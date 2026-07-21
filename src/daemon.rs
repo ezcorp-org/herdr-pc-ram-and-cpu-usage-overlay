@@ -29,8 +29,11 @@ use crate::proc;
 pub struct Tracked {
     /// Panes carrying our pseudo-agent (released, not TTL'd).
     pub pseudo: HashSet<String>,
-    /// Panes carrying TTL'd metadata statuses.
+    /// Panes carrying TTL'd pane-level metadata tokens (agents-panel mode).
     pub metadata: HashSet<String>,
+    /// Workspaces carrying TTL'd workspace-level metadata tokens (sidebar mode →
+    /// the spaces card, which renders workspace tokens rather than pane tokens).
+    pub workspaces: HashSet<String>,
 }
 
 /// PID of a live updater daemon, or `None` (missing pid file / dead process).
@@ -177,6 +180,7 @@ pub fn disable_updater() -> crate::Result<()> {
                 sweep.pseudo.extend(sp.pseudo_panes.iter().cloned());
                 sweep.metadata.extend(sp.agent_panes.iter().cloned());
                 sweep.metadata.extend(sp.spare_panes.iter().cloned());
+                sweep.workspaces.insert(sp.id.clone());
             }
             clear_all(&mut client, &sweep);
         }
@@ -248,8 +252,19 @@ pub fn push_statuses(
             for pane_id in &sp.pseudo_panes {
                 release_pseudo(client, pane_id, &source);
             }
+            // 0.7.5: the spaces card renders WORKSPACE tokens (`[ui.sidebar.spaces]`
+            // `$usage`), not pane tokens — so report at the workspace level.
+            if client
+                .workspace_report_metadata(&sp.id, &source, PSEUDO_AGENT, &status, ttl_ms)
+                .is_ok()
+            {
+                tracked.workspaces.insert(sp.id.clone());
+            }
+            continue;
         }
 
+        // agents-panel fall-through only (the pseudo pane just closed): report the
+        // pane-level token on a spare/agent pane so the agents panel still shows it.
         let targets = if !sp.spare_panes.is_empty() {
             &sp.spare_panes[..1]
         } else if !sp.agent_panes.is_empty() {
@@ -276,6 +291,9 @@ pub fn clear_all(client: &mut Herdr, tracked: &Tracked) {
     }
     for pane_id in &tracked.metadata {
         let _ = client.clear_metadata_status(pane_id, &source, PSEUDO_AGENT);
+    }
+    for workspace_id in &tracked.workspaces {
+        let _ = client.workspace_clear_metadata(workspace_id, &source, PSEUDO_AGENT);
     }
 }
 
