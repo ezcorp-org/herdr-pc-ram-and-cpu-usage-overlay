@@ -66,15 +66,35 @@ interval_seconds = 5
 window_title_totals = true
 ```
 
-- **agents-panel** (default): each space gets its own two-row entry in the
-  sidebar agents panel via a `usage` pseudo-agent on a spare shell pane.
-- **sidebar**: renders usage as a third line inside each spaces card, under the
-  branch name. Requires a herdr build patched to add a spaces-card status row —
-  a native plugin sidebar surface is an open upstream request (discussion #713).
-  That patch modifies herdr itself (AGPL-3.0), so it is **not** distributed with
-  this MIT plugin; agents-panel mode (above) works on stock herdr with no patch.
+- **agents-panel** (default): each space gets its own entry in the sidebar agents
+  panel via a `usage` pseudo-agent on a spare shell pane, carrying the usage token.
+- **sidebar**: renders usage inside each spaces card, under the branch name.
 
 Switching modes cleans up after the other mode automatically.
+
+### herdr 0.7.5+ (native sidebar tokens — no patch needed)
+
+Since herdr **0.7.5** the sidebar is drawn from configurable **token rows**, so
+sidebar mode no longer needs a patched build. This plugin pushes a named
+**`usage`** metadata token (`pane.report_metadata`, replacing the old
+`custom_status`), and you reference it as **`$usage`** in herdr's own
+`config.toml`:
+
+```toml
+[ui.sidebar.spaces]          # sidebar mode → usage under each space
+rows = [
+  ["state_icon", "workspace"],
+  ["branch", "git_status"],
+  ["$usage"],
+]
+
+[ui.sidebar.agents]          # agents-panel mode → usage on the agent row
+rows = [["state_icon", "workspace", "tab"], ["agent", "$usage"]]
+```
+
+Built-in `branch` / `git_status` (ahead/behind) tokens are native, so the old
+space-usage-line and git-dirty herdr patches are retired. Requires herdr ≥ 0.7.5
+(the `tokens` metadata API); older builds need plugin v1.0.x.
 
 ## Labels
 

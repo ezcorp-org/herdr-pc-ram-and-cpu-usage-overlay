@@ -13,8 +13,8 @@
 
 id = "ez-corp.space-usage"
 name = "PC RAM & CPU Usage Overlay"
-version = "1.0.0"
-min_herdr_version = "0.7.0"
+version = "1.1.0"
+min_herdr_version = "0.7.5"
 description = "CPU and RAM usage per space, grouped under the branch name."
 platforms = ["linux"]
 

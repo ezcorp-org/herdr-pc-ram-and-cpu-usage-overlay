@@ -224,11 +224,20 @@ pub fn push_statuses(
             }
             let pane = sp.pseudo_panes.first().or_else(|| sp.spare_panes.first());
             if let Some(pane) = pane {
+                // 0.7.5: report_agent only claims the identity/entry; the status
+                // text rides a named `usage` token pushed onto the same pane, which
+                // an `[sidebar.agents]` row renders via `$usage`.
                 if client
-                    .report_agent(pane, &source, PSEUDO_AGENT, "idle", &status)
+                    .report_agent(pane, &source, PSEUDO_AGENT, "idle")
                     .is_ok()
                 {
                     tracked.pseudo.insert(pane.clone());
+                    if client
+                        .report_metadata_status(pane, &source, PSEUDO_AGENT, &status, ttl_ms)
+                        .is_ok()
+                    {
+                        tracked.metadata.insert(pane.clone());
+                    }
                     continue; // dedicated panel entry covers this space
                 }
                 // pane just closed — fall through to metadata
@@ -250,7 +259,7 @@ pub fn push_statuses(
         };
         for pane_id in targets {
             if client
-                .report_metadata_status(pane_id, &source, &status, ttl_ms)
+                .report_metadata_status(pane_id, &source, PSEUDO_AGENT, &status, ttl_ms)
                 .is_ok()
             {
                 tracked.metadata.insert(pane_id.clone());
@@ -266,7 +275,7 @@ pub fn clear_all(client: &mut Herdr, tracked: &Tracked) {
         release_pseudo(client, pane_id, &source);
     }
     for pane_id in &tracked.metadata {
-        let _ = client.clear_metadata_status(pane_id, &source);
+        let _ = client.clear_metadata_status(pane_id, &source, PSEUDO_AGENT);
     }
 }
 

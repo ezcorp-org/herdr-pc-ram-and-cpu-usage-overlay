@@ -159,13 +159,17 @@ impl Herdr {
     // ---- mutation methods ---------------------------------------------------
 
     /// `pane.report_agent` — claim a pseudo-agent row (agents-panel mode).
+    ///
+    /// herdr 0.7.5 dropped the `custom_status` field from this call; the status
+    /// text now rides a named metadata token (see [`Self::report_metadata_status`]),
+    /// so this only claims the agent identity + state. The caller pushes the token
+    /// separately onto the same pane.
     pub fn report_agent(
         &mut self,
         pane_id: &str,
         source: &str,
         agent: &str,
         state: &str,
-        custom_status: &str,
     ) -> crate::Result<()> {
         self.call(
             "pane.report_agent",
@@ -174,7 +178,6 @@ impl Herdr {
                 "source": source,
                 "agent": agent,
                 "state": state,
-                "custom_status": custom_status,
             }),
         )?;
         Ok(())
@@ -189,12 +192,18 @@ impl Herdr {
         Ok(())
     }
 
-    /// `pane.report_metadata` with a TTL'd `custom_status` (sidebar mode).
+    /// `pane.report_metadata` — set a TTL'd named `token` to `value` on a pane.
+    ///
+    /// herdr 0.7.5 replaced the single `custom_status` field with a `tokens` map
+    /// (`{name: value|null}`); the sidebar renders it wherever the configured
+    /// `[sidebar.spaces]` / `[sidebar.agents]` rows reference `$<token>`. The TTL
+    /// self-clears the value if the daemon dies.
     pub fn report_metadata_status(
         &mut self,
         pane_id: &str,
         source: &str,
-        custom_status: &str,
+        token: &str,
+        value: &str,
         ttl_ms: u64,
     ) -> crate::Result<()> {
         self.call(
@@ -202,21 +211,26 @@ impl Herdr {
             &json!({
                 "pane_id": pane_id,
                 "source": source,
-                "custom_status": custom_status,
+                "tokens": { token: value },
                 "ttl_ms": ttl_ms,
             }),
         )?;
         Ok(())
     }
 
-    /// `pane.report_metadata` with `clear_custom_status`.
-    pub fn clear_metadata_status(&mut self, pane_id: &str, source: &str) -> crate::Result<()> {
+    /// `pane.report_metadata` clearing a named `token` (sets it to `null`).
+    pub fn clear_metadata_status(
+        &mut self,
+        pane_id: &str,
+        source: &str,
+        token: &str,
+    ) -> crate::Result<()> {
         self.call(
             "pane.report_metadata",
             &json!({
                 "pane_id": pane_id,
                 "source": source,
-                "clear_custom_status": true,
+                "tokens": { token: Value::Null },
             }),
         )?;
         Ok(())
