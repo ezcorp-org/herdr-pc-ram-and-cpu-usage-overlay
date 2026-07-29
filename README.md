@@ -54,6 +54,12 @@ herdr plugin action invoke report --plugin ez-corp.space-usage             # one
 Statuses carry a TTL and self-clear if the updater dies; disabling clears
 everything immediately.
 
+The updater **survives herdr restarts**. Enabling it records that you want it;
+herdr then runs the manifest's `[[startup]]` hook (`--restore`) on every server
+start — including a live `herdr update --handoff` — which brings the daemon back
+if it isn't already running. Disabling clears that record, so a deliberate
+`status-disable` stays disabled across restarts. Requires herdr ≥ 0.7.5.
+
 ## Modes
 
 Configure in `$HERDR_PLUGIN_CONFIG_DIR/config.toml`

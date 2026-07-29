@@ -96,6 +96,16 @@ pub fn pid_file() -> PathBuf {
     state_dir().join("updater.pid")
 }
 
+/// Marker recording that the updater is *wanted* (`<state_dir>/enabled`).
+///
+/// The pid file says whether a daemon is live *right now*; this says whether the
+/// user ever asked for one. `--restore` (the manifest `[[startup]]` hook) reads
+/// it so the updater comes back after a herdr or machine restart instead of
+/// silently staying off until someone re-invokes `status-enable`.
+pub fn enabled_flag() -> PathBuf {
+    state_dir().join("enabled")
+}
+
 // ---- env / path resolution --------------------------------------------------
 
 /// Read `name` from the environment, treating unset AND empty as absent — the

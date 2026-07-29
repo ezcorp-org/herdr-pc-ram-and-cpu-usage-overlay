@@ -13,7 +13,7 @@
 
 id = "ez-corp.space-usage"
 name = "PC RAM & CPU Usage Overlay"
-version = "1.1.0"
+version = "1.2.0"
 min_herdr_version = "0.7.5"
 description = "CPU and RAM usage per space, grouped under the branch name."
 platforms = ["linux"]
@@ -26,6 +26,17 @@ platforms = ["linux"]
 # what every pane/action command below invokes (relative to the plugin root).
 [[build]]
 command = ["cargo", "build", "--release"]
+platforms = ["linux"]
+
+# Restart recovery. herdr runs startup hooks on both a fresh server start and a
+# live handoff (`herdr update --handoff`), so this fires whenever herdr comes
+# back. `--restore` re-spawns the updater ONLY if it was enabled when herdr went
+# away (it reads a marker written by --enable / removed by --disable), and is a
+# silent no-op otherwise — so a deliberate --disable stays disabled, and an
+# already-live daemon is left alone. Without this the updater dies with herdr and
+# the sidebar stays blank until someone re-invokes status-enable by hand.
+[[startup]]
+command = ["./target/release/space-usage", "--restore"]
 platforms = ["linux"]
 
 # Live, self-refreshing dashboard. Opened as a temporary zoomed overlay pane.
