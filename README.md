@@ -58,7 +58,13 @@ The updater **survives herdr restarts**. Enabling it records that you want it;
 herdr then runs the manifest's `[[startup]]` hook (`--restore`) on every server
 start — including a live `herdr update --handoff` — which brings the daemon back
 if it isn't already running. Disabling clears that record, so a deliberate
-`status-disable` stays disabled across restarts. Requires herdr ≥ 0.7.5.
+`status-disable` stays disabled across restarts. A fresh install starts with no
+record, so nothing runs until you enable it once. Requires herdr ≥ 0.7.5.
+
+> **Upgrading from < 1.2.0?** The record is only written when you enable the
+> updater, so an updater enabled under an older version isn't yet marked as
+> wanted. Run `status-enable` (or `status-toggle` twice) once after upgrading —
+> from then on it is permanent.
 
 ## Modes
 
