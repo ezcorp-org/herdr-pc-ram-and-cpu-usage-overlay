@@ -35,6 +35,17 @@ pub struct Config {
     /// gives it meaning, so an unknown value auto-detects instead of failing
     /// here.
     pub icons: String,
+    /// Naming for the battery cell, overriding herdr's `[ui] battery_label`.
+    ///
+    /// Battery lives here rather than only in herdr's config because herdr has
+    /// no battery of its own to label: `battery_label` is not a key it knows, so
+    /// putting it in herdr's `[ui]` makes `herdr server reload-config` report
+    /// `unknown config key ui.battery_label; ignoring key` on every reload.
+    /// Harmless but noisy, and needless — nothing outside this plugin renders a
+    /// battery, so there is no second surface to keep in step. `cpu_label` and
+    /// `ram_label` stay in herdr's config precisely because the sidebar's
+    /// system-usage header does share those.
+    pub battery_label: Option<String>,
 }
 
 impl Default for Config {
@@ -45,6 +56,7 @@ impl Default for Config {
             window_title_totals: true,
             battery: true,
             icons: "auto".to_string(),
+            battery_label: None,
         }
     }
 }
@@ -127,6 +139,18 @@ impl Labels {
 
     pub fn battery(&self) -> Option<&str> {
         self.battery.as_deref()
+    }
+
+    /// Apply the plugin config's own label overrides on top of herdr's.
+    ///
+    /// Only battery has one, for the reason given on [`Config::battery_label`].
+    /// Returning `Self` keeps the load-then-override pair a single expression at
+    /// each call site, so no caller can load the labels and forget the overrides.
+    pub fn with_overrides(mut self, config: &Config) -> Self {
+        if let Some(label) = &config.battery_label {
+            self.battery = Some(label.clone());
+        }
+        self
     }
 
     /// The word to print on surfaces that always spell one out regardless of
@@ -277,6 +301,7 @@ fn parse_config(text: &str) -> Config {
                 }
             }
             "window_title_totals" => cfg.window_title_totals = value != "false",
+            "battery_label" => cfg.battery_label = non_empty(value),
             "battery" => cfg.battery = value != "false",
             // Stored raw: naming the tiers in two places would let the parser
             // and `icons::resolve` disagree about what `Nerd-Font` means.
@@ -305,14 +330,32 @@ fn parse_herdr_labels(text: &str) -> Labels {
         if !in_ui {
             continue;
         }
+        // An EMPTY label reads as unset, not as "name nothing".
+        //
+        // herdr's own config ships these keys as commented-out templates with
+        // empty quotes and a note naming the glyph to paste:
+        //
+        //     # cpu_label = ""   #  nf-oct-cpu
+        //
+        // Uncommenting one without filling it in is the obvious first move, and
+        // honouring the blank literally would silently strip the naming off
+        // every row — leaving bare percentages and no clue why. Treating it as
+        // unset keeps the tier's own naming, which is the recoverable answer.
+        // This also matches `non_empty_env`, which reads an empty environment
+        // value as absent for the same reason.
         match parse_kv_line(line) {
-            Some(("cpu_label", value)) => labels.cpu = Some(value.to_string()),
-            Some(("ram_label", value)) => labels.ram = Some(value.to_string()),
-            Some(("battery_label", value)) => labels.battery = Some(value.to_string()),
+            Some(("cpu_label", value)) => labels.cpu = non_empty(value),
+            Some(("ram_label", value)) => labels.ram = non_empty(value),
+            Some(("battery_label", value)) => labels.battery = non_empty(value),
             _ => {}
         }
     }
     labels
+}
+
+/// `Some(owned)` for a non-empty string, `None` for an empty one.
+fn non_empty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 /// Section name inside a leading `[...]` table header (the `[^\]]+` up to the
@@ -522,6 +565,40 @@ mod tests {
         // Surfaces that always spell a word still get one.
         assert_eq!(labels.cpu_word(), "cpu");
         assert_eq!(labels.ram_word(), "ram");
+    }
+
+    #[test]
+    fn the_plugin_config_owns_the_battery_label() {
+        // herdr does not know `battery_label`, so putting it in herdr's [ui]
+        // makes every `reload-config` log `unknown config key`. The plugin
+        // config is its proper home, and it overrides herdr's if both are set.
+        let cfg = parse_config("battery_label = \"\u{f241}\"");
+        assert_eq!(cfg.battery_label.as_deref(), Some("\u{f241}"));
+
+        let from_herdr = parse_herdr_labels("[ui]\nbattery_label = \"HERDR\"\n");
+        assert_eq!(
+            from_herdr.clone().with_overrides(&cfg).battery(),
+            Some("\u{f241}")
+        );
+
+        // With nothing set plugin-side, herdr's value still applies.
+        let bare = Config::default();
+        assert_eq!(from_herdr.with_overrides(&bare).battery(), Some("HERDR"));
+    }
+
+    #[test]
+    fn an_empty_label_reads_as_unset_not_as_blank() {
+        // herdr ships these keys as commented templates with empty quotes:
+        //     # cpu_label = ""   #  nf-oct-cpu
+        // Uncommenting one without pasting a glyph must not strip the naming
+        // off every row and leave bare percentages.
+        let labels = parse_herdr_labels("[ui]\ncpu_label = \"\"\nram_label = \"\"\n");
+        assert_eq!(labels.cpu(), None);
+        assert_eq!(labels.ram(), None);
+        assert_eq!(labels.cpu_word(), "cpu");
+        // The same line with a real glyph pasted in IS set.
+        let filled = parse_herdr_labels("[ui]\ncpu_label = \"\u{f4bc}\"   # nf-oct-cpu\n");
+        assert_eq!(filled.cpu(), Some("\u{f4bc}"));
     }
 
     #[test]

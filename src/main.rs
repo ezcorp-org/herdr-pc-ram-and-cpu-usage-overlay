@@ -110,7 +110,10 @@ fn run() -> Result<()> {
     // A pure local preview: it draws sample glyphs and reads two config files,
     // so it must work with herdr down — hence ahead of `connect`.
     if has_flag(&args, "--icons") {
-        print_icon_preview(&config, &config::load_herdr_labels());
+        print_icon_preview(
+            &config,
+            &config::load_herdr_labels().with_overrides(&config),
+        );
         return Ok(());
     }
 
@@ -120,7 +123,7 @@ fn run() -> Result<()> {
         return render::run_json(&mut client, &config);
     }
 
-    let labels = config::load_herdr_labels();
+    let labels = config::load_herdr_labels().with_overrides(&config);
     if has_flag(&args, "--once") {
         return render::run_once(&mut client, &labels, &config);
     }

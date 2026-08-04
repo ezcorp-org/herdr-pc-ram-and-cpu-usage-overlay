@@ -78,7 +78,7 @@ pub fn run_daemon() -> crate::Result<()> {
     std::fs::write(config::pid_file(), format!("{}\n", std::process::id()))?;
 
     let config = config::load_config();
-    let labels = config::load_herdr_labels();
+    let labels = config::load_herdr_labels().with_overrides(&config);
     // The glyph tier depends on config and locale, neither of which changes
     // while we run, so it is resolved once here rather than per refresh.
     let icons = config.icon_set();
