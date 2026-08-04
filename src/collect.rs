@@ -1,61 +1,99 @@
-//! Snapshot → spaces, worktree grouping, and CPU/RAM measurement
-//! (mirrors `index.js` lines 222-341).
+//! Snapshot → spaces, worktree grouping, and CPU/RAM measurement.
 //!
-//! [`collect_spaces`] turns `workspace.list` + per-workspace `pane.list` (plus
-//! per-pane `process_info`) into [`Space`]s. [`group_worktree_families`] and
-//! [`aggregate_families`] fold worktree-child workspaces into their parent.
-//! [`measure`] samples `/proc` CPU jiffies over a window and fills cpu/ram/proc
-//! counts. [`snapshot`] is the top-level `collect → group → measure → aggregate`
-//! pipeline.
+//! [`collect_spaces`] turns one `session.snapshot` (plus a `process_info` per
+//! pane) into [`Space`]s. [`group_worktree_families`] and [`aggregate_families`]
+//! fold worktree-child workspaces into their parent. [`measure`] samples `/proc`
+//! CPU jiffies over a window and fills cpu/ram/proc counts. [`snapshot`] is the
+//! top-level `collect → group → measure → aggregate` pipeline.
 
 use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::herdr::Herdr;
-use crate::model::Space;
+use crate::model::{PaneInfo, Space};
 use crate::proc;
 
 /// Pseudo-agent label used to mark our agents-panel entries (agents-panel mode)
 /// and to recognise / clean them up in sidebar mode.
 pub const PSEUDO_AGENT: &str = "usage";
 
+/// How one workspace's panes divide up: the cwd the branch is read from, plus
+/// the agent / spare / pseudo buckets.
+///
+/// Split out of [`collect_spaces`] so the classification rules are unit-testable
+/// without a live herdr.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PaneRoles {
+    /// cwd of the first pane that reports one — the branch lookup path.
+    cwd: Option<String>,
+    /// panes with a real agent.
+    agent_panes: Vec<String>,
+    /// plain shell panes.
+    spare_panes: Vec<String>,
+    /// panes already carrying our "usage" pseudo-agent.
+    pseudo_panes: Vec<String>,
+}
+
+/// Classify one workspace's panes, in the order herdr reported them.
+///
+/// The first pane with a non-empty cwd wins the branch lookup. `cwd` is optional
+/// in herdr's payload and can be briefly absent while a pane is still starting,
+/// so a later pane is allowed to supply it. Bucketing: our pseudo-agent first,
+/// then any other non-empty agent, else a plain shell pane.
+fn classify_panes(panes: &[&PaneInfo]) -> PaneRoles {
+    let mut roles = PaneRoles::default();
+    for pane in panes {
+        if roles.cwd.is_none() {
+            if let Some(c) = pane.cwd.as_deref().filter(|c| !c.is_empty()) {
+                roles.cwd = Some(c.to_string());
+            }
+        }
+        match pane.agent.as_deref() {
+            Some(PSEUDO_AGENT) => roles.pseudo_panes.push(pane.pane_id.clone()),
+            Some(agent) if !agent.is_empty() => roles.agent_panes.push(pane.pane_id.clone()),
+            _ => roles.spare_panes.push(pane.pane_id.clone()),
+        }
+    }
+    roles
+}
+
+/// Bucket a snapshot's flat pane list under each pane's `workspace_id`, keeping
+/// herdr's reported order within every workspace — that order is what makes
+/// "the first pane's cwd" well-defined.
+fn panes_by_workspace(panes: &[PaneInfo]) -> HashMap<&str, Vec<&PaneInfo>> {
+    let mut by_workspace: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
+    for pane in panes {
+        by_workspace
+            .entry(pane.workspace_id.as_str())
+            .or_default()
+            .push(pane);
+    }
+    by_workspace
+}
+
 /// Enumerate spaces and the root shell PID of each of their panes, classifying
 /// panes into agent / spare / pseudo buckets.
 ///
-/// Mirrors the JS exactly (index.js:222-258): one `workspace.list`, then one
-/// `pane.list` per workspace whose panes arrive already ordered — so the "first
-/// pane's cwd" (used for the git branch) matches without any regrouping.
-/// `pane.process_info` is per-pane (no bulk form), and a pane that closed
-/// mid-scan simply contributes no root.
+/// One `session.snapshot` supplies both the workspaces and every pane, so the
+/// two can never disagree — previously a workspace closing between
+/// `workspace.list` and its `pane.list` failed the whole sample. Only
+/// `pane.process_info` is still per-pane (no bulk form); a pane that closed
+/// mid-scan errors there and simply contributes no root.
 pub fn collect_spaces(client: &mut Herdr) -> crate::Result<Vec<Space>> {
-    let workspaces = client.workspace_list()?;
+    let snapshot = client.session_snapshot()?;
+    let by_workspace = panes_by_workspace(&snapshot.panes);
 
-    let mut spaces = Vec::with_capacity(workspaces.len());
-    for ws in workspaces {
-        let panes = client.pane_list(&ws.workspace_id)?;
+    let mut spaces = Vec::with_capacity(snapshot.workspaces.len());
+    for ws in &snapshot.workspaces {
+        let panes: &[&PaneInfo] = by_workspace
+            .get(ws.workspace_id.as_str())
+            .map_or(&[], Vec::as_slice);
+        let roles = classify_panes(panes);
 
-        let mut roots = Vec::new();
-        let mut agent_panes = Vec::new(); // panes with a real agent — sidebar rows
-        let mut spare_panes = Vec::new(); // plain shell panes — pseudo-agent hosts
-        let mut pseudo_panes = Vec::new(); // panes already carrying our "usage" agent
-        let mut cwd: Option<&str> = None;
-
-        for pane in &panes {
-            // First pane with a non-empty cwd wins (JS `if (!cwd && pane.cwd)`).
-            if cwd.is_none() {
-                if let Some(c) = pane.cwd.as_deref().filter(|c| !c.is_empty()) {
-                    cwd = Some(c);
-                }
-            }
-            // Classify: our pseudo-agent, then any real (non-empty) agent, else a
-            // plain shell pane. An empty-string agent is falsy in JS → spare.
-            match pane.agent.as_deref() {
-                Some(PSEUDO_AGENT) => pseudo_panes.push(pane.pane_id.clone()),
-                Some(agent) if !agent.is_empty() => agent_panes.push(pane.pane_id.clone()),
-                _ => spare_panes.push(pane.pane_id.clone()),
-            }
-            // Best-effort shell PID; a pane that just closed errors and is skipped.
+        // Best-effort shell PIDs; a pane that just closed errors and is skipped.
+        let mut roots = Vec::with_capacity(panes.len());
+        for pane in panes {
             if let Ok(info) = client.process_info(&pane.pane_id) {
                 if let Some(pid) = info.shell_pid.filter(|&p| p != 0) {
                     roots.push(pid);
@@ -68,18 +106,18 @@ pub fn collect_spaces(client: &mut Herdr) -> crate::Result<Vec<Space>> {
         } else {
             ws.label.clone()
         };
-        let branch = git_branch(cwd);
+        let branch = git_branch(roles.cwd.as_deref());
 
         spaces.push(Space {
-            id: ws.workspace_id,
+            id: ws.workspace_id.clone(),
             label,
             focused: ws.focused,
             pane_count: panes.len(),
             branch,
             roots,
-            agent_panes,
-            spare_panes,
-            pseudo_panes,
+            agent_panes: roles.agent_panes,
+            spare_panes: roles.spare_panes,
+            pseudo_panes: roles.pseudo_panes,
             ..Default::default()
         });
     }
@@ -87,8 +125,19 @@ pub fn collect_spaces(client: &mut Herdr) -> crate::Result<Vec<Space>> {
 }
 
 /// git branch of `cwd` via `git -C <cwd> rev-parse --abbrev-ref HEAD`
-/// (empty string if `cwd` is `None`/empty or not a repo — the git call exiting
-/// non-zero is swallowed exactly as the JS `try/catch` did).
+/// (empty string if `cwd` is `None`/empty or not a repo — a non-zero git exit is
+/// swallowed).
+///
+/// Two field choices here are deliberate; both were measured, so don't
+/// "modernize" either:
+///
+/// - `cwd`, not `foreground_cwd`. The latter is the one #1838/#2206 made
+///   non-blocking, and it transiently reports `/` on a fresh pane. `cwd` is the
+///   PTY's own tracked directory and was never observed empty.
+/// - the pane cwd, not the `worktree` block on `workspace.list`. That block
+///   exists in 0.7.5 and 0.8.0 alike, but it can stay `null` indefinitely for a
+///   workspace that IS a repo (observed on two, while `worktree.list` succeeded
+///   on both), so the branch would blank out.
 pub fn git_branch(cwd: Option<&str>) -> String {
     let cwd = match cwd {
         Some(c) if !c.is_empty() => c,
@@ -182,8 +231,8 @@ pub fn measure(spaces: &mut [Space], window_ms: u64) {
         let mut delta_jiffies: u64 = 0;
         for &pid in &pids {
             if let (Some(a), Some(b)) = (after.get(&pid), before.get(&pid)) {
-                // `saturating_sub` is JS `Math.max(0, a - b)` — guards counter
-                // resets / pid reuse.
+                // `saturating_sub` clamps at zero, guarding counter resets and
+                // pid reuse inside the window.
                 delta_jiffies += a.jiffies.saturating_sub(b.jiffies);
             }
         }
@@ -202,10 +251,10 @@ pub fn measure(spaces: &mut [Space], window_ms: u64) {
 /// panes and collecting labels), returning the spaces without folded children.
 ///
 /// Iterates by index and reads each child's *current* values at fold time, so a
-/// child that is itself a parent accumulates before contributing upward —
-/// matching the JS in-place mutation exactly. Every space carrying a
-/// `family_parent` is dropped from the result, even if that parent was not
-/// found (a missing parent means the child is not surfaced on its own).
+/// child that is itself a parent accumulates before contributing upward. Every
+/// space carrying a `family_parent` is dropped from the result, even if that
+/// parent was not found (a missing parent means the child is not surfaced on
+/// its own).
 pub fn aggregate_families(mut spaces: Vec<Space>) -> Vec<Space> {
     let index_of: HashMap<String, usize> = spaces
         .iter()
@@ -259,7 +308,70 @@ pub fn snapshot(client: &mut Herdr, window_ms: u64) -> crate::Result<Vec<Space>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Space;
+    use crate::model::{PaneInfo, Space};
+
+    /// Build a [`PaneInfo`] as `session.snapshot` reports one.
+    fn pane(pane_id: &str, workspace_id: &str, cwd: Option<&str>, agent: Option<&str>) -> PaneInfo {
+        PaneInfo {
+            pane_id: pane_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            cwd: cwd.map(str::to_string),
+            agent: agent.map(str::to_string),
+        }
+    }
+
+    // ---- pane bucketing + classification ------------------------------------
+
+    #[test]
+    fn panes_bucket_under_their_workspace_in_reported_order() {
+        let panes = vec![
+            pane("w1:p1", "w1", None, None),
+            pane("w2:p1", "w2", None, None),
+            pane("w1:p2", "w1", None, None),
+        ];
+        let by_workspace = panes_by_workspace(&panes);
+
+        let w1: Vec<&str> = by_workspace["w1"].iter().map(|p| &*p.pane_id).collect();
+        assert_eq!(w1, ["w1:p1", "w1:p2"], "order within a workspace is kept");
+        assert_eq!(by_workspace["w2"].len(), 1);
+        assert!(!by_workspace.contains_key("w3"));
+    }
+
+    #[test]
+    fn classify_takes_the_first_non_empty_cwd() {
+        // A pane can report no cwd (or an empty one) while it is still starting,
+        // so the branch lookup falls through to the next pane that has one.
+        let panes = [
+            pane("p1", "w1", None, None),
+            pane("p2", "w1", Some(""), None),
+            pane("p3", "w1", Some("/repo"), None),
+            pane("p4", "w1", Some("/other"), None),
+        ];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+        assert_eq!(classify_panes(&refs).cwd.as_deref(), Some("/repo"));
+    }
+
+    #[test]
+    fn classify_splits_pseudo_agent_and_spare_panes() {
+        let panes = [
+            pane("p1", "w1", None, Some(PSEUDO_AGENT)),
+            pane("p2", "w1", None, Some("claude")),
+            pane("p3", "w1", None, None),
+            pane("p4", "w1", None, Some("")), // empty agent is a plain shell
+        ];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+        let roles = classify_panes(&refs);
+
+        assert_eq!(roles.pseudo_panes, ["p1"]);
+        assert_eq!(roles.agent_panes, ["p2"]);
+        assert_eq!(roles.spare_panes, ["p3", "p4"]);
+        assert_eq!(roles.cwd, None);
+    }
+
+    #[test]
+    fn classify_of_no_panes_is_all_empty() {
+        assert_eq!(classify_panes(&[]), PaneRoles::default());
+    }
 
     /// Build a measured [`Space`] with just the aggregate-relevant fields set.
     fn space(id: &str, cpu: f64, ram_mb: f64, proc_count: usize, pane_count: usize) -> Space {
@@ -317,8 +429,8 @@ mod tests {
 
     #[test]
     fn aggregate_drops_child_even_when_parent_is_missing() {
-        // JS filters purely on `familyParent` being set, so a child whose parent
-        // isn't present is still not surfaced standalone.
+        // The filter is purely on `family_parent` being set, so a child whose
+        // parent isn't present is still not surfaced standalone.
         let standalone = space("a", 1.0, 1.0, 1, 1);
         let mut orphan = space("o", 2.0, 2.0, 1, 1);
         orphan.family_parent = Some("ghost".to_string());

@@ -1,5 +1,4 @@
-//! Socket-native herdr JSON-RPC client (replaces the per-sample CLI shell-outs
-//! of `index.js` lines 82-124, hardened).
+//! Socket-native herdr JSON-RPC client.
 //!
 //! One persistent [`UnixStream`] (paired with a [`BufReader`] over a cloned fd)
 //! speaks herdr's newline-delimited JSON-RPC:
@@ -7,14 +6,15 @@
 //!   success : `{"id":..,"result":{"type":"<snake>",...}}`
 //!   failure : `{"id":..,"error":{"code":..,"message":..}}`
 //! Any non-`error` envelope is treated as success (mutations return
-//! `{"type":"ok"}`). Method + param field names are verified against herdr 0.7.1
-//! source: methods in `src/api/server.rs` / `src/api/schema.rs`, params in
-//! `src/api/schema/panes.rs` (`PaneReportAgentParams`, `PaneReleaseAgentParams`,
-//! `PaneReportMetadataParams`) and `src/api/schema/common.rs`
-//! (`NotificationShowParams`, `ClientWindowTitleSetParams`). Because every
-//! param name is confirmed, all methods — reads and mutations — go over the
-//! socket; [`bin_path`] still exposes the `HERDR_BIN_PATH` CLI for callers that
-//! need a degraded fallback (e.g. best-effort notifications without a socket).
+//! `{"type":"ok"}`). Every method and param name below is verified against the
+//! herdr 0.8.0 API schema (`herdr` protocol 19) — reads (`SessionSnapshotParams`
+//! is empty, `PaneProcessInfoParams`, `WorktreeListParams`) and mutations alike
+//! (`PaneReportAgentParams`, `PaneReleaseAgentParams`, `PaneReportMetadataParams`,
+//! `WorkspaceReportMetadataParams`, `NotificationShowParams`,
+//! `ClientWindowTitleSetParams`). Because every param name is confirmed, all
+//! methods go over the socket; [`bin_path`] still exposes the `HERDR_BIN_PATH`
+//! CLI for callers that need a degraded fallback (e.g. best-effort notifications
+//! without a socket).
 //!
 //! The socket path is resolved `HERDR_SOCKET_PATH` → `$XDG_CONFIG_HOME/herdr` →
 //! `~/.config/herdr/herdr.sock` (the XDG/home resolution is reused from
@@ -29,8 +29,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::model::{
-    PaneInfo, PaneListResult, ProcessInfo, ProcessInfoResult, WorkspaceInfo, WorkspaceListResult,
-    WorktreeListResult,
+    ProcessInfo, ProcessInfoResult, SessionSnapshot, SessionSnapshotResult, WorktreeListResult,
 };
 
 /// Read/write timeout for a single JSON-RPC round-trip. Generous — herdr answers
@@ -128,18 +127,15 @@ impl Herdr {
 
     // ---- read methods -------------------------------------------------------
 
-    /// `workspace.list` — every open workspace (JS `herdr(['workspace','list'])`
-    /// at index.js:223).
-    pub fn workspace_list(&mut self) -> crate::Result<Vec<WorkspaceInfo>> {
-        let result = self.call("workspace.list", &json!({}))?;
-        Ok(serde_json::from_value::<WorkspaceListResult>(result)?.workspaces)
-    }
-
-    /// `pane.list` for one workspace (JS
-    /// `herdr(['pane','list','--workspace',id])` at index.js:225).
-    pub fn pane_list(&mut self, workspace_id: &str) -> crate::Result<Vec<PaneInfo>> {
-        let result = self.call("pane.list", &json!({ "workspace_id": workspace_id }))?;
-        Ok(serde_json::from_value::<PaneListResult>(result)?.panes)
+    /// `session.snapshot` — every open workspace AND every pane in one call.
+    ///
+    /// Deliberately one round trip rather than `workspace.list` + a `pane.list`
+    /// per workspace: those can be read torn apart, and a workspace that closes
+    /// between them makes the follow-up `pane.list` fail with
+    /// `workspace_not_found`, which used to abort the whole sample.
+    pub fn session_snapshot(&mut self) -> crate::Result<SessionSnapshot> {
+        let result = self.call("session.snapshot", &json!({}))?;
+        Ok(serde_json::from_value::<SessionSnapshotResult>(result)?.snapshot)
     }
 
     /// `pane.process_info` — the pane's shell PID (no bulk form exists).
@@ -340,8 +336,7 @@ fn frame_request(id: &str, method: &str, params: &Value) -> String {
 }
 
 /// Parse one response line: `error` (non-null) → `Err(message)`, otherwise the
-/// `result` object (or `{}` when a non-error envelope omits it — mirrors the JS
-/// `parsed.result || {}`).
+/// `result` object (or `{}` when a non-error envelope omits it).
 fn parse_envelope(line: &str) -> crate::Result<Value> {
     let envelope: Value =
         serde_json::from_str(line.trim()).map_err(|e| format!("invalid herdr response: {e}"))?;

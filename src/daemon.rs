@@ -1,5 +1,4 @@
-//! Sidebar status updater daemon and its enable/disable/toggle controls
-//! (mirrors `index.js` lines 343-616).
+//! Sidebar status updater daemon and its enable/disable/toggle controls.
 //!
 //! The daemon refreshes each space's usage on a cadence, surfacing it either as
 //! a "usage" pseudo-agent (agents-panel mode) or as TTL'd display-only metadata
@@ -228,7 +227,7 @@ pub fn push_statuses(
     tracked: &mut Tracked,
 ) {
     let source = config::plugin_id();
-    let ttl_ms = config.interval_seconds * 1000 * 3;
+    let ttl_ms = status_ttl_ms(config.interval_seconds);
 
     for sp in spaces {
         let status = status_line(sp, labels);
@@ -333,8 +332,7 @@ pub fn set_title_totals(client: &mut Herdr, spaces: &[Space], labels: &Labels) {
 ///
 /// Fully detached: a new session (setsid) so it survives the controlling
 /// terminal — which is what lets the daemon outlive the short-lived `--enable` /
-/// `--restore` command herdr spawned it from — and null stdio. Mirrors Node's
-/// `spawn(.., { detached: true, stdio: 'ignore' })` + `child.unref()`.
+/// `--restore` command herdr spawned it from — and null stdio.
 fn spawn_daemon() -> crate::Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
@@ -421,6 +419,30 @@ fn park() -> ! {
     }
 }
 
+/// Largest `ttl_ms` herdr accepts on `pane.report_metadata` /
+/// `workspace.report_metadata` (24 h — `ttl_ms.maximum` in `herdr api schema`).
+/// Anything above it is rejected with `invalid_metadata_ttl`.
+const MAX_TTL_MS: u64 = 86_400_000;
+
+/// The two bounds live in different modules, so tie them at compile time: the
+/// largest interval the config parser will yield must still derive a TTL herdr
+/// accepts. Changing either constant alone fails the build.
+///
+/// It must reference both constants, not a literal — `MAX_TTL_MS` tracks an
+/// external herdr API limit and so is the likelier of the two to be edited,
+/// which is exactly the edit a hardcoded ceiling would let through.
+const _: () = assert!(config::MAX_INTERVAL_SECONDS.saturating_mul(3_000) <= MAX_TTL_MS);
+
+/// Status TTL for one refresh cadence: three intervals, clamped to what herdr
+/// will accept.
+///
+/// Pushes are best-effort (the caller ignores failures), so an over-large TTL
+/// would blank the sidebar silently with nothing to point at. `saturating_mul`
+/// also keeps an absurd interval from wrapping.
+fn status_ttl_ms(interval_seconds: u64) -> u64 {
+    interval_seconds.saturating_mul(3_000).min(MAX_TTL_MS)
+}
+
 /// The per-space status text: `"<cpu> <n>% · <ram> <pct-or-compact>"`.
 fn status_line(sp: &Space, labels: &Labels) -> String {
     format!(
@@ -433,7 +455,7 @@ fn status_line(sp: &Space, labels: &Labels) -> String {
 }
 
 /// RAM as a percent-of-total string, falling back to the compact absolute form
-/// when `/proc/meminfo` is unreadable (JS `ramPct(mb) || compactRam(mb)`).
+/// when `/proc/meminfo` is unreadable.
 fn ram_display(mb: f64) -> String {
     let pct = proc::ram_pct(mb);
     if pct.is_empty() {
@@ -444,7 +466,7 @@ fn ram_display(mb: f64) -> String {
 }
 
 /// Compact absolute RAM: `"<x.x>G"` at/above 1024 MB, else `"<n>M"`
-/// (JS `compactRam`).
+/// — the narrow form used by sidebar statuses.
 fn compact_ram(mb: f64) -> String {
     if mb >= 1024.0 {
         format!("{:.1}G", mb / 1024.0)
@@ -459,7 +481,7 @@ fn release_pseudo(client: &mut Herdr, pane_id: &str, source: &str) {
     let _ = client.release_agent(pane_id, source, PSEUDO_AGENT);
 }
 
-/// Best-effort "Space usage" toast over a throwaway connection (JS `notify`).
+/// Best-effort "Space usage" toast over a throwaway connection.
 fn notify(body: &str) {
     if let Ok(mut client) = herdr::connect() {
         let _ = client.notification_show("Space usage", body);
@@ -480,9 +502,20 @@ mod tests {
     }
 
     #[test]
+    fn status_ttl_is_three_intervals_clamped_to_herdr_ceiling() {
+        assert_eq!(status_ttl_ms(5), 15_000);
+        assert_eq!(status_ttl_ms(1), 3_000);
+        // The largest interval that still fits: 28_800 * 3_000 == 86_400_000.
+        assert_eq!(status_ttl_ms(28_800), MAX_TTL_MS);
+        assert_eq!(status_ttl_ms(28_801), MAX_TTL_MS);
+        // Saturating, so an absurd interval clamps instead of wrapping.
+        assert_eq!(status_ttl_ms(u64::MAX), MAX_TTL_MS);
+    }
+
+    #[test]
     fn compact_ram_switches_unit_at_1024() {
         assert_eq!(compact_ram(0.0), "0M");
-        assert_eq!(compact_ram(512.6), "513M"); // Math.round
+        assert_eq!(compact_ram(512.6), "513M"); // rounds to whole MB
         assert_eq!(compact_ram(1023.4), "1023M"); // still MB below the gate
         assert_eq!(compact_ram(1024.0), "1.0G");
         assert_eq!(compact_ram(1536.0), "1.5G");

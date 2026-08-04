@@ -1,5 +1,4 @@
-//! Human and JSON rendering plus the `--once` / `--json` / `--interval` run modes
-//! (mirrors `index.js` lines 618-681 and 691-706).
+//! Human and JSON rendering plus the `--once` / `--json` / `--interval` run modes.
 //!
 //! [`render`] builds the coloured multi-line terminal report; [`render_json`]
 //! builds the machine-readable payload. The `run_*` helpers drive a
@@ -19,33 +18,31 @@ use crate::herdr::Herdr;
 use crate::model::Space;
 use crate::proc;
 
-/// CPU sample window for the one-shot `--once` / `--json` modes (ms), matching
-/// the JS `snapshot(300)` calls.
+/// CPU sample window for the one-shot `--once` / `--json` modes (ms) — short
+/// enough that an action returns promptly.
 const SNAPSHOT_WINDOW_MS: u64 = 300;
 
 /// Short first-frame window so the live watch draws almost immediately, before
-/// switching to full-interval windows (JS `windowMs = 400` seed).
+/// switching to full-interval windows.
 const FIRST_FRAME_WINDOW_MS: u64 = 400;
 
 // ---- ANSI styling -----------------------------------------------------------
 
 /// ANSI paint gate: colours only when stdout is a TTY and `NO_COLOR` is unset
-/// (an empty `NO_COLOR` is treated as absent, matching JS `!process.env.NO_COLOR`).
+/// (an empty `NO_COLOR` is treated as absent).
 struct Style {
     color: bool,
 }
 
 impl Style {
-    /// Detect colour support from the live stdout (JS `process.stdout.isTTY &&
-    /// !process.env.NO_COLOR`).
+    /// Detect colour support from the live stdout.
     fn detect() -> Self {
         Style {
             color: io::stdout().is_terminal() && crate::config::non_empty_env("NO_COLOR").is_none(),
         }
     }
 
-    /// Wrap `s` in the SGR `code` when colour is enabled, else return it plain
-    /// (JS `paint`).
+    /// Wrap `s` in the SGR `code` when colour is enabled, else return it plain.
     fn paint(&self, code: &str, s: &str) -> String {
         if self.color {
             format!("\x1b[{code}m{s}\x1b[0m")
@@ -71,7 +68,7 @@ impl Style {
     }
 
     /// Colour `s` by CPU load: `>= 80` red, `>= 40` yellow, else green
-    /// (JS `cpuColor`).
+    /// on the share-of-machine scale.
     fn cpu(&self, v: f64, s: &str) -> String {
         if v >= 80.0 {
             self.red(s)
@@ -84,7 +81,7 @@ impl Style {
 }
 
 /// Format RAM `mb` as `"<x.xx> GB"` at/above 1024 MB, else `"<x> MB"`
-/// (JS `fmtRam`).
+/// — the wide form used by the terminal report.
 fn fmt_ram(mb: f64) -> String {
     if mb >= 1024.0 {
         format!("{:.2} GB", mb / 1024.0)
@@ -183,8 +180,8 @@ fn render_styled(spaces: &[Space], labels: &Labels, style: &Style) -> String {
 // ---- JSON payload -----------------------------------------------------------
 
 /// One entry of the `--json` payload. Field declaration order IS the emitted key
-/// order (serde preserves it) and mirrors `index.js` lines 691-706 exactly — this
-/// is the parity contract, so do not reorder or rename.
+/// order (serde preserves it) and is the payload's public contract, so do not
+/// reorder or rename.
 #[derive(Serialize)]
 struct JsonSpace {
     workspace_id: String,
@@ -195,17 +192,16 @@ struct JsonSpace {
     processes: usize,
     cpu_percent: Number,
     ram_mb: Number,
-    /// `null` when `/proc/meminfo` MemTotal is unreadable (JS `... : null`).
+    /// `null` when `/proc/meminfo` MemTotal is unreadable.
     ram_percent: Option<Number>,
-    /// Present only for spaces that folded in worktree children (JS spreads
-    /// `{ includes_worktrees }` conditionally, so an absent value omits the key).
+    /// Present only for spaces that folded in worktree children; an absent
+    /// value omits the key entirely rather than emitting `null`.
     #[serde(skip_serializing_if = "Option::is_none")]
     includes_worktrees: Option<Vec<String>>,
 }
 
-/// Mirror JS `Number(x.toFixed(1))` as a JSON number: round to one decimal, then
-/// collapse a whole result to an integer so `JSON.stringify` renders `12`, not
-/// `12.0` (`Number("12.0") === 12`).
+/// Round to one decimal, then collapse a whole result to an integer so the
+/// payload renders `12` rather than `12.0`.
 fn json_num_1dp(x: f64) -> Number {
     let rounded = (x * 10.0).round() / 10.0;
     if rounded.is_finite() && rounded.fract() == 0.0 {
@@ -216,7 +212,7 @@ fn json_num_1dp(x: f64) -> Number {
 }
 
 /// Serialize spaces to the `--json` payload (array of per-space objects), 2-space
-/// indented to match `JSON.stringify(payload, null, 2)`. No trailing newline.
+/// indented. No trailing newline.
 pub fn render_json(spaces: &[Space]) -> String {
     let mem_total = proc::mem_total_mb();
     let payload: Vec<JsonSpace> = spaces
@@ -255,8 +251,8 @@ pub fn run_json(client: &mut Herdr) -> crate::Result<()> {
 
 /// `--interval`: live watch, redrawing every `interval_ms` (first frame quick).
 ///
-/// A background thread restores the cursor and exits on SIGINT/SIGTERM (JS
-/// `restore`); the main loop hides the cursor, then clears + redraws each frame,
+/// A background thread restores the cursor and exits on SIGINT/SIGTERM; the
+/// main loop hides the cursor, then clears + redraws each frame,
 /// widening the CPU window from the quick first frame to `interval_ms`.
 pub fn run_interval(client: &mut Herdr, labels: &Labels, interval_ms: u64) -> crate::Result<()> {
     let mut signals = Signals::new([SIGINT, SIGTERM])?;
@@ -300,9 +296,8 @@ pub fn run_interval(client: &mut Herdr, labels: &Labels, interval_ms: u64) -> cr
     }
 }
 
-/// Local wall-clock `HH:MM:SS` for the live-watch footer stamp (JS
-/// `new Date().toLocaleTimeString()`; the exact locale format is cosmetic and
-/// not part of any parity contract).
+/// Local wall-clock `HH:MM:SS` for the live-watch footer stamp (cosmetic — not
+/// part of any output contract).
 fn local_time_string() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -340,7 +335,7 @@ mod tests {
     #[test]
     fn fmt_ram_switches_unit_at_1024() {
         assert_eq!(fmt_ram(0.0), "0 MB");
-        assert_eq!(fmt_ram(512.4), "512 MB"); // toFixed(0) rounds
+        assert_eq!(fmt_ram(512.4), "512 MB"); // rounds to whole MB
         assert_eq!(fmt_ram(1023.9), "1024 MB"); // still MB below the 1024 gate
         assert_eq!(fmt_ram(1024.0), "1.00 GB");
         assert_eq!(fmt_ram(1536.0), "1.50 GB");
@@ -445,7 +440,7 @@ mod tests {
 
         let out = render_json(&[a, b]);
 
-        // Keys appear in the exact index.js order.
+        // Keys appear in the declared order.
         let order = [
             "workspace_id",
             "label",

@@ -13,7 +13,12 @@
 
 id = "ez-corp.space-usage"
 name = "PC RAM & CPU Usage Overlay"
-version = "1.2.0"
+version = "1.3.0"
+# Oldest herdr with every API this plugin calls: `session.snapshot`, the `tokens`
+# metadata API on `pane.report_metadata` / `workspace.report_metadata`, and
+# `pane.process_info` — all 0.7.5. Diffing the two bundled API schemas
+# (`herdr api schema`, protocol 17 → 19) shows 0.8.0 changed none of the types
+# used here, so this stays put; developed and tested against 0.8.0.
 min_herdr_version = "0.7.5"
 description = "CPU and RAM usage per space, grouped under the branch name."
 platforms = ["linux"]
@@ -56,7 +61,7 @@ command = ["./target/release/space-usage", "--once"]
 # Sidebar status updater: a background daemon that pushes each space's usage
 # as display-only metadata on a spare shell pane; the locally patched herdr
 # renders it as a third row in the sidebar spaces card. Statuses carry a TTL,
-# so they self-clear if the daemon dies.
+# so the text self-clears if the daemon dies.
 [[actions]]
 id = "status-toggle"
 title = "Toggle sidebar usage status"

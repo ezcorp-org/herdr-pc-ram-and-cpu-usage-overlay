@@ -1,5 +1,4 @@
-//! Plugin config + herdr `[ui]` label loading, and env/state path resolution
-//! (mirrors `index.js` lines 350-417).
+//! Plugin config + herdr `[ui]` label loading, and env/state path resolution.
 //!
 //! - [`load_config`] parses `$HERDR_PLUGIN_CONFIG_DIR/config.toml` (flat
 //!   `key = value` lines).
@@ -56,6 +55,18 @@ impl Default for Labels {
 /// Default plugin id when herdr does not inject `HERDR_PLUGIN_ID`.
 const DEFAULT_PLUGIN_ID: &str = "ez-corp.space-usage";
 
+/// Upper bound on `interval_seconds` (8 h).
+///
+/// The daemon gives every status a TTL of three intervals, and herdr rejects a
+/// `ttl_ms` above 24 h — so past this the sidebar would silently stay blank
+/// because every report was refused. Clamping here rather than in the TTL is
+/// deliberate: capping only the TTL would let it fall *below* the refresh
+/// interval, so statuses would blink out between pushes. It also keeps the
+/// millisecond arithmetic well clear of overflow.
+///
+/// [`crate::daemon`] ties this to herdr's ceiling with a compile-time assert.
+pub(crate) const MAX_INTERVAL_SECONDS: u64 = 28_800;
+
 /// Load the plugin's own `config.toml`, returning defaults if it is absent.
 pub fn load_config() -> Config {
     match std::fs::read_to_string(config_dir().join("config.toml")) {
@@ -108,8 +119,8 @@ pub fn enabled_flag() -> PathBuf {
 
 // ---- env / path resolution --------------------------------------------------
 
-/// Read `name` from the environment, treating unset AND empty as absent — the
-/// JS `process.env.X || fallback` idiom (an empty string is falsy in JS).
+/// Read `name` from the environment, treating unset AND empty as absent — herdr
+/// injects an empty string for a value it has no answer for.
 pub(crate) fn non_empty_env(name: &str) -> Option<String> {
     match std::env::var(name) {
         Ok(v) if !v.is_empty() => Some(v),
@@ -117,8 +128,7 @@ pub(crate) fn non_empty_env(name: &str) -> Option<String> {
     }
 }
 
-/// User home directory from `$HOME` (matches `os.homedir()` on Linux), or an
-/// empty path when unset.
+/// User home directory from `$HOME`, or an empty path when unset.
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -140,7 +150,7 @@ fn herdr_config_path() -> PathBuf {
 // ---- pure parsers (hand-rolled, no `toml` crate) ----------------------------
 
 /// Parse the plugin's flat `config.toml` text into a [`Config`], starting from
-/// the documented defaults (mirrors JS `loadConfig`).
+/// the documented defaults.
 ///
 /// Recognised keys: `mode` (`agents-panel` | `sidebar`), `interval_seconds`
 /// (numeric `>= 1`), `window_title_totals` (`false` only when it equals the
@@ -157,13 +167,15 @@ fn parse_config(text: &str) -> Config {
         match key {
             "mode" if value == "sidebar" => cfg.mode = Mode::Sidebar,
             "mode" if value == "agents-panel" => cfg.mode = Mode::AgentsPanel,
-            // `Number(value) >= 1`: accept any numeric >= 1. The struct stores
-            // whole seconds, so a fractional value is truncated (JS keeps it as
-            // a float, but the daemon only ever uses it as a coarse cadence).
+            // Accept any numeric >= 1, clamped to `MAX_INTERVAL_SECONDS`. The
+            // struct stores whole seconds, so a fractional value is truncated —
+            // the daemon only ever uses this as a coarse cadence.
             "interval_seconds" => {
                 if let Ok(n) = value.parse::<f64>() {
                     if n >= 1.0 {
-                        cfg.interval_seconds = n as u64;
+                        // A huge float saturates rather than wrapping, so the
+                        // `min` still lands on the cap.
+                        cfg.interval_seconds = (n as u64).min(MAX_INTERVAL_SECONDS);
                     }
                 }
             }
@@ -175,8 +187,7 @@ fn parse_config(text: &str) -> Config {
 }
 
 /// Parse herdr's OWN `config.toml` text for `cpu_label` / `ram_label`, reading
-/// them ONLY inside the `[ui]` section — not `[ui.toast]` or any other table
-/// (mirrors JS `loadHerdrLabels`).
+/// them ONLY inside the `[ui]` section — not `[ui.toast]` or any other table.
 fn parse_herdr_labels(text: &str) -> Labels {
     let mut labels = Labels::default();
     let mut in_ui = false;
@@ -211,12 +222,12 @@ fn section_name(line: &str) -> Option<&str> {
 
 /// Split one flat `key = value` line into `(key, unquoted_value)`.
 ///
-/// Mirrors the JS `^\s*([A-Za-z_]+)\s*=\s*(.+?)\s*$` key/value regex plus the
-/// `^["']|["']$` quote strip: the key is one or more ASCII letters/underscores,
+/// Deliberately naive, matching the subset of TOML these config files use: the
+/// key is one or more ASCII letters/underscores,
 /// the value is everything after the FIRST `=` with surrounding whitespace
 /// trimmed (non-empty required) and at most one leading and one trailing quote
 /// (`"` or `'`) removed. Inline `#` comments are NOT stripped — by design, to
-/// match the naive JS parser.
+/// keep the parser predictable.
 fn parse_kv_line(line: &str) -> Option<(&str, &str)> {
     let (key, value) = line.split_once('=')?;
     let key = key.trim();
@@ -232,7 +243,7 @@ fn parse_kv_line(line: &str) -> Option<(&str, &str)> {
 
 /// Remove at most one leading and one trailing quote (`"` or `'`), independently
 /// — the `str.replace(/^["']|["']$/g, '')` behaviour (mismatched quotes and a
-/// lone quote are handled the same way JS handles them).
+/// lone quote both collapse rather than erroring).
 fn strip_quotes(s: &str) -> &str {
     let is_quote = |c: char| c == '"' || c == '\'';
     let s = s.strip_prefix(is_quote).unwrap_or(s);
@@ -277,6 +288,25 @@ mod tests {
         assert_eq!(parse_config("interval_seconds = 0").interval_seconds, 5);
         assert_eq!(parse_config("interval_seconds = -3").interval_seconds, 5);
         assert_eq!(parse_config("interval_seconds = fast").interval_seconds, 5);
+    }
+
+    #[test]
+    fn config_interval_seconds_is_clamped_to_the_ttl_ceiling() {
+        // herdr caps `ttl_ms` at 24 h and the daemon asks for three intervals,
+        // so anything past the cap would have every report refused.
+        assert_eq!(
+            parse_config("interval_seconds = 28800").interval_seconds,
+            MAX_INTERVAL_SECONDS,
+        );
+        assert_eq!(
+            parse_config("interval_seconds = 999999").interval_seconds,
+            MAX_INTERVAL_SECONDS,
+        );
+        // A float far past u64 saturates on cast, then clamps — never wraps.
+        assert_eq!(
+            parse_config("interval_seconds = 1e30").interval_seconds,
+            MAX_INTERVAL_SECONDS,
+        );
     }
 
     #[test]
@@ -337,7 +367,7 @@ mod tests {
 
     #[test]
     fn labels_section_header_is_trimmed_before_matching() {
-        // `[ ui ]` still counts as the ui table (JS trims the captured name).
+        // `[ ui ]` still counts as the ui table — the name is trimmed.
         let labels = parse_herdr_labels("[ ui ]\ncpu_label = X\n");
         assert_eq!(labels.cpu, "X");
     }

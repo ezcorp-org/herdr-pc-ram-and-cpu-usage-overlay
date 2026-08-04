@@ -1,4 +1,4 @@
-//! `/proc` sampling and `sysconf` probes (mirrors `index.js` lines 52-216).
+//! `/proc` sampling and `sysconf` probes.
 //!
 //! Everything here is host-local: reading `/proc/<pid>/stat` for CPU jiffies and
 //! parent PIDs, `/proc/<pid>/statm` for RSS, and `/proc/meminfo` for the total.
@@ -37,7 +37,7 @@ pub fn page_size() -> u64 {
 }
 
 /// Number of online logical CPUs (`_SC_NPROCESSORS_ONLN`); normalizes CPU%.
-/// At least 1 (`os.cpus().length || 1` in the JS).
+/// At least 1.
 pub fn nproc() -> u64 {
     sysconf(libc::_SC_NPROCESSORS_ONLN, 1).max(1)
 }
@@ -52,7 +52,7 @@ pub fn scan_proc() -> HashMap<u32, ProcEntry> {
     };
     for entry in dir.flatten() {
         // Numeric directory names are pids; everything else (`self`, `meminfo`,
-        // ..) fails to parse and is skipped — mirrors the JS digit-only filter.
+        // ..) fails to parse and is skipped.
         let pid: u32 = match entry.file_name().to_string_lossy().parse() {
             Ok(pid) => pid,
             Err(_) => continue,
@@ -124,7 +124,7 @@ fn parse_mem_total_mb(meminfo: &str) -> Option<f64> {
 }
 
 /// Total system RAM in MB from `/proc/meminfo` `MemTotal` (0 if unreadable).
-/// Read once and cached, matching the JS module-level memo.
+/// Read once and cached for the process lifetime.
 pub fn mem_total_mb() -> f64 {
     static MEM_TOTAL_MB: OnceLock<f64> = OnceLock::new();
     *MEM_TOTAL_MB.get_or_init(|| {
@@ -138,7 +138,8 @@ pub fn mem_total_mb() -> f64 {
 /// Render `mb` as a whole-percent-of-`total_mb` string, or `""` when unknown.
 fn pct_string(mb: f64, total_mb: f64) -> String {
     if total_mb > 0.0 {
-        // `round()` matches JS `Math.round` for the non-negative values here.
+        // `round()` is half-away-from-zero, which for these non-negative
+        // values is ordinary half-up rounding.
         format!("{}%", (100.0 * mb / total_mb).round() as i64)
     } else {
         String::new()
@@ -231,7 +232,7 @@ mod tests {
     fn ram_pct_math_rounds_and_guards_zero_total() {
         // 100 * 1024 / 16384 = 6.25 -> 6
         assert_eq!(pct_string(1024.0, 16384.0), "6%");
-        // 100 * 250 / 10000 = 2.5 -> 3 (half away from zero, like Math.round)
+        // 100 * 250 / 10000 = 2.5 -> 3 (half away from zero)
         assert_eq!(pct_string(250.0, 10000.0), "3%");
         // full machine
         assert_eq!(pct_string(16384.0, 16384.0), "100%");

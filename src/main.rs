@@ -1,11 +1,11 @@
 //! Space Usage — CPU / RAM per herdr space (workspace).
 //!
-//! Rust rewrite of `index.js`. For every workspace herdr reports, we find each
+//! For every workspace herdr reports, we find each
 //! pane's shell process (via the herdr socket), walk that PID's `/proc` subtree,
 //! and sum CPU% (from utime+stime deltas over a sample window, normalized across
 //! all CPU cores) and RSS memory. Results are grouped by space.
 //!
-//! Modes (argv flags, parity with the JS version):
+//! Modes (argv flags):
 //!   --once            print a single snapshot and exit (used by the action)
 //!   --interval N      live watch, refreshing every N seconds (used by the pane)
 //!   --json            emit machine-readable JSON and exit

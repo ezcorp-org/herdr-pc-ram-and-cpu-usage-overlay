@@ -51,15 +51,19 @@ herdr plugin action invoke report --plugin ez-corp.space-usage             # one
 ./target/release/space-usage --json                                        # machine-readable
 ```
 
-Statuses carry a TTL and self-clear if the updater dies; disabling clears
-everything immediately.
+Status **text** carries a TTL and self-clears if the updater dies. In
+agents-panel mode the `usage` pseudo-agent row itself has no TTL (herdr's
+`pane.report_agent` takes none), so a hard-killed updater leaves an empty row
+behind until the next `status-enable`/`status-disable`. Disabling clears
+everything immediately either way.
 
 The updater **survives herdr restarts**. Enabling it records that you want it;
 herdr then runs the manifest's `[[startup]]` hook (`--restore`) on every server
 start — including a live `herdr update --handoff` — which brings the daemon back
 if it isn't already running. Disabling clears that record, so a deliberate
 `status-disable` stays disabled across restarts. A fresh install starts with no
-record, so nothing runs until you enable it once. Requires herdr ≥ 0.7.5.
+record, so nothing runs until you enable it once. Requires herdr ≥ 0.7.5;
+verified against 0.7.5 and 0.8.0.
 
 > **Upgrading from < 1.2.0?** The record is only written when you enable the
 > updater, so an updater enabled under an older version isn't yet marked as
@@ -74,7 +78,7 @@ Configure in `$HERDR_PLUGIN_CONFIG_DIR/config.toml`
 ```toml
 mode = "agents-panel"       # default — works on stock herdr
 # mode = "sidebar"          # for herdr builds with the sidebar patch (below)
-interval_seconds = 5
+interval_seconds = 5        # 1..28800; statuses get a TTL of three intervals
 window_title_totals = true
 ```
 
@@ -124,6 +128,19 @@ workspace and pane in a single call → `pane.process_info` yields each pane's
 (utime+stime jiffie deltas over a sample window) and RSS. Branch comes from the
 pane cwd's git checkout, and worktree families from `worktree.list`. Clock ticks
 (`_SC_CLK_TCK`) and page size (`_SC_PAGESIZE`) are probed via `sysconf`.
+
+Workspaces and panes deliberately come from the **one** `session.snapshot` call
+rather than `workspace.list` plus a `pane.list` per workspace: the two can be
+read torn apart, and a workspace that closes in between makes the follow-up
+`pane.list` fail with `workspace_not_found` — which used to abort the whole
+sample.
+
+Branch and worktree grouping are read from the pane `cwd` and `worktree.list`
+rather than from the `worktree` block on `workspace.list`. That block can stay
+`null` indefinitely for a workspace that really is a repo, so relying on it
+would blank the branch out. For the same reason the branch uses `cwd` and not
+`foreground_cwd` — the latter is the field that became non-blocking in 0.8.0
+(#1838, #2206) and transiently reports `/`.
 
 ## Development
 
