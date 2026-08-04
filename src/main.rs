@@ -26,7 +26,14 @@ mod daemon;
 mod herdr;
 mod icons;
 mod model;
-#[cfg(unix)]
+// One `proc` module per platform, selected here so every consumer just says
+// `proc::`. macOS is carved out of the unix arm because it has no `/proc`;
+// the other BSDs stay on the sysfs reader, which is what they had before and
+// is closer to right for them than the Darwin libproc backend would be.
+#[cfg(all(unix, not(target_os = "macos")))]
+mod proc;
+#[cfg(target_os = "macos")]
+#[path = "proc_macos.rs"]
 mod proc;
 #[cfg(windows)]
 #[path = "proc_windows.rs"]
