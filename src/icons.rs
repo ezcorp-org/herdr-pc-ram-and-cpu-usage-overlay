@@ -457,6 +457,11 @@ fn probe_nerd_font(_glyph: char) -> bool {
 /// no match, so non-empty stdout on a successful exit IS the answer. Whitespace
 /// alone does not count: a shell that echoes a bare newline must not read as a
 /// font.
+///
+/// Compiled on every target although only the Linux probe calls it, so the
+/// logic stays under test everywhere — the same reason `battery::sysfs` carries
+/// this waiver.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn font_list_reports_coverage(status_ok: bool, stdout: &[u8]) -> bool {
     status_ok && stdout.iter().any(|byte| !byte.is_ascii_whitespace())
 }
