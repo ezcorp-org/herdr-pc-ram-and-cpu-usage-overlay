@@ -452,6 +452,27 @@ mod tests {
     }
 
     #[test]
+    fn classify_misreads_a_foreign_usage_token_as_ours() {
+        // KNOWN LIMITATION, pinned deliberately rather than left as prose.
+        //
+        // herdr merges every plugin's tokens into one flat map and does not say
+        // who wrote what, so `usage` from another plugin is indistinguishable
+        // from ours and its pane is offered as a spare — the pane-grab this
+        // guard otherwise prevents. Closing it means renaming our token, which
+        // silently blanks the sidebar of everyone whose herdr config says
+        // `$usage`; with the plugin already widely installed that trade is not
+        // worth a collision no plugin has yet caused. The real fix is upstream:
+        // expose on read the `source` that `pane.report_metadata` already
+        // requires on write.
+        //
+        // If this test ever fails, the rename happened — update the README's
+        // "Living alongside other plugins" section with it.
+        let panes = [pane_with_tokens("someone-elses", &[PSEUDO_AGENT])];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+        assert_eq!(classify_panes(&refs).spare_panes, ["someone-elses"]);
+    }
+
+    #[test]
     fn classify_treats_an_empty_token_map_as_a_plain_pane() {
         // herdr sends `tokens` as an empty object once every token on a pane has
         // expired or been cleared. "Present but empty" is not ownership.
