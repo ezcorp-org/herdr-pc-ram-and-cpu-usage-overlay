@@ -233,20 +233,50 @@ honours them too — and **an explicit label replaces the tier's glyph rather th
 stacking with it**, so you never get the icon drawn twice:
 
 ```toml
-# in herdr's own config.toml
+# in herdr's own config.toml — drives BOTH the header and these rows
 [ui]
 cpu_label = ""
 ram_label = ""
-battery_label = ""     # plugin-only; the header has no battery
 ```
 
-`space-usage --icons` prints exactly this block for whichever tier you are
-previewing, so you can copy it straight across. Pair it with `icons = "text"` in
-the plugin config — with the labels doing the naming, the tier has nothing left
-to add.
+```toml
+# in the plugin's config.toml — battery only
+battery_label = ""
+icons = "text"          # the labels are doing the naming now
+```
 
-Defaults are `cpu` / `ram` / `bat` when herdr names nothing. Restart the updater
-to pick up a change.
+`space-usage --icons` prints the `[ui]` block for whichever tier you are
+previewing, so you can copy it straight across.
+
+**Why battery is in the other file:** herdr has no battery of its own to label,
+so `battery_label` is not a key it knows. Putting it in herdr's `[ui]` makes
+every `herdr server reload-config` report
+`unknown config key ui.battery_label; ignoring key`. Nothing outside this plugin
+renders a battery, so there is no second surface to keep in step. `cpu_label`
+and `ram_label` live in herdr's config precisely because the header does share
+them.
+
+**Applying a change.** The updater re-reads both files every refresh, so the
+rows follow within one interval — no `status-toggle` needed. herdr's header
+picks up its own config on `herdr server reload-config`. So:
+
+```sh
+herdr server reload-config     # header updates; rows follow on the next refresh
+```
+
+Watch out for empty values. herdr ships these keys commented out with **blank**
+quotes and a note naming the glyph to paste:
+
+```toml
+# cpu_label = ""   #  nf-oct-cpu
+```
+
+Uncommenting that without pasting a glyph in leaves an empty label, which reads
+as *unset* — you get the tier's own naming back, not a blank. That is
+deliberate: honouring the blank literally would strip the naming off every row
+and leave bare percentages with no clue why.
+
+Defaults are `cpu` / `ram` / `bat` when nothing names them.
 
 ## How it works
 
