@@ -1,6 +1,6 @@
 [package]
 name = "space-usage"
-version = "1.4.1"
+version = "1.5.0"
 edition = "2021"
 description = "CPU and RAM usage per herdr space, grouped under the branch name."
 license = "MIT"
