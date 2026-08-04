@@ -8,15 +8,17 @@ a glance which space is eating your machine.
 ```
 ● web-app
     main
-    cpu 26% · ram 8%          ← spaces card (sidebar mode, patched herdr)
+    cpu ░26% · ram ░8% · bat ▓74%+   ← spaces card (sidebar mode)
 
 ⚡ web-app
-    idle · usage · cpu 26% · ram 8%   ← agents panel (default mode, stock herdr)
+    idle · usage · cpu ░26% · ram ░8%   ← agents panel (default mode)
 ```
 
 - Per-space CPU% and RAM%, both a share of the **whole machine** (0–100%, so a
   busy space reads e.g. `cpu 4%` — not a per-core figure that can exceed 100%),
   refreshed every 5s
+- **Battery** next to them, with a charge-level gauge — and **hidden entirely on
+  a machine that has none**, so desktops and servers see no empty cell
 - **Worktree-aware**: workspaces opened as worktree children are folded into
   their parent space's total
 - All-space totals in your terminal's window title: `spaces · cpu 39% · ram 8%`
@@ -24,7 +26,7 @@ a glance which space is eating your machine.
 - A small static Rust binary (~2–5 MB resident) that talks to herdr over its
   unix socket (a named pipe on Windows) — no per-sample subprocess spawns, no
   Node runtime
-- Runs on **Linux and Windows** (herdr Windows beta)
+- Runs on **Linux, macOS, and Windows** (herdr Windows beta)
 
 ## Install
 
@@ -32,10 +34,18 @@ a glance which space is eating your machine.
 herdr plugin install ezcorp-org/herdr-pc-ram-and-cpu-usage-overlay
 ```
 
-Requirements: Linux or Windows, and the **Rust toolchain** (`cargo`) on the box
-hosting the herdr server — herdr compiles the plugin at install time via
+Requirements: Linux, macOS, or Windows, and the **Rust toolchain** (`cargo`) on
+the box hosting the herdr server — herdr compiles the plugin at install time via
 `cargo build --release`. Plugins run on the machine hosting the herdr server, so
 remote setups need these on the server box only. `node` is no longer required.
+
+Each platform reads processes its own way, chosen at compile time:
+
+| Platform | Process sampling | Battery |
+|---|---|---|
+| Linux | `/proc` | `/sys/class/power_supply` |
+| macOS | `libproc` (`proc_listallpids`, `proc_pidinfo`) | `pmset -g batt` |
+| Windows | Toolhelp32 + `GetProcessTimes` | `GetSystemPowerStatus` |
 
 On Windows the sampling uses the Win32 process APIs instead of `/proc`, and the
 herdr socket is reached through its named pipe; both are handled automatically.
@@ -58,6 +68,7 @@ Other entrypoints:
 herdr plugin pane open --plugin ez-corp.space-usage --entrypoint dashboard  # live dashboard
 herdr plugin action invoke report --plugin ez-corp.space-usage             # one-shot snapshot
 ./target/release/space-usage --json                                        # machine-readable
+./target/release/space-usage --icons                                       # preview icon tiers
 ```
 
 Status **text** carries a TTL and self-clears if the updater dies. In
@@ -89,6 +100,8 @@ mode = "agents-panel"       # default — works on stock herdr
 # mode = "sidebar"          # for herdr builds with the sidebar patch (below)
 interval_seconds = 5        # 1..28800; statuses get a TTL of three intervals
 window_title_totals = true
+battery = true              # show the battery cell when the machine has one
+icons = "auto"              # auto | text | unicode | nerdfont | emoji
 ```
 
 - **agents-panel** (default): each space gets its own entry in the sidebar agents
@@ -121,12 +134,65 @@ Built-in `branch` / `git_status` (ahead/behind) tokens are native, so the old
 space-usage-line and git-dirty herdr patches are retired. Requires herdr ≥ 0.7.5
 (the `tokens` metadata API); older builds need plugin v1.0.x.
 
-## Labels
+## Battery
 
-The `cpu`/`ram` tokens are read from herdr's own `config.toml` `[ui]`
-(`cpu_label` / `ram_label`, default `cpu`/`ram`) — set them to nerd-font icons to
-taste. On a patched build this also matches the sidebar's system-usage header,
-which reads the same two keys. Restart the updater to pick up a change.
+The battery cell sits next to cpu and ram, and **disappears completely on a
+machine that has no battery** — a desktop, a server, or a VM shows nothing
+rather than a fabricated `0%`.
+
+```
+cpu ░26% · ram ░8% · bat ▓74%+      74% and charging
+cpu ░26% · ram ░8% · bat ▒52%       52% on battery
+cpu ░26% · ram ░8%                  no battery in this machine
+```
+
+A trailing `+` means charging; `=` means on power but holding (full, or capped
+by a vendor charge limit). Turn the cell off with `battery = false`, which also
+skips the read entirely — no sysfs walk, no `pmset` process.
+
+Two details worth knowing:
+
+- On Linux, peripherals register as batteries too. A wireless mouse appears in
+  `/sys/class/power_supply` as `type=Battery` with `scope=Device`; those are
+  filtered out, so your mouse never gets reported as the machine's battery.
+- Plugins run on the machine hosting the **herdr server**. Attach from a laptop
+  to a remote server and the battery shown is the *server's* — usually none.
+  That is consistent with cpu and ram, which are also the server's.
+
+Because herdr's sidebar has no machine-wide row, one battery reading is drawn
+once per space card. With three spaces open you will see it three times. The
+full-width `--once` report avoids this by putting it on the total line only.
+
+## Icons and labels
+
+`icons` picks the glyph vocabulary. Run **`space-usage --icons`** to see all four
+drawn in your own terminal before choosing — whether a Nerd Font is installed,
+and whether your terminal draws emoji at one column or two, is something only you
+can see.
+
+| tier | renders | needs |
+|---|---|---|
+| `text` | `cpu 26% · ram 8% · bat 74%` | nothing |
+| `unicode` | `cpu ░26% · ram ░8% · bat ▓74%` | nothing |
+| `nerdfont` | ` 26% ·  8% ·  74%` | a Nerd Font |
+| `emoji` | `💻26% · 🧠8% · 🔋74%` | a colour emoji font |
+
+`auto` (the default) picks `unicode` on a UTF-8 locale and `text` otherwise.
+
+The `unicode` tier is a **level gauge**, not a pictogram: `░` below 34%, `▒`
+below 67%, `▓` below 90%, `█` above. That choice is deliberate. There is no
+pictogram for "CPU" or "battery" that renders without installing a font — the
+battery emoji `U+1F50B` is absent from both DejaVu Sans Mono and Liberation Mono
+(the default Linux mono faces), and Nerd Font glyphs live in the Private Use
+Area. Every glyph the safe tiers emit was checked with `fc-list :charset=<cp>`
+against both faces and is present in both; a test asserts they stay inside the
+BMP, outside the Private Use Area, and on that measured list, so the "no font
+install" promise cannot rot.
+
+The words themselves come from herdr's own `config.toml` `[ui]` — `cpu_label`,
+`ram_label`, and `battery_label` (default `cpu`/`ram`/`bat`). An explicit label
+always wins over the tier's own wording, so you can still set them to whatever
+you like. Restart the updater to pick up a change.
 
 ## How it works
 

@@ -2,12 +2,16 @@
 //!
 //! - [`load_config`] parses `$HERDR_PLUGIN_CONFIG_DIR/config.toml` (flat
 //!   `key = value` lines).
-//! - [`load_herdr_labels`] reads `cpu_label` / `ram_label` from herdr's OWN
-//!   `[ui]` section so per-space rows match the patched sidebar header.
+//! - [`load_herdr_labels`] reads `cpu_label` / `ram_label` / `battery_label`
+//!   from herdr's OWN `[ui]` section so per-space rows match the patched
+//!   sidebar header.
 //! - The path helpers resolve the herdr-injected env (`HERDR_PLUGIN_*`) with the
 //!   same `<tmpdir>/<id>` fallbacks the runtime uses.
 
 use std::path::PathBuf;
+
+use crate::battery::{self, Battery};
+use crate::icons::{self, IconSet};
 
 /// Status-surfacing strategy (plugin `config.toml` `mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +28,13 @@ pub struct Config {
     pub mode: Mode,
     pub interval_seconds: u64,
     pub window_title_totals: bool,
+    /// Whether to show the battery cell at all. On by default; a host with no
+    /// battery hides it regardless (see [`Config::battery_reading`]).
+    pub battery: bool,
+    /// Glyph tier name as the user typed it — [`crate::icons::resolve`] is what
+    /// gives it meaning, so an unknown value auto-detects instead of failing
+    /// here.
+    pub icons: String,
 }
 
 impl Default for Config {
@@ -32,15 +43,48 @@ impl Default for Config {
             mode: Mode::AgentsPanel,
             interval_seconds: 5,
             window_title_totals: true,
+            battery: true,
+            icons: "auto".to_string(),
         }
     }
 }
 
-/// CPU / RAM label tokens sourced from herdr's `[ui]` config (default cpu/ram).
+impl Config {
+    /// The glyph tier this config selects.
+    ///
+    /// Resolve once per refresh and pass the result down: the answer depends on
+    /// the locale environment, which cannot change while the process runs, so
+    /// re-resolving per space would be pure repetition.
+    pub fn icon_set(&self) -> IconSet {
+        icons::resolve(Some(&self.icons))
+    }
+
+    /// The machine-wide battery reading for one refresh cycle, or `None` when
+    /// this host has no battery or the user turned the metric off.
+    ///
+    /// The `battery = false` gate lives here, at the *read*, rather than at each
+    /// place a cell is drawn. An opted-out user then pays nothing for the metric
+    /// — no sysfs walk on Linux, no `pmset` child process on macOS — and every
+    /// surface downstream (sidebar, window title, terminal report, JSON) is off
+    /// by construction instead of by four separate checks that could drift.
+    /// Turning the metric off therefore looks exactly like a desktop to the
+    /// renderers, which is the honest answer: there is no reading to show.
+    ///
+    /// Call this ONCE per refresh and pass the `Option<Battery>` down. A battery
+    /// is one value for the whole machine, so calling it per space would re-walk
+    /// sysfs (or fork `pmset`) once per space to be told the same thing.
+    pub fn battery_reading(&self) -> Option<Battery> {
+        self.battery.then(battery::read).flatten()
+    }
+}
+
+/// CPU / RAM / battery label tokens sourced from herdr's `[ui]` config
+/// (default cpu/ram/bat).
 #[derive(Debug, Clone)]
 pub struct Labels {
     pub cpu: String,
     pub ram: String,
+    pub battery: String,
 }
 
 impl Default for Labels {
@@ -48,6 +92,7 @@ impl Default for Labels {
         Self {
             cpu: "cpu".to_string(),
             ram: "ram".to_string(),
+            battery: "bat".to_string(),
         }
     }
 }
@@ -75,7 +120,8 @@ pub fn load_config() -> Config {
     }
 }
 
-/// Load `cpu_label` / `ram_label` from herdr's `[ui]` config section.
+/// Load `cpu_label` / `ram_label` / `battery_label` from herdr's `[ui]` config
+/// section.
 pub fn load_herdr_labels() -> Labels {
     match std::fs::read_to_string(herdr_config_path()) {
         Ok(text) => parse_herdr_labels(&text),
@@ -159,8 +205,10 @@ fn herdr_config_path() -> PathBuf {
 /// the documented defaults.
 ///
 /// Recognised keys: `mode` (`agents-panel` | `sidebar`), `interval_seconds`
-/// (numeric `>= 1`), `window_title_totals` (`false` only when it equals the
-/// literal `false`, any other value is truthy). Unknown keys are ignored.
+/// (numeric `>= 1`), `window_title_totals` and `battery` (`false` only when
+/// they equal the literal `false`, any other value is truthy), and `icons`
+/// (a tier name kept verbatim for [`crate::icons::resolve`]). Unknown keys are
+/// ignored.
 fn parse_config(text: &str) -> Config {
     let mut cfg = Config::default();
     for line in text.split('\n') {
@@ -186,14 +234,19 @@ fn parse_config(text: &str) -> Config {
                 }
             }
             "window_title_totals" => cfg.window_title_totals = value != "false",
+            "battery" => cfg.battery = value != "false",
+            // Stored raw: naming the tiers in two places would let the parser
+            // and `icons::resolve` disagree about what `Nerd-Font` means.
+            "icons" => cfg.icons = value.to_string(),
             _ => {}
         }
     }
     cfg
 }
 
-/// Parse herdr's OWN `config.toml` text for `cpu_label` / `ram_label`, reading
-/// them ONLY inside the `[ui]` section — not `[ui.toast]` or any other table.
+/// Parse herdr's OWN `config.toml` text for `cpu_label` / `ram_label` /
+/// `battery_label`, reading them ONLY inside the `[ui]` section — not
+/// `[ui.toast]` or any other table.
 fn parse_herdr_labels(text: &str) -> Labels {
     let mut labels = Labels::default();
     let mut in_ui = false;
@@ -212,6 +265,7 @@ fn parse_herdr_labels(text: &str) -> Labels {
         match parse_kv_line(line) {
             Some(("cpu_label", value)) => labels.cpu = value.to_string(),
             Some(("ram_label", value)) => labels.ram = value.to_string(),
+            Some(("battery_label", value)) => labels.battery = value.to_string(),
             _ => {}
         }
     }
@@ -268,6 +322,8 @@ mod tests {
         assert_eq!(cfg.mode, Mode::AgentsPanel);
         assert_eq!(cfg.interval_seconds, 5);
         assert!(cfg.window_title_totals);
+        assert!(cfg.battery, "the battery cell is on unless opted out");
+        assert_eq!(cfg.icons, "auto");
     }
 
     #[test]
@@ -325,6 +381,44 @@ mod tests {
     }
 
     #[test]
+    fn config_battery_false_only_on_literal_false() {
+        assert!(!parse_config("battery = false").battery);
+        assert!(!parse_config("battery = \"false\"").battery);
+        // Anything other than the literal `false` is truthy — same rule as
+        // `window_title_totals`, so the two booleans cannot drift apart.
+        assert!(parse_config("battery = true").battery);
+        assert!(parse_config("battery = 0").battery);
+    }
+
+    #[test]
+    fn config_battery_false_takes_no_reading_at_all() {
+        // The whole point of the gate: opting out costs zero syscalls, and
+        // every renderer downstream sees the same `None` a desktop produces.
+        // Hardware-independent — true on a laptop and on a VM alike.
+        let cfg = parse_config("battery = false");
+        assert_eq!(cfg.battery_reading(), None);
+    }
+
+    #[test]
+    fn config_icons_keeps_the_raw_tier_name() {
+        // The parser stores what the user typed; `icons::resolve` owns the
+        // vocabulary, including the case/separator folding it does.
+        assert_eq!(parse_config("icons = nerdfont").icons, "nerdfont");
+        assert_eq!(parse_config("icons = \"Nerd-Font\"").icons, "Nerd-Font");
+        assert_eq!(parse_config("icons = bogus").icons, "bogus");
+        assert_eq!(
+            parse_config("icons = nerdfont").icon_set(),
+            IconSet::NerdFont,
+        );
+        // A typo is cosmetic, never fatal: it falls back to auto-detection,
+        // which yields one of the two tiers that need no font installed.
+        assert!(matches!(
+            parse_config("icons = bogus").icon_set(),
+            IconSet::Text | IconSet::Unicode,
+        ));
+    }
+
+    #[test]
     fn config_skips_comments_and_malformed_lines() {
         let text = "\
             # mode = sidebar\n\
@@ -344,6 +438,7 @@ mod tests {
         let labels = parse_herdr_labels("[server]\ncpu_label = \"NOPE\"\n");
         assert_eq!(labels.cpu, "cpu");
         assert_eq!(labels.ram, "ram");
+        assert_eq!(labels.battery, "bat");
     }
 
     #[test]
@@ -352,12 +447,15 @@ mod tests {
             [ui]\n\
             cpu_label = \"C\"\n\
             ram_label = 'M'\n\
+            battery_label = \"PWR\"\n\
             [ui.toast]\n\
             cpu_label = \"WRONG\"\n\
-            ram_label = \"WRONG\"\n";
+            ram_label = \"WRONG\"\n\
+            battery_label = \"WRONG\"\n";
         let labels = parse_herdr_labels(text);
         assert_eq!(labels.cpu, "C"); // from [ui], not [ui.toast]
         assert_eq!(labels.ram, "M");
+        assert_eq!(labels.battery, "PWR");
     }
 
     #[test]

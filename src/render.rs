@@ -4,15 +4,22 @@
 //! builds the machine-readable payload. The `run_*` helpers drive a
 //! [`collect::snapshot`](crate::collect::snapshot) and print the result, with
 //! `run_interval` clearing and redrawing each frame.
+//!
+//! Every surface's metric cells are assembled here — including the narrow ones
+//! the sidebar daemon and the `--icons` preview draw ([`usage_row`]) — so there
+//! is one place that decides what a metric looks like and the surfaces cannot
+//! drift apart.
 
 use std::io::{self, IsTerminal, Write};
 
 use serde::Serialize;
 use serde_json::Number;
 
+use crate::battery::{Battery, State};
 use crate::collect;
-use crate::config::Labels;
+use crate::config::{Config, Labels};
 use crate::herdr::Herdr;
+use crate::icons::IconSet;
 use crate::model::Space;
 use crate::proc;
 
@@ -88,16 +95,119 @@ fn fmt_ram(mb: f64) -> String {
     }
 }
 
+/// Compact absolute RAM: `"<x.x>G"` at/above 1024 MB, else `"<n>M"`
+/// — the narrow form the sidebar falls back to.
+fn compact_ram(mb: f64) -> String {
+    if mb >= 1024.0 {
+        format!("{:.1}G", mb / 1024.0)
+    } else {
+        format!("{}M", mb.round() as i64)
+    }
+}
+
+// ---- narrow metric cells ----------------------------------------------------
+//
+// The sidebar status, the window title, and the `--icons` preview all draw the
+// same few characters, so they all build them here.
+
+/// Separator between the cells of a narrow metric row.
+const CELL_SEPARATOR: &str = " · ";
+
+/// The narrow RAM cell — the tier's rendering of RAM as a percent of the
+/// machine's total (`ram ░8%`).
+///
+/// RAM is the one metric that is not simply a percentage. With MemTotal
+/// unreadable there is nothing to be a percentage *of*, so the cell falls back
+/// to the compact absolute (`ram 1.5G`) the sidebar has always shown there. The
+/// tier deliberately contributes nothing in that branch: a gauge glyph measures
+/// a level, and drawing one beside an absolute figure would be inventing a
+/// reading we do not have.
+fn ram_cell(icons: IconSet, label: &str, mb: f64) -> String {
+    ram_cell_of(icons, label, mb, proc::mem_total_mb())
+}
+
+/// [`ram_cell`] with the machine total injected.
+///
+/// The seam exists for the tests: the real total is read once and cached for the
+/// process, so a test host with a readable `/proc/meminfo` could never reach the
+/// fallback branch (and one without it could never reach the percent branch).
+fn ram_cell_of(icons: IconSet, label: &str, mb: f64, mem_total_mb: f64) -> String {
+    if mem_total_mb > 0.0 {
+        // Same arithmetic and rounding as `proc::ram_pct`, so the Text tier
+        // reproduces the pre-icons sidebar byte for byte.
+        icons.ram(label, 100.0 * mb / mem_total_mb)
+    } else {
+        format!("{label} {}", compact_ram(mb))
+    }
+}
+
+/// The battery cell, or nothing when there is no reading to show.
+///
+/// A helper rather than a `map` at each call site so the sidebar row, the window
+/// title, and the report's total line cannot disagree about what a battery looks
+/// like. `reading` is already `None` when the user turned the metric off — see
+/// [`Config::battery_reading`].
+fn battery_cell(icons: IconSet, labels: &Labels, reading: Option<Battery>) -> Option<String> {
+    reading.map(|reading| icons.battery(&labels.battery, reading))
+}
+
+/// Join the cells of one narrow row: `cpu ░26% · ram ░8% · bat ▓74%`.
+///
+/// Split from [`usage_row`] so the `--icons` preview can feed it fixed sample
+/// percentages — a preview built out of the host's real RAM total would show a
+/// different row on every machine — while still going through the one function
+/// that decides cell order and separator.
+pub fn metric_row(cpu: String, ram: String, battery: Option<String>) -> String {
+    let mut cells = vec![cpu, ram];
+    cells.extend(battery); // absent battery: no cell, no trailing separator
+    cells.join(CELL_SEPARATOR)
+}
+
+/// One set of totals as a narrow row — what the sidebar card and the window
+/// title show.
+///
+/// `battery` is the machine-wide reading taken once per refresh cycle by
+/// [`Config::battery_reading`] and passed down, never re-read here: this runs
+/// once per space, and the battery is one value for the whole machine.
+pub fn usage_row(
+    cpu: f64,
+    ram_mb: f64,
+    labels: &Labels,
+    icons: IconSet,
+    battery: Option<Battery>,
+) -> String {
+    metric_row(
+        icons.cpu(&labels.cpu, cpu),
+        ram_cell(icons, &labels.ram, ram_mb),
+        battery_cell(icons, labels, battery),
+    )
+}
+
 // ---- human render -----------------------------------------------------------
 
 /// Format the per-space CPU/RAM report as a coloured, multi-line string.
-pub fn render(spaces: &[Space], labels: &Labels) -> String {
-    render_styled(spaces, labels, &Style::detect())
+///
+/// `battery` lands on the total line and nowhere else. It is one number for the
+/// whole machine, so stamping the same figure onto every space's row would be
+/// noise in a report this wide — and worse, would read as if it were per-space.
+pub fn render(
+    spaces: &[Space],
+    labels: &Labels,
+    icons: IconSet,
+    battery: Option<Battery>,
+) -> String {
+    render_styled(spaces, labels, icons, battery, &Style::detect())
 }
 
 /// Colour-parametrised body of [`render`] (split out so tests can force a
 /// deterministic no-colour rendering).
-fn render_styled(spaces: &[Space], labels: &Labels, style: &Style) -> String {
+fn render_styled(
+    spaces: &[Space],
+    labels: &Labels,
+    icons: IconSet,
+    battery: Option<Battery>,
+    style: &Style,
+) -> String {
     let mut lines: Vec<String> = vec![style.bold("  CPU / RAM per space"), String::new()];
     if spaces.is_empty() {
         lines.push(style.dim("  No spaces open."));
@@ -163,13 +273,19 @@ fn render_styled(spaces: &[Space], labels: &Labels, style: &Style) -> String {
     } else {
         format!(" ({total_pct})")
     };
+    // Three spaces is the gap between the total line's other cells, so the
+    // battery joins the row rather than looking bolted on.
+    let total_battery_str = battery_cell(icons, labels, battery)
+        .map(|cell| format!("   {cell}"))
+        .unwrap_or_default();
     lines.push(style.dim(&format!(
-        "  ── total   {} {:.1}%   {} {}{}",
+        "  ── total   {} {:.1}%   {} {}{}{}",
         labels.cpu,
         total_cpu,
         labels.ram,
         fmt_ram(total_ram),
         total_pct_str,
+        total_battery_str,
     )));
 
     lines.join("\n")
@@ -196,6 +312,32 @@ struct JsonSpace {
     /// value omits the key entirely rather than emitting `null`.
     #[serde(skip_serializing_if = "Option::is_none")]
     includes_worktrees: Option<Vec<String>>,
+    /// Machine-wide battery charge, repeated on every row — the payload's top
+    /// level is an array of spaces, and adding a wrapper object to hold one
+    /// machine-wide field would break every existing consumer. `null` on a host
+    /// with no battery (and when the user set `battery = false`, which reads the
+    /// same way from here: there is nothing to report).
+    ///
+    /// Trailing, like [`Self::battery_state`], so the keys every existing
+    /// consumer already reads keep their positions.
+    battery_percent: Option<Number>,
+    /// Charge state as a lowercase string (`charging`, `discharging`, `full`,
+    /// `not_charging`, `unknown`), or `null` alongside a `null` percentage.
+    battery_state: Option<String>,
+}
+
+/// The wire spelling of a charge state: lowercase, `snake_case`, and stable.
+///
+/// Exhaustive on purpose — a new [`State`] variant must fail the build here
+/// rather than silently serialize as something a consumer has never seen.
+fn battery_state_key(state: State) -> &'static str {
+    match state {
+        State::Charging => "charging",
+        State::Discharging => "discharging",
+        State::Full => "full",
+        State::NotCharging => "not_charging",
+        State::Unknown => "unknown",
+    }
 }
 
 /// Round to one decimal, then collapse a whole result to an integer so the
@@ -211,7 +353,10 @@ fn json_num_1dp(x: f64) -> Number {
 
 /// Serialize spaces to the `--json` payload (array of per-space objects), 2-space
 /// indented. No trailing newline.
-pub fn render_json(spaces: &[Space]) -> String {
+///
+/// `battery` is the one reading taken for this snapshot, copied onto every row —
+/// see [`JsonSpace::battery_percent`] for why it rides along per space.
+pub fn render_json(spaces: &[Space], battery: Option<Battery>) -> String {
     let mem_total = proc::mem_total_mb();
     let payload: Vec<JsonSpace> = spaces
         .iter()
@@ -226,6 +371,8 @@ pub fn render_json(spaces: &[Space]) -> String {
             ram_mb: json_num_1dp(s.ram_mb),
             ram_percent: (mem_total > 0.0).then(|| json_num_1dp(100.0 * s.ram_mb / mem_total)),
             includes_worktrees: s.worktree_labels.clone(),
+            battery_percent: battery.map(|b| json_num_1dp(b.percent)),
+            battery_state: battery.map(|b| battery_state_key(b.state).to_string()),
         })
         .collect();
     serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_string())
@@ -234,16 +381,19 @@ pub fn render_json(spaces: &[Space]) -> String {
 // ---- run modes --------------------------------------------------------------
 
 /// `--once`: print a single rendered snapshot and return.
-pub fn run_once(client: &mut Herdr, labels: &Labels) -> crate::Result<()> {
+pub fn run_once(client: &mut Herdr, labels: &Labels, config: &Config) -> crate::Result<()> {
     let spaces = collect::snapshot(client, SNAPSHOT_WINDOW_MS)?;
-    println!("{}", render(&spaces, labels));
+    println!(
+        "{}",
+        render(&spaces, labels, config.icon_set(), config.battery_reading()),
+    );
     Ok(())
 }
 
 /// `--json`: print one JSON snapshot and return.
-pub fn run_json(client: &mut Herdr) -> crate::Result<()> {
+pub fn run_json(client: &mut Herdr, config: &Config) -> crate::Result<()> {
     let spaces = collect::snapshot(client, SNAPSHOT_WINDOW_MS)?;
-    println!("{}", render_json(&spaces));
+    println!("{}", render_json(&spaces, config.battery_reading()));
     Ok(())
 }
 
@@ -252,22 +402,32 @@ pub fn run_json(client: &mut Herdr) -> crate::Result<()> {
 /// A SIGINT/SIGTERM hook (a console ctrl handler on Windows) restores the
 /// cursor and exits; the main loop hides the cursor, then clears + redraws each
 /// frame, widening the CPU window from the quick first frame to `interval_ms`.
-pub fn run_interval(client: &mut Herdr, labels: &Labels, interval_ms: u64) -> crate::Result<()> {
+pub fn run_interval(
+    client: &mut Herdr,
+    labels: &Labels,
+    config: &Config,
+    interval_ms: u64,
+) -> crate::Result<()> {
     install_quit_hook()?;
 
     let mut out = io::stdout();
     write!(out, "\x1b[?25l")?; // hide cursor
     out.flush()?;
 
+    // The tier cannot change while we run, so it is resolved once; the charge
+    // does change, so it is re-read once per frame — but only once, not once
+    // per space.
+    let icons = config.icon_set();
     let mut window_ms = FIRST_FRAME_WINDOW_MS;
     loop {
+        let battery = config.battery_reading();
         // On success, `snapshot` paces the loop via its internal
         // `thread::sleep(window_ms)` inside `measure`; on the error path it
         // returns before `measure`, so this frame has no delay of its own and
         // must sleep the cadence itself to avoid busy-spinning (mirrors the
         // daemon's error-branch sleep).
         let (body, failed) = match collect::snapshot(client, window_ms) {
-            Ok(spaces) => (render(&spaces, labels), false),
+            Ok(spaces) => (render(&spaces, labels, icons, battery), false),
             Err(err) => (
                 format!("{} {err}", Style::detect().red("  herdr unavailable:")),
                 true,
@@ -370,7 +530,12 @@ mod tests {
         }
     }
 
-    // ---- fmt_ram: MB below 1024, GB at/above ---------------------------------
+    /// Terse [`Battery`] builder for the cell tests.
+    fn bat(percent: f64, state: State) -> Battery {
+        Battery { percent, state }
+    }
+
+    // ---- fmt_ram / compact_ram: MB below 1024, GB at/above -------------------
 
     #[test]
     fn fmt_ram_switches_unit_at_1024() {
@@ -379,6 +544,74 @@ mod tests {
         assert_eq!(fmt_ram(1023.9), "1024 MB"); // still MB below the 1024 gate
         assert_eq!(fmt_ram(1024.0), "1.00 GB");
         assert_eq!(fmt_ram(1536.0), "1.50 GB");
+    }
+
+    #[test]
+    fn compact_ram_switches_unit_at_1024() {
+        assert_eq!(compact_ram(0.0), "0M");
+        assert_eq!(compact_ram(512.6), "513M"); // rounds to whole MB
+        assert_eq!(compact_ram(1023.4), "1023M"); // still MB below the gate
+        assert_eq!(compact_ram(1024.0), "1.0G");
+        assert_eq!(compact_ram(1536.0), "1.5G");
+    }
+
+    // ---- narrow metric cells --------------------------------------------------
+
+    #[test]
+    fn ram_cell_rounds_exactly_as_ram_pct_does() {
+        // The pre-icons sidebar showed `proc::ram_pct`, so the Text tier has to
+        // reproduce it byte for byte — these are that function's own cases.
+        assert_eq!(ram_cell_of(IconSet::Text, "ram", 1024.0, 16384.0), "ram 6%");
+        // 100 * 250 / 10000 = 2.5 -> 3 (half away from zero).
+        assert_eq!(ram_cell_of(IconSet::Text, "ram", 250.0, 10000.0), "ram 3%");
+        // The tier decorates that same number, it does not change it.
+        assert_eq!(
+            ram_cell_of(IconSet::Unicode, "ram", 1024.0, 16384.0),
+            "ram ░6%",
+        );
+    }
+
+    #[test]
+    fn ram_cell_falls_back_to_the_compact_absolute_without_a_total() {
+        // No MemTotal means no scale to be a percentage of. The absolute is
+        // shown with the label and *no* gauge: a gauge glyph claims a level, and
+        // in this branch we have none to claim.
+        assert_eq!(
+            ram_cell_of(IconSet::Unicode, "ram", 1536.0, 0.0),
+            "ram 1.5G"
+        );
+        assert_eq!(ram_cell_of(IconSet::Text, "ram", 512.0, 0.0), "ram 512M");
+        // Same for a nonsensical total, which would otherwise divide by zero.
+        assert_eq!(ram_cell_of(IconSet::Emoji, "ram", 0.0, -1.0), "ram 0M");
+    }
+
+    #[test]
+    fn metric_row_omits_an_absent_battery_and_its_separator() {
+        let cells = |battery: Option<&str>| {
+            metric_row(
+                "A".to_string(),
+                "B".to_string(),
+                battery.map(str::to_string),
+            )
+        };
+        assert_eq!(cells(None), "A · B"); // no dangling separator
+        assert_eq!(cells(Some("C")), "A · B · C");
+    }
+
+    #[test]
+    fn usage_row_is_cpu_then_ram_then_battery() {
+        // The whole row, spelled out with the machine total pinned (1310.72 MB
+        // of 16384 MB is 8%) — `usage_row` itself reads that total from the host.
+        let row = metric_row(
+            IconSet::Unicode.cpu("cpu", 26.0),
+            ram_cell_of(IconSet::Unicode, "ram", 1310.72, 16384.0),
+            battery_cell(
+                IconSet::Unicode,
+                &Labels::default(),
+                Some(bat(74.0, State::Discharging)),
+            ),
+        );
+        assert_eq!(row, "cpu ░26% · ram ░8% · bat ▓74%");
     }
 
     // ---- Style: gating + CPU thresholds --------------------------------------
@@ -405,7 +638,7 @@ mod tests {
 
     #[test]
     fn render_empty_spaces() {
-        let out = render_styled(&[], &Labels::default(), &plain());
+        let out = render_styled(&[], &Labels::default(), IconSet::Unicode, None, &plain());
         assert_eq!(out, "  CPU / RAM per space\n\n  No spaces open.");
     }
 
@@ -413,7 +646,13 @@ mod tests {
     fn render_lays_out_marker_branch_and_notes() {
         let mut focused = space("main", true, 5.0, 512.0, 2);
         focused.branch = "feature/x".to_string();
-        let out = render_styled(&[focused], &Labels::default(), &plain());
+        let out = render_styled(
+            &[focused],
+            &Labels::default(),
+            IconSet::Unicode,
+            None,
+            &plain(),
+        );
         let lines: Vec<&str> = out.split('\n').collect();
 
         assert_eq!(lines[0], "  CPU / RAM per space");
@@ -432,6 +671,8 @@ mod tests {
         let out = render_styled(
             &[space("s", false, 0.0, 0.0, 1)],
             &Labels::default(),
+            IconSet::Unicode,
+            None,
             &plain(),
         );
         let lines: Vec<&str> = out.split('\n').collect();
@@ -444,7 +685,7 @@ mod tests {
     fn render_shows_worktree_note() {
         let mut sp = space("repo", false, 0.0, 0.0, 3);
         sp.worktree_labels = Some(vec!["wt-a".to_string(), "wt-b".to_string()]);
-        let out = render_styled(&[sp], &Labels::default(), &plain());
+        let out = render_styled(&[sp], &Labels::default(), IconSet::Unicode, None, &plain());
         assert!(out.contains("· 3 panes · +2 worktrees"), "{out}");
     }
 
@@ -453,10 +694,64 @@ mod tests {
         let labels = Labels {
             cpu: "CPU".to_string(),
             ram: "MEM".to_string(),
+            battery: "PWR".to_string(),
         };
-        let out = render_styled(&[space("s", false, 1.0, 1.0, 1)], &labels, &plain());
+        let out = render_styled(
+            &[space("s", false, 1.0, 1.0, 1)],
+            &labels,
+            IconSet::Text,
+            Some(bat(74.0, State::Discharging)),
+            &plain(),
+        );
         assert!(out.contains("CPU"));
         assert!(out.contains("MEM"));
+        assert!(out.contains("PWR 74%"), "{out}");
+    }
+
+    // ---- render: the machine-wide battery lives on the total line ------------
+
+    #[test]
+    fn render_puts_the_battery_on_the_total_line_only() {
+        let spaces = [
+            space("a", true, 1.0, 1.0, 1),
+            space("b", false, 2.0, 2.0, 1),
+        ];
+        let out = render_styled(
+            &spaces,
+            &Labels::default(),
+            IconSet::Unicode,
+            Some(bat(74.0, State::Discharging)),
+            &plain(),
+        );
+        let lines: Vec<&str> = out.split('\n').collect();
+        let total = lines.last().expect("a total line");
+
+        assert!(total.contains("bat ▓74%"), "total: {total}");
+        // Two spaces, one battery: a machine-wide number copied onto every row
+        // would read as if each space had its own pack.
+        assert_eq!(out.matches("bat").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn render_without_a_battery_is_the_report_unchanged() {
+        // The cell is additive — a battery-less host gets byte-for-byte the
+        // report this plugin printed before the metric existed.
+        let spaces = [space("a", true, 1.0, 1.0, 1)];
+        let with = render_styled(
+            &spaces,
+            &Labels::default(),
+            IconSet::Unicode,
+            Some(bat(74.0, State::Discharging)),
+            &plain(),
+        );
+        let without = render_styled(
+            &spaces,
+            &Labels::default(),
+            IconSet::Unicode,
+            None,
+            &plain(),
+        );
+        assert_eq!(with.strip_suffix("   bat ▓74%"), Some(without.as_str()));
     }
 
     // ---- json: number shape + field ordering ---------------------------------
@@ -478,9 +773,10 @@ mod tests {
         a.worktree_labels = Some(vec!["child".to_string()]);
         let b = space("w2", false, 0.0, 0.0, 1); // no worktrees
 
-        let out = render_json(&[a, b]);
+        let out = render_json(&[a, b], Some(bat(74.0, State::Discharging)));
 
-        // Keys appear in the declared order.
+        // Keys appear in the declared order. The battery pair is appended at the
+        // END: every key an existing consumer reads keeps the position it had.
         let order = [
             "workspace_id",
             "label",
@@ -492,6 +788,8 @@ mod tests {
             "ram_mb",
             "ram_percent",
             "includes_worktrees",
+            "battery_percent",
+            "battery_state",
         ];
         let mut last = 0;
         for key in order {
@@ -513,10 +811,62 @@ mod tests {
         // ram_percent is always present (number or null), never dropped.
         assert!(parsed[0].get("ram_percent").is_some());
         assert!(parsed[1].get("ram_percent").is_some());
+        // The battery is machine-wide, so every row carries the same reading —
+        // there is no per-space wrapper to hang it off without breaking the
+        // top-level array every consumer already parses.
+        for row in [&parsed[0], &parsed[1]] {
+            assert_eq!(row["battery_percent"], 74.0);
+            assert_eq!(row["battery_state"], "discharging");
+        }
+    }
+
+    #[test]
+    fn json_battery_pair_is_null_without_a_reading() {
+        // A desktop (and a user who set `battery = false`) emits the keys as
+        // `null` rather than dropping them — same rule `ram_percent` follows, so
+        // a consumer can read the field unconditionally.
+        let out = render_json(&[space("w1", true, 1.0, 1.0, 1)], None);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed[0]["battery_percent"].is_null(), "{out}");
+        assert!(parsed[0]["battery_state"].is_null(), "{out}");
+        assert!(out.contains("\"battery_percent\": null"), "{out}");
+    }
+
+    #[test]
+    fn json_battery_state_is_lowercase_for_every_state() {
+        // The wire spelling is a contract: consumers match on these strings.
+        let expected = [
+            (State::Charging, "charging"),
+            (State::Discharging, "discharging"),
+            (State::Full, "full"),
+            (State::NotCharging, "not_charging"),
+            (State::Unknown, "unknown"),
+        ];
+        for (state, key) in expected {
+            assert_eq!(battery_state_key(state), key);
+            let out = render_json(&[space("w1", true, 0.0, 0.0, 1)], Some(bat(5.0, state)));
+            let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(parsed[0]["battery_state"], key, "{out}");
+        }
+    }
+
+    #[test]
+    fn json_battery_percent_rounds_like_every_other_number() {
+        let out = render_json(
+            &[space("w1", true, 0.0, 0.0, 1)],
+            Some(bat(63.46, State::Full)),
+        );
+        // 63.46 -> 63.5, and a whole percentage still collapses to an integer.
+        assert!(out.contains("\"battery_percent\": 63.5"), "{out}");
+        let whole = render_json(
+            &[space("w1", true, 0.0, 0.0, 1)],
+            Some(bat(100.0, State::Full)),
+        );
+        assert!(whole.contains("\"battery_percent\": 100,"), "{whole}");
     }
 
     #[test]
     fn json_empty_payload_is_bare_brackets() {
-        assert_eq!(render_json(&[]), "[]");
+        assert_eq!(render_json(&[], None), "[]");
     }
 }
