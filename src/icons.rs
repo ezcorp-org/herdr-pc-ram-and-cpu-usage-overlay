@@ -30,6 +30,7 @@
 //! The word in front of the number always comes from herdr's own `[ui]` config
 //! ([`crate::config::Labels`]) — a tier supplies the glyph, never the wording.
 
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
@@ -415,25 +416,49 @@ fn nerd_font_available() -> bool {
 
 /// Ask fontconfig whether any installed font covers `glyph`.
 ///
-/// `fc-list :charset=<hex>` prints one line per matching font and nothing at
-/// all when there is no match, so non-empty stdout IS the answer. Anything that
-/// goes wrong — no `fc-list` on `PATH`, a non-zero exit, a spawn failure — reads
-/// as "no", which falls back to [`IconSet::Text`]: the safe direction.
-///
-/// fontconfig is a Linux convention. macOS and Windows have their own font
-/// databases (CoreText, DirectWrite) and generally no `fc-list`, so `auto`
-/// yields `Text` there and those users pick a tier explicitly after running
-/// `--icons`. Querying CoreText/DirectWrite would mean real FFI against two more
-/// system APIs to sharpen a heuristic that still could not see the terminal's
-/// actual font — not worth it.
+/// **Linux only, on purpose.** fontconfig is a Linux convention; macOS and
+/// Windows keep their fonts in CoreText and DirectWrite. Where `fc-list` is
+/// absent this would always answer "no", which is harmless — but where it is
+/// present *and behaves differently* it is worse than useless. A macOS CI runner
+/// with Homebrew fontconfig reported coverage for `U+10FFFE`, a permanent
+/// noncharacter no font can contain; trusting that would have auto-selected a
+/// Nerd Font tier on machines with no Nerd Font, which is exactly the row of
+/// boxes `auto` exists to avoid. So the probe is scoped to the one platform
+/// whose answer has been verified, and everywhere else `auto` yields
+/// [`IconSet::Text`] — matching what the README promises.
+#[cfg(target_os = "linux")]
 fn probe_nerd_font(glyph: char) -> bool {
-    Command::new("fc-list")
+    let output = Command::new("fc-list")
         .arg(format!(":charset={:x}", glyph as u32))
         .arg("family")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
-        .output()
-        .is_ok_and(|out| out.status.success() && !out.stdout.is_empty())
+        .output();
+    match output {
+        Ok(out) => font_list_reports_coverage(out.status.success(), &out.stdout),
+        // No `fc-list` on PATH, or the spawn failed: read as "no", which falls
+        // back to Text — the safe direction.
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_nerd_font(_glyph: char) -> bool {
+    false
+}
+
+/// Decide coverage from an `fc-list` result.
+///
+/// Split from the spawn so the decision is testable without a subprocess — the
+/// version that called `fc-list` inside its own test was passing on Linux and
+/// failing on macOS for reasons that had nothing to do with the logic.
+///
+/// `fc-list` prints one line per matching font and nothing at all when there is
+/// no match, so non-empty stdout on a successful exit IS the answer. Whitespace
+/// alone does not count: a shell that echoes a bare newline must not read as a
+/// font.
+fn font_list_reports_coverage(status_ok: bool, stdout: &[u8]) -> bool {
+    status_ok && stdout.iter().any(|byte| !byte.is_ascii_whitespace())
 }
 
 /// Whether `locale` names a UTF-8 charset (`en_US.UTF-8`, `en_US.utf8`, …).
@@ -602,13 +627,40 @@ mod tests {
     }
 
     #[test]
-    fn probing_for_an_absent_glyph_is_false_and_never_panics() {
-        // U+10FFFE is a permanent noncharacter, so no font can claim it. This
-        // also exercises the real `fc-list` path: on a host without fontconfig
-        // the spawn simply fails, which must read as "no" rather than blowing
-        // up. Either way the answer is false, so the test is deterministic
-        // across Linux, macOS, and Windows CI runners.
-        assert!(!probe_nerd_font('\u{10FFFE}'));
+    fn font_list_output_decides_coverage() {
+        // The decision, without a subprocess. `fc-list` prints one line per
+        // match and nothing at all otherwise.
+        assert!(font_list_reports_coverage(true, b"DejaVu Sans Mono\n"));
+        assert!(!font_list_reports_coverage(true, b""));
+        // Whitespace alone is not a font.
+        assert!(!font_list_reports_coverage(true, b"\n"));
+        assert!(!font_list_reports_coverage(true, b"  \t\n"));
+        // A non-zero exit is never coverage, whatever it printed.
+        assert!(!font_list_reports_coverage(false, b"DejaVu Sans Mono\n"));
+    }
+
+    #[test]
+    fn the_probe_runs_without_panicking_whatever_the_host_has() {
+        // Deliberately asserts nothing about the ANSWER: it depends on the
+        // host's fonts, and an earlier version of this test asserted that a
+        // noncharacter is uncovered, which held on Linux and failed on a macOS
+        // runner whose fontconfig claimed otherwise. The logic is pinned by
+        // `font_list_output_decides_coverage`; this only pins that spawning is
+        // safe — including where `fc-list` does not exist.
+        let _ = probe_nerd_font(NERD_CPU);
+        let _ = probe_nerd_font('\u{10FFFE}');
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn off_linux_the_probe_is_always_false() {
+        // The README promises `auto` yields Text off Linux; this is that promise
+        // in code, checked on the macOS and Windows CI runners.
+        assert!(!probe_nerd_font(NERD_CPU));
+        assert_eq!(
+            auto_detect(env_from(&[("LANG", "en_US.UTF-8")]), nerd_font_available),
+            IconSet::Text,
+        );
     }
 
     #[test]

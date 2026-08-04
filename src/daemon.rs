@@ -154,8 +154,15 @@ pub fn run_daemon() -> crate::Result<()> {
     // Windows-only backstop for the read timeout unix gets from the socket.
     let started = std::time::Instant::now();
     let heartbeat = Arc::new(AtomicU64::new(0));
+    // The watchdog is sized off the cadence fixed at startup, which is the same
+    // one `daemon_interval_ms` uses — the interval is deliberately not re-read
+    // per cycle, so this stays correct for the daemon's whole life.
     #[cfg(windows)]
-    spawn_watchdog(Arc::clone(&heartbeat), started, config.interval_seconds);
+    spawn_watchdog(
+        Arc::clone(&heartbeat),
+        started,
+        settings.config.interval_seconds,
+    );
 
     let mut window_ms: u64 = 500; // quick first sample so the sidebar updates immediately
     let mut failures: u32 = 0;
