@@ -19,11 +19,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use crate::battery::Battery;
 use crate::collect::{self, PSEUDO_AGENT};
 use crate::config::{self, Config, Labels, Mode};
 use crate::herdr::{self, Herdr};
+use crate::icons::IconSet;
 use crate::model::Space;
 use crate::proc;
+use crate::render;
 
 /// Panes we have pushed status onto this run, so shutdown can clear them.
 #[derive(Debug, Default)]
@@ -35,6 +38,40 @@ pub struct Tracked {
     /// Workspaces carrying TTL'd workspace-level metadata tokens (sidebar mode →
     /// the spaces card, which renders workspace tokens rather than pane tokens).
     pub workspaces: HashSet<String>,
+}
+
+/// Everything the render path reads out of config, re-read together.
+///
+/// Grouped rather than passed as three loose values so a caller cannot refresh
+/// one and keep a stale copy of another — the labels and the icon tier decide
+/// the same row between them, and disagreeing copies would render a mixture.
+struct Settings {
+    config: Config,
+    labels: Labels,
+    icons: IconSet,
+}
+
+/// Re-read the plugin config and herdr's labels, and re-resolve the icon tier.
+///
+/// Called once per refresh so an edit to either config file reaches the sidebar
+/// on the next cycle instead of waiting for someone to restart the updater. That
+/// matters more than it sounds: herdr's own system-usage header renders from the
+/// same `cpu_label` / `ram_label`, and herdr reloads its config on demand, so a
+/// daemon holding a startup snapshot of those keys would show the old naming in
+/// the rows and the new one in the header — the two drifting apart with no
+/// indication why.
+///
+/// Cost is two small file reads. The font probe behind the tier is cached in a
+/// `OnceLock`, so re-resolving does not re-fork `fc-list`.
+fn reload_settings() -> Settings {
+    let config = config::load_config();
+    let labels = config::load_herdr_labels().with_overrides(&config);
+    let icons = config.icon_set();
+    Settings {
+        config,
+        labels,
+        icons,
+    }
 }
 
 /// PID of a live updater daemon, or `None` (missing pid file / dead process /
@@ -74,8 +111,11 @@ pub fn run_daemon() -> crate::Result<()> {
     std::fs::create_dir_all(config::state_dir())?;
     std::fs::write(config::pid_file(), format!("{}\n", std::process::id()))?;
 
-    let config = config::load_config();
-    let labels = config::load_herdr_labels();
+    // Re-read every cycle rather than once here — see `reload_settings`. The
+    // first read also fixes the refresh cadence for the life of the daemon,
+    // since that drives the sleep and the status TTL together.
+    let mut settings = reload_settings();
+    let daemon_interval_ms = settings.config.interval_seconds * 1000;
 
     let mut client = match herdr::connect() {
         Ok(client) => client,
@@ -114,25 +154,53 @@ pub fn run_daemon() -> crate::Result<()> {
     // Windows-only backstop for the read timeout unix gets from the socket.
     let started = std::time::Instant::now();
     let heartbeat = Arc::new(AtomicU64::new(0));
+    // The watchdog is sized off the cadence fixed at startup, which is the same
+    // one `daemon_interval_ms` uses — the interval is deliberately not re-read
+    // per cycle, so this stays correct for the daemon's whole life.
     #[cfg(windows)]
-    spawn_watchdog(Arc::clone(&heartbeat), started, config.interval_seconds);
+    spawn_watchdog(
+        Arc::clone(&heartbeat),
+        started,
+        settings.config.interval_seconds,
+    );
 
-    let daemon_interval_ms = config.interval_seconds * 1000;
     let mut window_ms: u64 = 500; // quick first sample so the sidebar updates immediately
     let mut failures: u32 = 0;
     loop {
         heartbeat.store(started.elapsed().as_secs(), Ordering::SeqCst);
+        // Pick up config edits without an updater restart. Two small file reads
+        // per refresh, against a cadence measured in seconds — far cheaper than
+        // the `/proc` walk that just ran, and it is what keeps the sidebar rows
+        // in step with herdr's own system-usage header: both render from
+        // `cpu_label` / `ram_label`, so a stale copy here shows one naming above
+        // the other. The interval is deliberately NOT re-read; changing the
+        // cadence mid-flight would desynchronise the TTL from the refresh rate.
+        settings = reload_settings();
+        let (config, labels, icons) = (&settings.config, &settings.labels, settings.icons);
+
         match collect::snapshot(&mut client, window_ms) {
             Ok(spaces) => {
                 if stopping.load(Ordering::SeqCst) {
                     park(); // shutdown ran during the sample window — do not re-report
                 }
+                // ONE reading per refresh: the battery is machine-wide, so the
+                // per-space push below must not re-walk sysfs (or fork `pmset`)
+                // for each space to be told the same number.
+                let battery = config.battery_reading();
                 {
                     let mut guard = tracked.lock().expect("tracked mutex poisoned");
-                    push_statuses(&mut client, &spaces, &config, &labels, &mut guard);
+                    push_statuses(
+                        &mut client,
+                        &spaces,
+                        config,
+                        labels,
+                        icons,
+                        battery,
+                        &mut guard,
+                    );
                 }
                 if config.window_title_totals {
-                    set_title_totals(&mut client, &spaces, &labels);
+                    set_title_totals(&mut client, &spaces, labels, icons, battery);
                 }
                 failures = 0;
             }
@@ -249,18 +317,24 @@ pub fn toggle_updater() -> crate::Result<()> {
 /// spare pane; on success that space is done. sidebar mode (and the agents-panel
 /// fall-through when the pseudo report fails): release leftover pseudo-agents,
 /// then report TTL'd metadata on the first spare pane (else the first agent pane).
+///
+/// `icons` and `battery` are the once-per-refresh presentation inputs the caller
+/// resolved: both are machine-wide, so taking them as parameters is what keeps
+/// the per-space loop below from re-deriving them once per space.
 pub fn push_statuses(
     client: &mut Herdr,
     spaces: &[Space],
     config: &Config,
     labels: &Labels,
+    icons: IconSet,
+    battery: Option<Battery>,
     tracked: &mut Tracked,
 ) {
     let source = config::plugin_id();
     let ttl_ms = status_ttl_ms(config.interval_seconds);
 
     for sp in spaces {
-        let status = status_line(sp, labels);
+        let status = status_line(sp, labels, icons, battery);
 
         if config.mode == Mode::AgentsPanel {
             // Drop stale claims from earlier runs so a space keeps one entry.
@@ -351,22 +425,38 @@ pub fn clear_all(client: &mut Herdr, tracked: &Tracked) {
     }
 }
 
-/// Write the all-space CPU/RAM totals to the client window title.
-pub fn set_title_totals(client: &mut Herdr, spaces: &[Space], labels: &Labels) {
+/// Write the all-space CPU/RAM/battery totals to the client window title.
+pub fn set_title_totals(
+    client: &mut Herdr,
+    spaces: &[Space],
+    labels: &Labels,
+    icons: IconSet,
+    battery: Option<Battery>,
+) {
+    let _ = client.window_title_set(&title_totals(spaces, labels, icons, battery));
+}
+
+/// The window title text: `"spaces · "` plus the same row the sidebar card
+/// shows, summed over every space.
+///
+/// Pure, and split from [`set_title_totals`] so the formatting is testable
+/// without a live herdr connection.
+fn title_totals(
+    spaces: &[Space],
+    labels: &Labels,
+    icons: IconSet,
+    battery: Option<Battery>,
+) -> String {
     let mut cpu = 0.0;
     let mut ram_mb = 0.0;
     for sp in spaces {
         cpu += sp.cpu;
         ram_mb += sp.ram_mb;
     }
-    let title = format!(
-        "spaces · {} {}% · {} {}",
-        labels.cpu,
-        cpu.round() as i64,
-        labels.ram,
-        ram_display(ram_mb),
-    );
-    let _ = client.window_title_set(&title);
+    format!(
+        "spaces · {}",
+        render::usage_row(cpu, ram_mb, labels, icons, battery),
+    )
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -542,36 +632,10 @@ fn status_ttl_ms(interval_seconds: u64) -> u64 {
     interval_seconds.saturating_mul(3_000).min(MAX_TTL_MS)
 }
 
-/// The per-space status text: `"<cpu> <n>% · <ram> <pct-or-compact>"`.
-fn status_line(sp: &Space, labels: &Labels) -> String {
-    format!(
-        "{} {}% · {} {}",
-        labels.cpu,
-        sp.cpu.round() as i64,
-        labels.ram,
-        ram_display(sp.ram_mb),
-    )
-}
-
-/// RAM as a percent-of-total string, falling back to the compact absolute form
-/// when `/proc/meminfo` is unreadable.
-fn ram_display(mb: f64) -> String {
-    let pct = proc::ram_pct(mb);
-    if pct.is_empty() {
-        compact_ram(mb)
-    } else {
-        pct
-    }
-}
-
-/// Compact absolute RAM: `"<x.x>G"` at/above 1024 MB, else `"<n>M"`
-/// — the narrow form used by sidebar statuses.
-fn compact_ram(mb: f64) -> String {
-    if mb >= 1024.0 {
-        format!("{:.1}G", mb / 1024.0)
-    } else {
-        format!("{}M", mb.round() as i64)
-    }
+/// The per-space status text — `cpu ░26% · ram ░8% · bat ▓74%` in the Unicode
+/// tier, and the battery cell only when the host has one.
+fn status_line(sp: &Space, labels: &Labels, icons: IconSet, battery: Option<Battery>) -> String {
+    render::usage_row(sp.cpu, sp.ram_mb, labels, icons, battery)
 }
 
 /// Best-effort release of our pseudo-agent on `pane_id` (a closed pane errors and
@@ -590,6 +654,7 @@ fn notify(body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::battery::State;
     use crate::config::Labels;
 
     fn space(cpu: f64, ram_mb: f64) -> Space {
@@ -598,6 +663,11 @@ mod tests {
             ram_mb,
             ..Default::default()
         }
+    }
+
+    /// Terse [`Battery`] builder for the cell tests.
+    fn bat(percent: f64, state: State) -> Battery {
+        Battery { percent, state }
     }
 
     #[test]
@@ -611,32 +681,125 @@ mod tests {
         assert_eq!(status_ttl_ms(u64::MAX), MAX_TTL_MS);
     }
 
-    #[test]
-    fn compact_ram_switches_unit_at_1024() {
-        assert_eq!(compact_ram(0.0), "0M");
-        assert_eq!(compact_ram(512.6), "513M"); // rounds to whole MB
-        assert_eq!(compact_ram(1023.4), "1023M"); // still MB below the gate
-        assert_eq!(compact_ram(1024.0), "1.0G");
-        assert_eq!(compact_ram(1536.0), "1.5G");
-    }
+    // ---- the sidebar status line --------------------------------------------
 
     #[test]
     fn status_line_uses_labels_and_rounds_cpu() {
-        let labels = Labels {
-            cpu: "CPU".to_string(),
-            ram: "MEM".to_string(),
-        };
-        // No /proc/meminfo total in most CI: ram_display falls back to compact.
-        // Assert the CPU rounding + label layout, which are total-independent.
-        let line = status_line(&space(5.6, 0.0), &labels);
+        let labels = Labels::new(Some("CPU"), Some("MEM"), Some("PWR"));
+        // The RAM cell depends on the host's MemTotal (percent when readable,
+        // compact absolute when not), so assert the CPU rounding + label layout,
+        // which are total-independent. `render::ram_cell_of` pins both branches.
+        let line = status_line(&space(5.6, 0.0), &labels, IconSet::Text, None);
         assert!(line.starts_with("CPU 6% · MEM "), "got: {line}");
     }
 
     #[test]
     fn status_line_rounds_cpu_half_away_from_zero() {
         let labels = Labels::default();
-        assert!(status_line(&space(2.5, 0.0), &labels).starts_with("cpu 3%"));
-        assert!(status_line(&space(2.4, 0.0), &labels).starts_with("cpu 2%"));
+        let line = |cpu| status_line(&space(cpu, 0.0), &labels, IconSet::Text, None);
+        assert!(line(2.5).starts_with("cpu 3%"));
+        assert!(line(2.4).starts_with("cpu 2%"));
+    }
+
+    #[test]
+    fn status_line_adds_a_battery_cell_only_when_there_is_a_reading() {
+        let labels = Labels::default();
+        let sp = space(26.0, 0.0);
+        let with = status_line(
+            &sp,
+            &labels,
+            IconSet::Unicode,
+            Some(bat(74.0, State::Discharging)),
+        );
+        let without = status_line(&sp, &labels, IconSet::Unicode, None);
+
+        assert!(with.ends_with(" · bat ▓74%"), "got: {with}");
+        // A desktop/server/VM shows no battery at all — not `bat 0%`, and not a
+        // dangling separator.
+        assert!(!without.contains("bat"), "got: {without}");
+        // The cell is purely additive: everything before it is byte-identical.
+        assert_eq!(with.strip_suffix(" · bat ▓74%"), Some(without.as_str()));
+    }
+
+    #[test]
+    fn status_line_has_no_battery_cell_when_the_config_turns_it_off() {
+        // `battery = false` is honoured at the read, so an opted-out user gets
+        // exactly the row a battery-less host gets — on any hardware, which is
+        // what makes this assertion safe on a developer's laptop too.
+        let config = Config {
+            battery: false,
+            ..Config::default()
+        };
+        let line = status_line(
+            &space(26.0, 0.0),
+            &Labels::default(),
+            IconSet::Unicode,
+            config.battery_reading(),
+        );
+        assert!(!line.contains("bat"), "got: {line}");
+    }
+
+    #[test]
+    fn status_line_draws_the_cpu_and_battery_cells_in_every_tier() {
+        let labels = Labels::default();
+        let sp = space(26.0, 0.0);
+        // Head and tail of the row per tier; the RAM cell in the middle is
+        // host-dependent, so `render`'s tests pin the whole row instead.
+        let expected = [
+            (IconSet::Text, "cpu 26%", "bat 74%"),
+            (IconSet::Unicode, "cpu ░26%", "bat ▓74%"),
+            (IconSet::NerdFont, "\u{f4bc} 26%", "\u{f241} 74%"),
+            (IconSet::Emoji, "💻26%", "🔋74%"),
+        ];
+        for (icons, cpu, battery) in expected {
+            let line = status_line(&sp, &labels, icons, Some(bat(74.0, State::Discharging)));
+            assert!(line.starts_with(&format!("{cpu} · ")), "{icons:?}: {line}");
+            assert!(
+                line.ends_with(&format!(" · {battery}")),
+                "{icons:?}: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_line_battery_cell_shows_the_charge_state() {
+        // Same charge, three states: a glance at the sidebar has to tell a pack
+        // that is filling from one that is draining.
+        let labels = Labels::default();
+        let line = |state| {
+            status_line(
+                &space(26.0, 0.0),
+                &labels,
+                IconSet::Unicode,
+                Some(bat(74.0, state)),
+            )
+        };
+        assert!(line(State::Charging).ends_with("bat ▓74%+"));
+        assert!(line(State::Discharging).ends_with("bat ▓74%"));
+        assert!(line(State::Full).ends_with("bat ▓74%="));
+        assert_ne!(line(State::Charging), line(State::Discharging));
+    }
+
+    // ---- the window title ----------------------------------------------------
+
+    #[test]
+    fn title_totals_sums_the_spaces_and_carries_one_battery() {
+        let labels = Labels::default();
+        let spaces = [space(10.0, 0.0), space(16.4, 0.0)];
+        let with = title_totals(
+            &spaces,
+            &labels,
+            IconSet::Text,
+            Some(bat(74.0, State::Full)),
+        );
+        let without = title_totals(&spaces, &labels, IconSet::Text, None);
+
+        // 10.0 + 16.4 = 26.4, rounded once over the total rather than per space.
+        assert!(with.starts_with("spaces · cpu 26% · ram "), "got: {with}");
+        // One machine-wide cell on the title, `=` for a pack on power.
+        assert!(with.ends_with(" · bat 74%="), "got: {with}");
+        assert!(!without.contains("bat"), "got: {without}");
+        assert_eq!(with.strip_suffix(" · bat 74%="), Some(without.as_str()));
     }
 
     // ---- restart recovery ---------------------------------------------------

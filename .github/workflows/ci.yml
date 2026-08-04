@@ -8,11 +8,26 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # All three are hard gates.
+  #
+  # Windows compiles and is live-verified against the herdr 0.8.0-preview beta
+  # (Win32 process sampling + named-pipe transport), so a Windows regression
+  # must fail the build like any other.
+  #
+  # macOS compiles today because the socket client is a UnixStream and
+  # signal-hook is a POSIX dependency, so Darwin needs nothing special to build.
+  # It is still functionally degraded until a Darwin process backend lands: the
+  # module tree routes every unix target at the `/proc` reader, which does not
+  # exist on macOS, so CPU/RAM read zero there. The tests that run are the
+  # platform-neutral ones, and they are worth gating on — they catch Darwin
+  # build breakage the moment it appears.
   build:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+    name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
