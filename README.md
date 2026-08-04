@@ -169,8 +169,10 @@ example) is treated as owned and skipped — otherwise the panel grows a second
 Two consequences worth knowing:
 
 - If **every** agent-less pane in a space belongs to another plugin, that space
-  gets no row of its own; its usage is shown on one of its agent rows instead.
-  Open any plain shell pane in the space to get the dedicated row back.
+  gets no row of its own; its usage is shown on one of its agent rows instead
+  (which is what `[ui.sidebar.agents]`'s `$usage` renders anyway). If it has no
+  agent panes either, the space shows nothing until one appears. Opening any
+  plain shell pane in the space restores the dedicated row.
 - Usage numbers are never affected. Measurement walks every pane in the space
   regardless of who owns it, so plugin panes still count toward its CPU and RAM.
 

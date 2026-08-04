@@ -47,12 +47,17 @@ pub struct Tracked {
 /// kernel later recycled for something else — and without it `--enable` would
 /// no-op forever against that impostor, leaving the sidebar permanently blank.
 pub fn daemon_pid() -> Option<u32> {
+    let pid = read_pid_file()?;
+    is_our_process(pid).then_some(pid)
+}
+
+/// The pid recorded in `<state_dir>/updater.pid`, or `None` if the file is
+/// missing, unparseable, or holds a non-positive pid. Says nothing about
+/// whether that process is alive — [`daemon_pid`] adds that.
+fn read_pid_file() -> Option<u32> {
     let text = std::fs::read_to_string(config::pid_file()).ok()?;
     let pid: i32 = text.trim().parse().ok()?;
-    if pid <= 0 {
-        return None;
-    }
-    is_our_process(pid as u32).then_some(pid as u32)
+    (pid > 0).then_some(pid as u32)
 }
 
 /// `--daemon`: run the updater loop until signalled, then clear and exit.
@@ -195,8 +200,15 @@ pub fn disable_updater() -> crate::Result<()> {
         // NOT done on unix — there the daemon unlinks it from its own SIGTERM
         // handler, and removing it out from under a daemon that is still
         // shutting down would let an immediate `--enable` start a second one.
+        //
+        // Guarded on the file still naming the pid we just stopped: a daemon
+        // started in the window between `daemon_pid` and here owns its own file
+        // and must keep it, or this would silently break its single-instance
+        // guard.
         #[cfg(windows)]
-        let _ = std::fs::remove_file(config::pid_file());
+        if read_pid_file() == Some(pid) {
+            let _ = std::fs::remove_file(config::pid_file());
+        }
     }
 
     // Belt and braces: sweep every current pane in case the daemon died — release
@@ -293,13 +305,20 @@ pub fn push_statuses(
         }
 
         // agents-panel fall-through: report the pane-level token on a spare/agent
-        // pane so the agents panel still shows the space. Two ways to get here —
-        // the pseudo pane closed between classification and the report, or the
-        // workspace offered no hostable pane at all because every agent-less one
-        // belongs to another plugin (see `collect::is_plugin_pane`). In the
-        // second case the space has no row of its own and its usage rides on a
-        // real agent's row instead; that is the deliberate cost of not
-        // hijacking someone else's pane.
+        // pane so the agents panel still shows the space. Three ways in, only
+        // the first of which used to be documented:
+        //   1. `report_agent` failed — the pseudo pane closed mid-cycle;
+        //   2. the space has only agent panes, so there was never a spare to
+        //      claim (true since long before the plugin-pane guard);
+        //   3. every agent-less pane belongs to another plugin and was filtered
+        //      out (see `collect::is_plugin_pane`).
+        // In 2 and 3 the space gets no row of its own and its usage rides on an
+        // agent's row instead. That is the designed agents-panel layout, not a
+        // hijack — `[ui.sidebar.agents]` expands `$usage` on the agent row — and
+        // it stays a token report: we never claim a pseudo-AGENT on a pane we
+        // do not own, which is the thing that grew a duplicate panel entry.
+        // If the space has no agent panes either, `targets` is empty and the
+        // space reports nothing this cycle; the next refresh re-evaluates.
         let targets = if !sp.spare_panes.is_empty() {
             &sp.spare_panes[..1]
         } else if !sp.agent_panes.is_empty() {
@@ -407,9 +426,26 @@ fn enabled_flag_set(path: &std::path::Path) -> bool {
 /// image name (`/proc/<pid>/comm` on Linux, the Toolhelp exe name on Windows)
 /// against our own.
 ///
-/// Guards pid reuse behind a stale pid file. Anything unreadable — a vanished
-/// process, or one owned by another user — reads as "not ours", which is the
-/// safe answer: we then treat the updater as down and start a fresh one.
+/// Guards pid reuse behind a stale pid file: a vanished process has no image
+/// name to read and so reads as "not ours", which is the safe answer — we then
+/// treat the updater as down and start a fresh one.
+///
+/// Two things this deliberately does NOT promise, both worth knowing before
+/// leaning on it:
+///
+/// - It is not an ownership check. `/proc/<pid>/comm` is world-readable, so
+///   another user's process of the same name matches. The old `kill(pid, 0)`
+///   probe rejected those with EPERM; it was dropped for a platform-neutral
+///   liveness check. Reach is narrow — herdr gives each user its own
+///   `HERDR_PLUGIN_STATE_DIR`, so a shared pid file needs the `<tmpdir>`
+///   fallback, i.e. the binary run outside herdr.
+/// - It cannot tell the daemon apart from our OTHER commands. `--interval`
+///   (the dashboard pane) and `--once` run the same executable, so a recycled
+///   pid landing on a live dashboard reads as a running daemon and makes
+///   `--enable` no-op until that pane closes. Pre-existing, on both platforms.
+///
+/// An advisory lock held on the pid file for the daemon's lifetime would settle
+/// both (`File::try_lock`, stable since 1.89) and is the recommended follow-up.
 fn is_our_process(pid: u32) -> bool {
     match (
         proc::process_image_name(pid),

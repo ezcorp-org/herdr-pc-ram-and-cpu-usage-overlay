@@ -43,11 +43,14 @@ pub fn clk_tck() -> u64 {
 ///
 /// `GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)`, NOT
 /// `available_parallelism()`. The metric is a share of the WHOLE MACHINE, to
-/// match the Linux twin's `_SC_NPROCESSORS_ONLN`, and `available_parallelism`
-/// answers a different question: it honours the process affinity mask and job
-/// CPU limits, and counts only the caller's processor group — so on a box with
-/// more than 64 logical CPUs it saturates at 64 and every reported CPU% comes
-/// out inflated by the ratio.
+/// match the Linux twin's `_SC_NPROCESSORS_ONLN`. On Windows
+/// `available_parallelism` is `GetSystemInfo().dwNumberOfProcessors`, which is
+/// documented as the count for the CALLER'S PROCESSOR GROUP — so on a box with
+/// more than 64 logical CPUs it saturates at 64, halving the divisor and
+/// doubling every reported CPU%. (It is not affinity-aware either; std's own
+/// docs note it can overcount under a process affinity mask or job object
+/// limit. Neither function honours affinity, which is what keeps this in step
+/// with `_SC_NPROCESSORS_ONLN`.)
 pub fn nproc() -> u64 {
     // SAFETY: a pure query of a static system value.
     let n = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
@@ -360,15 +363,16 @@ mod tests {
     fn nproc_counts_the_whole_machine() {
         let n = nproc();
         assert!(n >= 1, "nproc must never report zero");
-        // The machine-wide count can only be >= what this process is allowed to
-        // run on; `available_parallelism` is the affinity-limited, single-group
-        // answer this function deliberately does NOT use.
-        let affinity = std::thread::available_parallelism()
+        // Every processor group can only be >= the caller's single group, which
+        // is the answer `available_parallelism` gives and this function
+        // deliberately does NOT use. Equal on any box with <= 64 logical CPUs;
+        // strictly greater is exactly the case that used to double CPU%.
+        let one_group = std::thread::available_parallelism()
             .map(|n| n.get() as u64)
             .unwrap_or(1);
         assert!(
-            n >= affinity,
-            "machine-wide count {n} is below the affinity-limited {affinity}"
+            n >= one_group,
+            "all-groups count {n} is below the single-group {one_group}"
         );
     }
 
