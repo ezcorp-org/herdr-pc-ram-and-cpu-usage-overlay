@@ -14,7 +14,7 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -106,10 +106,17 @@ pub fn run_daemon() -> crate::Result<()> {
         });
     }
 
+    // Windows-only backstop for the read timeout unix gets from the socket.
+    let started = std::time::Instant::now();
+    let heartbeat = Arc::new(AtomicU64::new(0));
+    #[cfg(windows)]
+    spawn_watchdog(Arc::clone(&heartbeat), started, config.interval_seconds);
+
     let daemon_interval_ms = config.interval_seconds * 1000;
     let mut window_ms: u64 = 500; // quick first sample so the sidebar updates immediately
     let mut failures: u32 = 0;
     loop {
+        heartbeat.store(started.elapsed().as_secs(), Ordering::SeqCst);
         match collect::snapshot(&mut client, window_ms) {
             Ok(spaces) => {
                 if stopping.load(Ordering::SeqCst) {
@@ -181,6 +188,15 @@ pub fn disable_updater() -> crate::Result<()> {
         // way down. Windows: TerminateProcess — abrupt, but the sweep below and
         // the status TTLs cover the cleanup the daemon can no longer do.
         proc::stop_process(pid);
+        // A terminated process runs no shutdown, so on Windows nothing would
+        // ever unlink the pid file: it outlives the daemon and leaves the
+        // recycled-pid check ([`is_our_process`]) as the only thing standing
+        // between a stale pid and a permanently no-op `--enable`. Deliberately
+        // NOT done on unix — there the daemon unlinks it from its own SIGTERM
+        // handler, and removing it out from under a daemon that is still
+        // shutting down would let an immediate `--enable` start a second one.
+        #[cfg(windows)]
+        let _ = std::fs::remove_file(config::pid_file());
     }
 
     // Belt and braces: sweep every current pane in case the daemon died — release
@@ -276,8 +292,14 @@ pub fn push_statuses(
             continue;
         }
 
-        // agents-panel fall-through only (the pseudo pane just closed): report the
-        // pane-level token on a spare/agent pane so the agents panel still shows it.
+        // agents-panel fall-through: report the pane-level token on a spare/agent
+        // pane so the agents panel still shows the space. Two ways to get here —
+        // the pseudo pane closed between classification and the report, or the
+        // workspace offered no hostable pane at all because every agent-less one
+        // belongs to another plugin (see `collect::is_plugin_pane`). In the
+        // second case the space has no row of its own and its usage rides on a
+        // real agent's row instead; that is the deliberate cost of not
+        // hijacking someone else's pane.
         let targets = if !sp.spare_panes.is_empty() {
             &sp.spare_panes[..1]
         } else if !sp.agent_panes.is_empty() {
@@ -420,6 +442,44 @@ fn park() -> ! {
     loop {
         thread::sleep(Duration::from_secs(3600));
     }
+}
+
+/// How long a sample may stall before the Windows watchdog gives up on it:
+/// generous, because a slow sample is normal and a false trip would kill a
+/// healthy updater. Only a host that has stopped answering entirely gets here.
+#[cfg(windows)]
+const WATCHDOG_GRACE: Duration = Duration::from_secs(300);
+
+/// Windows-only stand-in for the socket read timeout unix sets in
+/// [`crate::herdr`].
+///
+/// A named pipe opened as a `File` has no timeout knob, so a herdr that accepts
+/// the connection but never answers parks the sample loop inside `read_line`
+/// forever. Nothing recovers from that on its own: the failure counter never
+/// advances, so the five-failure shutdown never runs, the pid file is never
+/// released, and every later `--enable` / `--restore` sees a live pid and
+/// silently no-ops — the sidebar stays blank until someone finds the process by
+/// hand. The loop stamps `heartbeat` before each sample; if that stamp stops
+/// advancing, drop the pid file and exit so the statuses TTL out and the updater
+/// can be enabled again.
+#[cfg(windows)]
+fn spawn_watchdog(heartbeat: Arc<AtomicU64>, started: std::time::Instant, interval_seconds: u64) {
+    // At least the grace period, and always several intervals, so a long
+    // configured cadence cannot trip its own watchdog.
+    let deadline = WATCHDOG_GRACE
+        .as_secs()
+        .max(interval_seconds.saturating_mul(5));
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(30));
+        let stalled = started
+            .elapsed()
+            .as_secs()
+            .saturating_sub(heartbeat.load(Ordering::SeqCst));
+        if stalled >= deadline {
+            let _ = std::fs::remove_file(config::pid_file());
+            std::process::exit(1);
+        }
+    });
 }
 
 /// Largest `ttl_ms` herdr accepts on `pane.report_metadata` /

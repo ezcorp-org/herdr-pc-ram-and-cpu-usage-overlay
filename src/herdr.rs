@@ -55,15 +55,29 @@ fn open_stream(path: &Path) -> io::Result<Stream> {
 
 /// Connect the platform stream to the herdr socket at `path`.
 ///
-/// No read/write timeouts: a pipe opened as `File` has no such knobs. herdr
-/// answers in milliseconds; a wedged host is the only hang, as on unix when the
-/// timeout fires late.
+/// `SECURITY_IDENTIFICATION` is not optional. A named pipe lives in a global
+/// namespace that any local account may create names in, and our name is
+/// guessable (it embeds `%APPDATA%`, which contains the user name). Without an
+/// explicit SQOS level Windows hands the pipe SERVER `SecurityImpersonation`,
+/// so a local attacker who squats the name before herdr binds it can call
+/// `ImpersonateNamedPipeClient` and act as whoever runs this plugin.
+/// `SecurityIdentification` lets the server learn who we are but never act as
+/// us, which is all herdr needs to serve JSON-RPC. std ORs in
+/// `SECURITY_SQOS_PRESENT` for us, and without that flag the level is ignored.
+///
+/// No read/write timeouts: a pipe opened as `File` has no such knobs. That is
+/// the one thing unix gets for free here, so the daemon carries a watchdog
+/// instead — see [`crate::daemon::run_daemon`].
 #[cfg(windows)]
 fn open_stream(path: &Path) -> io::Result<Stream> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+
     let pipe = format!(r"\\.\pipe\{}", path.display());
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .security_qos_flags(SECURITY_IDENTIFICATION)
         .open(pipe)
 }
 
