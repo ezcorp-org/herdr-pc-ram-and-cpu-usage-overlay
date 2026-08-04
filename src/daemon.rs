@@ -40,6 +40,40 @@ pub struct Tracked {
     pub workspaces: HashSet<String>,
 }
 
+/// Everything the render path reads out of config, re-read together.
+///
+/// Grouped rather than passed as three loose values so a caller cannot refresh
+/// one and keep a stale copy of another — the labels and the icon tier decide
+/// the same row between them, and disagreeing copies would render a mixture.
+struct Settings {
+    config: Config,
+    labels: Labels,
+    icons: IconSet,
+}
+
+/// Re-read the plugin config and herdr's labels, and re-resolve the icon tier.
+///
+/// Called once per refresh so an edit to either config file reaches the sidebar
+/// on the next cycle instead of waiting for someone to restart the updater. That
+/// matters more than it sounds: herdr's own system-usage header renders from the
+/// same `cpu_label` / `ram_label`, and herdr reloads its config on demand, so a
+/// daemon holding a startup snapshot of those keys would show the old naming in
+/// the rows and the new one in the header — the two drifting apart with no
+/// indication why.
+///
+/// Cost is two small file reads. The font probe behind the tier is cached in a
+/// `OnceLock`, so re-resolving does not re-fork `fc-list`.
+fn reload_settings() -> Settings {
+    let config = config::load_config();
+    let labels = config::load_herdr_labels().with_overrides(&config);
+    let icons = config.icon_set();
+    Settings {
+        config,
+        labels,
+        icons,
+    }
+}
+
 /// PID of a live updater daemon, or `None` (missing pid file / dead process /
 /// a pid that no longer belongs to us).
 ///
@@ -77,11 +111,11 @@ pub fn run_daemon() -> crate::Result<()> {
     std::fs::create_dir_all(config::state_dir())?;
     std::fs::write(config::pid_file(), format!("{}\n", std::process::id()))?;
 
-    let config = config::load_config();
-    let labels = config::load_herdr_labels().with_overrides(&config);
-    // The glyph tier depends on config and locale, neither of which changes
-    // while we run, so it is resolved once here rather than per refresh.
-    let icons = config.icon_set();
+    // Re-read every cycle rather than once here — see `reload_settings`. The
+    // first read also fixes the refresh cadence for the life of the daemon,
+    // since that drives the sleep and the status TTL together.
+    let mut settings = reload_settings();
+    let daemon_interval_ms = settings.config.interval_seconds * 1000;
 
     let mut client = match herdr::connect() {
         Ok(client) => client,
@@ -123,11 +157,20 @@ pub fn run_daemon() -> crate::Result<()> {
     #[cfg(windows)]
     spawn_watchdog(Arc::clone(&heartbeat), started, config.interval_seconds);
 
-    let daemon_interval_ms = config.interval_seconds * 1000;
     let mut window_ms: u64 = 500; // quick first sample so the sidebar updates immediately
     let mut failures: u32 = 0;
     loop {
         heartbeat.store(started.elapsed().as_secs(), Ordering::SeqCst);
+        // Pick up config edits without an updater restart. Two small file reads
+        // per refresh, against a cadence measured in seconds — far cheaper than
+        // the `/proc` walk that just ran, and it is what keeps the sidebar rows
+        // in step with herdr's own system-usage header: both render from
+        // `cpu_label` / `ram_label`, so a stale copy here shows one naming above
+        // the other. The interval is deliberately NOT re-read; changing the
+        // cadence mid-flight would desynchronise the TTL from the refresh rate.
+        settings = reload_settings();
+        let (config, labels, icons) = (&settings.config, &settings.labels, settings.icons);
+
         match collect::snapshot(&mut client, window_ms) {
             Ok(spaces) => {
                 if stopping.load(Ordering::SeqCst) {
@@ -142,15 +185,15 @@ pub fn run_daemon() -> crate::Result<()> {
                     push_statuses(
                         &mut client,
                         &spaces,
-                        &config,
-                        &labels,
+                        config,
+                        labels,
                         icons,
                         battery,
                         &mut guard,
                     );
                 }
                 if config.window_title_totals {
-                    set_title_totals(&mut client, &spaces, &labels, icons, battery);
+                    set_title_totals(&mut client, &spaces, labels, icons, battery);
                 }
                 failures = 0;
             }
