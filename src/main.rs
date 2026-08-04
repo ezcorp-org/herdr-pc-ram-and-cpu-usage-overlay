@@ -19,10 +19,12 @@
 //! Linux and Windows: the `proc` module reads `/proc` on Linux and the Win32
 //! process APIs on Windows. herdr injects HERDR_BIN_PATH / HERDR_PLUGIN_*.
 
+mod battery;
 mod collect;
 mod config;
 mod daemon;
 mod herdr;
+mod icons;
 mod model;
 #[cfg(unix)]
 mod proc;
