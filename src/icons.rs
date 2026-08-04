@@ -18,8 +18,20 @@
 //! double-width, which shears a narrow sidebar. The `safe_tiers_*` test enforces
 //! that contract against real rendered output, so it cannot rot.
 //!
+//! [`resolve`] picks the tier. Its `auto` mode chooses between exactly two of
+//! them — [`IconSet::NerdFont`] when a Nerd Font is detected, else
+//! [`IconSet::Text`]. It deliberately never selects [`IconSet::Unicode`]: those
+//! glyphs are *present* everywhere, but `░`/`▒` are dither patterns that render
+//! as an indistinct blob at terminal sizes. Being in the font and being legible
+//! are different properties, and only the first one is measurable from here.
+//! See [`auto_detect`] and [`nerd_font_available`] for what the detection can
+//! and cannot know.
+//!
 //! The word in front of the number always comes from herdr's own `[ui]` config
 //! ([`crate::config::Labels`]) — a tier supplies the glyph, never the wording.
+
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use crate::battery::{Battery, State};
 use crate::config::non_empty_env;
@@ -260,20 +272,27 @@ const LOCALE_VARS: [&str; 3] = ["LC_ALL", "LC_CTYPE", "LANG"];
 /// missing key — auto-detects instead of erroring: a typo in a cosmetic setting
 /// must not blank the sidebar.
 pub fn resolve(configured: Option<&str>) -> IconSet {
-    resolve_with(configured, non_empty_env)
+    resolve_with(configured, non_empty_env, nerd_font_available)
 }
 
-/// [`resolve`] with the environment injected.
+/// [`resolve`] with the environment and the font probe injected.
 ///
-/// The seam exists for the tests: mutating the real process environment to
-/// exercise locale precedence would race every other test thread in the binary.
-fn resolve_with(configured: Option<&str>, env: impl Fn(&str) -> Option<String>) -> IconSet {
+/// Both seams exist for the tests. Mutating the real process environment to
+/// exercise locale precedence would race every other test thread in the binary,
+/// and the font probe reads the *host's* installed fonts — so without a seam
+/// every auto-detection test would pass or fail depending on whether the machine
+/// running it happens to have a Nerd Font, which is no test at all.
+fn resolve_with(
+    configured: Option<&str>,
+    env: impl Fn(&str) -> Option<String>,
+    has_nerd_font: impl Fn() -> bool,
+) -> IconSet {
     match configured.map(normalise_tier_name).as_deref() {
         Some("text") => IconSet::Text,
         Some("unicode") => IconSet::Unicode,
         Some("nerdfont") => IconSet::NerdFont,
         Some("emoji") => IconSet::Emoji,
-        _ => auto_detect(env),
+        _ => auto_detect(env, has_nerd_font),
     }
 }
 
@@ -282,23 +301,85 @@ fn normalise_tier_name(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace(['-', '_'], "")
 }
 
-/// The best tier that needs no font install: [`IconSet::Unicode`] on a UTF-8
-/// locale, else [`IconSet::Text`].
+/// The best tier this machine looks able to draw: [`IconSet::NerdFont`] when a
+/// Nerd Font is installed, else [`IconSet::Text`].
 ///
-/// A non-UTF-8 locale is the one signal we can read locally that block glyphs
-/// will not survive the trip to the terminal, and it costs nothing to honour.
-/// Font *coverage* is not detectable from here at all, which is why the Unicode
-/// tier is restricted to glyphs measured to be in the stock faces.
-fn auto_detect(env: impl Fn(&str) -> Option<String>) -> IconSet {
+/// Two things this deliberately does NOT do, both learned the hard way:
+///
+/// - **It never auto-selects [`IconSet::Unicode`].** Those glyphs are *present*
+///   in the stock faces — that was measured — but `░`/`▒` are dither patterns,
+///   and at terminal sizes they render as an indistinct blob rather than a light
+///   shade. Present and legible are different properties, and only the first is
+///   measurable from here. The gauge stays available by explicit opt-in.
+/// - **It falls back to [`IconSet::Text`], never to something merely likely.**
+///   A wrong guess costs the user an unreadable sidebar, which is strictly worse
+///   than plain words.
+///
+/// The locale check gates the whole thing: a terminal that cannot carry UTF-8
+/// cannot carry a Nerd Font glyph either, and that is cheap to rule out first.
+fn auto_detect(env: impl Fn(&str) -> Option<String>, has_nerd_font: impl Fn() -> bool) -> IconSet {
     // `non_empty_env` treats an empty value as unset, which is also what POSIX
     // says about an empty `LC_ALL` — so an empty higher-precedence variable
     // correctly falls through to the next one.
     let locale = LOCALE_VARS.iter().find_map(|name| env(name));
-    if is_utf8_locale(locale.as_deref()) {
-        IconSet::Unicode
+    // Order matters: the locale check is a couple of `getenv`s, the font probe
+    // forks a process. Short-circuit means a `C`-locale host never pays for it.
+    if is_utf8_locale(locale.as_deref()) && has_nerd_font() {
+        IconSet::NerdFont
     } else {
         IconSet::Text
     }
+}
+
+// ---- Nerd Font probe ------------------------------------------------------------
+
+/// Whether some installed font carries [`NERD_CPU`], cached for the process.
+///
+/// **This detects "a Nerd Font is installed", not "your terminal uses one".**
+/// The distinction is not pedantry — it is the whole accuracy budget of this
+/// function. herdr draws the sidebar into whatever terminal emulator the user
+/// launched it from, and that emulator's font lives in its own config, which no
+/// plugin can read. Worse, the updater daemon runs detached with null stdio, so
+/// it has no terminal to interrogate even in principle: the usual trick of
+/// printing a glyph and asking the terminal where the cursor landed needs a TTY
+/// this process does not have.
+///
+/// So this is a heuristic with one known false positive — a Nerd Font present
+/// on disk but not selected in the terminal — which lands the user back on the
+/// boxes we are trying to avoid. It is chosen anyway because the alternative
+/// (never using icons) is worse for the many people who install a Nerd Font
+/// precisely to use it, and because the miss is one config line to correct after
+/// `--icons` shows it. `auto` is a convenience, not a contract.
+///
+/// Cached in a `OnceLock`: the daemon resolves the tier once per refresh, and
+/// forking `fc-list` every five seconds forever to be told the same thing would
+/// be indefensible.
+fn nerd_font_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| probe_nerd_font(NERD_CPU))
+}
+
+/// Ask fontconfig whether any installed font covers `glyph`.
+///
+/// `fc-list :charset=<hex>` prints one line per matching font and nothing at
+/// all when there is no match, so non-empty stdout IS the answer. Anything that
+/// goes wrong — no `fc-list` on `PATH`, a non-zero exit, a spawn failure — reads
+/// as "no", which falls back to [`IconSet::Text`]: the safe direction.
+///
+/// fontconfig is a Linux convention. macOS and Windows have their own font
+/// databases (CoreText, DirectWrite) and generally no `fc-list`, so `auto`
+/// yields `Text` there and those users pick a tier explicitly after running
+/// `--icons`. Querying CoreText/DirectWrite would mean real FFI against two more
+/// system APIs to sharpen a heuristic that still could not see the terminal's
+/// actual font — not worth it.
+fn probe_nerd_font(glyph: char) -> bool {
+    Command::new("fc-list")
+        .arg(format!(":charset={:x}", glyph as u32))
+        .arg("family")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|out| out.status.success() && !out.stdout.is_empty())
 }
 
 /// Whether `locale` names a UTF-8 charset (`en_US.UTF-8`, `en_US.utf8`, …).
@@ -348,8 +429,19 @@ mod tests {
     }
 
     /// Resolve with no environment at all — isolates config parsing from locale.
+    /// A host with no locale and no Nerd Font — the most conservative machine.
     fn resolve_bare(configured: Option<&str>) -> IconSet {
-        resolve_with(configured, env_from(&[]))
+        resolve_with(configured, env_from(&[]), || false)
+    }
+
+    /// Probe stub: pretend a Nerd Font is installed.
+    fn has_nerd() -> bool {
+        true
+    }
+
+    /// Probe stub: pretend none is.
+    fn no_nerd() -> bool {
+        false
     }
 
     // ---- tier parsing --------------------------------------------------------
@@ -372,17 +464,42 @@ mod tests {
 
     #[test]
     fn auto_unknown_and_missing_all_fall_back_to_detection() {
-        // The bare environment detects `Text`; a UTF-8 one detects `Unicode`.
-        // Both must follow the *detector*, not a hardcoded default.
+        // A bare host detects `Text`; a UTF-8 host with a Nerd Font detects
+        // `NerdFont`. Both must follow the *detector*, not a hardcoded default.
         let utf8 = || env_from(&[("LANG", "en_US.UTF-8")]);
         for configured in [None, Some("auto"), Some("bogus"), Some("")] {
             assert_eq!(resolve_bare(configured), IconSet::Text, "{configured:?}");
             assert_eq!(
-                resolve_with(configured, utf8()),
-                IconSet::Unicode,
+                resolve_with(configured, utf8(), has_nerd),
+                IconSet::NerdFont,
                 "{configured:?}",
             );
         }
+    }
+
+    #[test]
+    fn auto_never_selects_the_unicode_gauge() {
+        // The gauge glyphs are *present* in the stock faces — measured — but
+        // `░`/`▒` are dither patterns that render as an indistinct blob at
+        // terminal sizes. Reported from a real sidebar, which is why `auto` no
+        // longer reaches for them. No combination of locale and font may bring
+        // it back; it stays available only by explicit opt-in.
+        for utf8 in [true, false] {
+            let env = if utf8 {
+                env_from(&[("LANG", "en_US.UTF-8")])
+            } else {
+                env_from(&[("LANG", "C")])
+            };
+            for probe in [has_nerd, no_nerd] {
+                assert_ne!(
+                    auto_detect(&env, probe),
+                    IconSet::Unicode,
+                    "auto picked the gauge (utf8={utf8})",
+                );
+            }
+        }
+        // ..but asking for it by name still works.
+        assert_eq!(resolve_bare(Some("unicode")), IconSet::Unicode);
     }
 
     // ---- locale auto-detection -----------------------------------------------
@@ -395,17 +512,49 @@ mod tests {
             ("LC_CTYPE", "en_US.UTF-8"),
             ("LANG", "en_US.UTF-8"),
         ]);
-        assert_eq!(auto_detect(all_wins), IconSet::Text);
+        assert_eq!(auto_detect(all_wins, has_nerd), IconSet::Text);
 
         let ctype_wins = env_from(&[("LC_CTYPE", "C"), ("LANG", "en_US.UTF-8")]);
-        assert_eq!(auto_detect(ctype_wins), IconSet::Text);
+        assert_eq!(auto_detect(ctype_wins, has_nerd), IconSet::Text);
 
         // An empty higher-precedence variable is unset, so the next one decides.
         let empty_falls_through = env_from(&[("LC_ALL", ""), ("LANG", "en_US.UTF-8")]);
-        assert_eq!(auto_detect(empty_falls_through), IconSet::Unicode);
+        assert_eq!(
+            auto_detect(empty_falls_through, has_nerd),
+            IconSet::NerdFont
+        );
 
         let lang_only = env_from(&[("LANG", "en_US.UTF-8")]);
-        assert_eq!(auto_detect(lang_only), IconSet::Unicode);
+        assert_eq!(auto_detect(lang_only, has_nerd), IconSet::NerdFont);
+    }
+
+    // ---- the Nerd Font probe ---------------------------------------------------
+
+    #[test]
+    fn a_utf8_locale_without_a_nerd_font_still_falls_back_to_text() {
+        // The safe direction. A machine that cannot draw the icons must get
+        // words, never a row of boxes.
+        let utf8 = env_from(&[("LANG", "en_US.UTF-8")]);
+        assert_eq!(auto_detect(utf8, no_nerd), IconSet::Text);
+    }
+
+    #[test]
+    fn the_font_probe_is_skipped_entirely_on_a_non_utf8_locale() {
+        // Short-circuit: the probe forks `fc-list`, so a `C`-locale host must
+        // never pay for it. Panicking from the stub proves it is not called.
+        let c_locale = env_from(&[("LANG", "C")]);
+        let must_not_run = || panic!("font probe ran despite a non-UTF-8 locale");
+        assert_eq!(auto_detect(c_locale, must_not_run), IconSet::Text);
+    }
+
+    #[test]
+    fn probing_for_an_absent_glyph_is_false_and_never_panics() {
+        // U+10FFFE is a permanent noncharacter, so no font can claim it. This
+        // also exercises the real `fc-list` path: on a host without fontconfig
+        // the spawn simply fails, which must read as "no" rather than blowing
+        // up. Either way the answer is false, so the test is deterministic
+        // across Linux, macOS, and Windows CI runners.
+        assert!(!probe_nerd_font('\u{10FFFE}'));
     }
 
     #[test]
@@ -421,13 +570,13 @@ mod tests {
     fn non_utf8_locales_fall_back_to_text() {
         for locale in ["C", "POSIX", "en_US", "en_US.ISO-8859-1", ""] {
             assert_eq!(
-                auto_detect(env_from(&[("LANG", locale)])),
+                auto_detect(env_from(&[("LANG", locale)]), has_nerd),
                 IconSet::Text,
                 "{locale:?}",
             );
         }
         // Nothing set at all is also Text.
-        assert_eq!(auto_detect(env_from(&[])), IconSet::Text);
+        assert_eq!(auto_detect(env_from(&[]), has_nerd), IconSet::Text);
         assert!(!is_utf8_locale(None));
     }
 

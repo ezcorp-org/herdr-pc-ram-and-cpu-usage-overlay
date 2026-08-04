@@ -8,11 +8,14 @@ a glance which space is eating your machine.
 ```
 ● web-app
     main
-    cpu ░26% · ram ░8% · bat ▓74%+   ← spaces card (sidebar mode)
+    cpu 26% · ram 8% · bat 74%+     ← spaces card (sidebar mode)
 
 ⚡ web-app
-    idle · usage · cpu ░26% · ram ░8%   ← agents panel (default mode)
+    idle · usage · cpu 26% · ram 8%   ← agents panel (default mode)
 ```
+
+With a Nerd Font installed it detects that and uses icons instead —
+` 26% ·  8% ·  74%+`. See [Icons](#icons-and-labels).
 
 - Per-space CPU% and RAM%, both a share of the **whole machine** (0–100%, so a
   busy space reads e.g. `cpu 4%` — not a per-core figure that can exceed 100%),
@@ -173,18 +176,46 @@ emoji at one column or two, is something only you can see.
 | tier | renders | needs |
 |---|---|---|
 | `text` | `cpu 26% · ram 8% · bat 74%` | nothing |
-| `unicode` | `cpu ░26% · ram ░8% · bat ▓74%` | nothing |
+| `unicode` | `cpu ░26% · ram ░8% · bat ▓74%` | nothing (opt-in) |
 | `nerdfont` | ` 26% ·  8% ·  74%` | a Nerd Font |
 | `emoji` | `💻26% · 🧠8% · 🔋74%` | a colour emoji font |
 
-`auto` (the default) picks `unicode` on a UTF-8 locale and `text` otherwise.
+### What `auto` does
 
-The `unicode` tier is a **level gauge**, not a pictogram: `░` below 34%, `▒`
-below 67%, `▓` below 90%, `█` above. That choice is deliberate. There is no
-pictogram for "CPU" or "battery" that renders without installing a font — the
-battery emoji `U+1F50B` is absent from both DejaVu Sans Mono and Liberation Mono
-(the default Linux mono faces), and Nerd Font glyphs live in the Private Use
-Area. Every glyph the safe tiers emit was checked with `fc-list :charset=<cp>`
+`auto` (the default) tries to detect whether this machine can draw icons:
+
+1. If the locale is not UTF-8 → `text`. A terminal that cannot carry UTF-8
+   cannot carry a Nerd Font glyph either, and this costs two `getenv`s.
+2. Otherwise it asks fontconfig (`fc-list :charset=f4bc`) whether any installed
+   font carries a Nerd Font glyph. Found → `nerdfont`. Not found → `text`.
+
+The probe runs **once per process** and is cached; the updater never re-forks it.
+
+Two honest limits:
+
+- **It detects "a Nerd Font is installed", not "your terminal uses one".** herdr
+  draws into whatever terminal emulator you launched it from, and that font
+  lives in the emulator's own config, which no plugin can read. The updater
+  daemon runs detached with null stdio, so it has no terminal to interrogate
+  even in principle. If you have a Nerd Font on disk but your terminal is set to
+  something else, `auto` will guess wrong — set `icons` explicitly.
+- **fontconfig is a Linux convention.** macOS and Windows generally have no
+  `fc-list`, so `auto` yields `text` there. Run the preview and pick a tier.
+
+The fallback is always `text`, never a guess: an unreadable sidebar is strictly
+worse than plain words.
+
+`auto` never selects `unicode`. Those glyphs are *present* in the stock faces —
+that was measured — but `░` and `▒` are dither patterns, and at terminal sizes
+they render as an indistinct blob rather than a light shade. Present and legible
+are different properties and only the first can be measured from here, so the
+gauge is opt-in. If you want it: `░` below 34%, `▒` below 67%, `▓` below 90%,
+`█` above.
+
+There is no pictogram for "CPU" or "battery" that renders without installing a
+font: the battery emoji `U+1F50B` is absent from both DejaVu Sans Mono and
+Liberation Mono, and Nerd Font glyphs live in the Private Use Area. Every glyph
+the `text` and `unicode` tiers emit was checked with `fc-list :charset=<cp>`
 against both faces and is present in both; a test asserts they stay inside the
 BMP, outside the Private Use Area, and on that measured list, so the "no font
 install" promise cannot rot.
