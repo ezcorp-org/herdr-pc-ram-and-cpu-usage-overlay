@@ -259,6 +259,35 @@ pub fn rss_mb(pids: &HashSet<u32>) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
+/// Shared by the two platform twins' `stop_process` tests: stop `child` and
+/// require it to actually be gone soon after.
+///
+/// Polls rather than blocking in `wait`, so a `stop_process` that does nothing
+/// fails the test in seconds instead of hanging until the CI job times out, and
+/// the child is always reaped either way. Says nothing about the exit status —
+/// the platforms disagree there (unix reports the signal, Windows reports the
+/// exit code TerminateProcess was given).
+#[cfg(test)]
+pub(crate) fn assert_stopped_promptly(mut child: std::process::Child) {
+    use std::time::{Duration, Instant};
+
+    stop_process(child.id());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        if child.try_wait().expect("try_wait on child").is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !exited {
+        let _ = child.kill(); // never leave a 5-minute process behind
+        let _ = child.wait();
+    }
+    assert!(exited, "stop_process did not terminate the child");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,19 +361,16 @@ mod tests {
         // A child we own that does nothing but wait, so the only thing that can
         // end it is our TerminateProcess. `ping` ships with every Windows SKU
         // and paces one echo per second.
-        let mut child = std::process::Command::new("ping")
+        let child = std::process::Command::new("ping")
             .args(["-n", "300", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
             .expect("spawn ping");
-        stop_process(child.id());
-        // `wait` reaps it; without the terminate landing this blocks for ~300 s
-        // and the test times out, which is the failure we want to see.
-        let status = child.wait().expect("wait for ping");
-        assert!(
-            !status.success(),
-            "a terminated child must not exit cleanly"
-        );
+        // Asserted by "did it die", NOT by exit status: `stop_process` calls
+        // TerminateProcess with exit code 0, so a killed process is
+        // indistinguishable from a clean one by `ExitStatus::success` — unlike
+        // unix, where a SIGTERMed child reports the signal.
+        assert_stopped_promptly(child);
     }
 
     #[test]

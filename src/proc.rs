@@ -188,6 +188,37 @@ pub fn stop_process(pid: u32) {
     }
 }
 
+/// Shared by the two platform twins' `stop_process` tests: stop `child` and
+/// require it to actually be gone soon after. (Mirrored in `proc_windows.rs` —
+/// the twins are compiled exclusively, so their common helpers are duplicated
+/// rather than shared, same as `subtree` / `children_map` / `pct_string`.)
+///
+/// Polls rather than blocking in `wait`, so a `stop_process` that does nothing
+/// fails the test in seconds instead of hanging until the CI job times out, and
+/// the child is always reaped either way. Says nothing about the exit status —
+/// the platforms disagree there (unix reports the signal, Windows reports the
+/// exit code TerminateProcess was given, which is 0).
+#[cfg(test)]
+pub(crate) fn assert_stopped_promptly(mut child: std::process::Child) {
+    use std::time::{Duration, Instant};
+
+    stop_process(child.id());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        if child.try_wait().expect("try_wait on child").is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !exited {
+        let _ = child.kill(); // never leave a 5-minute process behind
+        let _ = child.wait();
+    }
+    assert!(exited, "stop_process did not terminate the child");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,14 +320,10 @@ mod tests {
     fn stop_process_terminates_a_child() {
         // A child we own, doing nothing, so the only thing that can end it is
         // our SIGTERM. `sleep` is in POSIX and always present.
-        let mut child = std::process::Command::new("sleep")
+        let child = std::process::Command::new("sleep")
             .arg("300")
             .spawn()
             .expect("spawn sleep");
-        stop_process(child.id());
-        // `wait` reaps it; without the signal landing this blocks for 300 s and
-        // the test times out, which is the failure we want to see.
-        let status = child.wait().expect("wait for sleep");
-        assert!(!status.success(), "a SIGTERMed child must not exit cleanly");
+        assert_stopped_promptly(child);
     }
 }
