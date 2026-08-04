@@ -158,6 +158,30 @@ would blank the branch out. For the same reason the branch uses `cwd` and not
 `foreground_cwd` — the latter is the field that became non-blocking in 0.8.0
 (#1838, #2206) and transiently reports `/`.
 
+### Living alongside other plugins
+
+In **agents-panel** mode the usage row needs a pane to live on, and it will
+never take one that belongs to another plugin. A pane with no agent but with
+metadata tokens that aren't ours (herdr-sidebar's explorer/git heartbeats, for
+example) is treated as owned and skipped — otherwise the panel grows a second
+"agent" row and the usage text ends up pinned inside someone else's pane.
+
+Two consequences worth knowing:
+
+- If **every** agent-less pane in a space belongs to another plugin, that space
+  gets no row of its own; its usage is shown on one of its agent rows instead.
+  Open any plain shell pane in the space to get the dedicated row back.
+- Usage numbers are never affected. Measurement walks every pane in the space
+  regardless of who owns it, so plugin panes still count toward its CPU and RAM.
+
+This is a heuristic, and it has to be: herdr reports a pane's tokens as one flat
+map merged across all plugins, with no record of who set what. A plugin that
+puts tokens on ordinary shell panes will shrink the pool of panes this one can
+use, and a plugin that names a token `usage` will look like us.
+
+**sidebar** mode is unaffected — it reports at the workspace level and never
+claims a pane at all.
+
 ## Development
 
 ```sh

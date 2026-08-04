@@ -69,6 +69,18 @@ fn classify_panes(panes: &[&PaneInfo]) -> PaneRoles {
 /// the panel and pinned the usage text to the wrong pane. Our own fall-through
 /// `usage` token must NOT trip this, or a pane we reported once would stop
 /// being a spare pane on the next cycle.
+///
+/// A HEURISTIC, and deliberately so: herdr's `PaneInfo.tokens` is one flat
+/// `map<string,string>` merged across every reporting source, with no ownership
+/// field anywhere on the pane, so "someone else annotated this pane" is the
+/// strongest signal the API offers. Two known costs, both preferred to grabbing
+/// a pane that isn't ours:
+///
+/// - a plugin that badges PLAIN SHELL panes rather than opening its own shrinks
+///   the spare pool; if it badges every agent-less pane in a workspace, that
+///   space gets no dedicated row and its usage rides on an agent pane instead
+///   (see the fall-through in [`crate::daemon::push_statuses`]);
+/// - a plugin that names a token `usage` reads as a spare pane here.
 fn is_plugin_pane(pane: &PaneInfo) -> bool {
     pane.tokens
         .as_ref()
@@ -343,7 +355,7 @@ mod tests {
         let mut p = pane(pane_id, "w1", None, None);
         p.tokens = Some(
             keys.iter()
-                .map(|k| (k.to_string(), serde_json::Value::from("x")))
+                .map(|k| (k.to_string(), "x".to_string()))
                 .collect(),
         );
         p
@@ -437,6 +449,47 @@ mod tests {
         p.agent = Some("claude".to_string());
         let refs: Vec<&PaneInfo> = [&p].to_vec();
         assert_eq!(classify_panes(&refs).agent_panes, ["claude"]);
+    }
+
+    #[test]
+    fn classify_treats_an_empty_token_map_as_a_plain_pane() {
+        // herdr sends `tokens` as an empty object once every token on a pane has
+        // expired or been cleared. "Present but empty" is not ownership.
+        let panes = [pane_with_tokens("shell", &[])];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+        assert_eq!(classify_panes(&refs).spare_panes, ["shell"]);
+    }
+
+    #[test]
+    fn classification_drops_only_plugin_panes() {
+        // The safety property behind the new arm: a pane may be left out of
+        // every bucket ONLY for being plugin-owned. Anything else silently
+        // vanishing would be a space losing its status host for no reason.
+        let mut agent = pane("claude", "w1", None, None);
+        agent.agent = Some("claude".to_string());
+        let mut pseudo = pane("ours", "w1", None, None);
+        pseudo.agent = Some(PSEUDO_AGENT.to_string());
+        let panes = [
+            agent,
+            pseudo,
+            pane("shell", "w1", None, None),
+            pane_with_tokens("mine-only", &[PSEUDO_AGENT]),
+            pane_with_tokens("theirs", &["herdr-sidebar-git"]),
+        ];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+        let roles = classify_panes(&refs);
+
+        let mut bucketed: Vec<&str> = roles
+            .agent_panes
+            .iter()
+            .chain(&roles.spare_panes)
+            .chain(&roles.pseudo_panes)
+            .map(String::as_str)
+            .collect();
+        bucketed.sort_unstable();
+        // Everything is placed except the one pane another plugin owns.
+        assert_eq!(bucketed, ["claude", "mine-only", "ours", "shell"]);
+        assert_eq!(bucketed.len() + 1, panes.len());
     }
 
     /// Build a measured [`Space`] with just the aggregate-relevant fields set.
