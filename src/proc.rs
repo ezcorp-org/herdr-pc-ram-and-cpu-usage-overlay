@@ -264,4 +264,39 @@ mod tests {
         assert_eq!(parse_mem_total_mb(meminfo), Some(16.0)); // 16384 / 1024
         assert_eq!(parse_mem_total_mb("MemFree: 10 kB\n"), None);
     }
+
+    // ---- live-machine probes (mirrored by the proc_windows.rs twin) ---------
+
+    #[test]
+    fn own_image_name_is_reported_and_vanished_pid_is_none() {
+        let name = process_image_name(std::process::id()).expect("own image name");
+        assert!(!name.is_empty());
+        // The stale-pid-file case: nothing to read for a dead pid. This is also
+        // the liveness half of `daemon::is_our_process`.
+        assert_eq!(process_image_name(u32::MAX), None);
+    }
+
+    #[test]
+    fn scan_includes_our_own_process_with_a_parent() {
+        let procs = scan_proc();
+        let me = procs
+            .get(&std::process::id())
+            .expect("our own pid is in the scan");
+        assert!(me.ppid > 0, "our parent pid should be a real process");
+    }
+
+    #[test]
+    fn stop_process_terminates_a_child() {
+        // A child we own, doing nothing, so the only thing that can end it is
+        // our SIGTERM. `sleep` is in POSIX and always present.
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn sleep");
+        stop_process(child.id());
+        // `wait` reaps it; without the signal landing this blocks for 300 s and
+        // the test times out, which is the failure we want to see.
+        let status = child.wait().expect("wait for sleep");
+        assert!(!status.success(), "a SIGTERMed child must not exit cleanly");
+    }
 }

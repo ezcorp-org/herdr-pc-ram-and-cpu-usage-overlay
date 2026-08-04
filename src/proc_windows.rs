@@ -20,8 +20,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_TERMINATE,
+    GetActiveProcessorCount, GetProcessTimes, OpenProcess, TerminateProcess, ALL_PROCESSOR_GROUPS,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
 /// Per-process sample: parent PID and cumulative CPU time in [`clk_tck`] units
@@ -40,11 +40,18 @@ pub fn clk_tck() -> u64 {
 
 /// Number of logical CPUs; normalizes CPU% to a share of the whole machine.
 /// At least 1.
+///
+/// `GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)`, NOT
+/// `available_parallelism()`. The metric is a share of the WHOLE MACHINE, to
+/// match the Linux twin's `_SC_NPROCESSORS_ONLN`, and `available_parallelism`
+/// answers a different question: it honours the process affinity mask and job
+/// CPU limits, and counts only the caller's processor group — so on a box with
+/// more than 64 logical CPUs it saturates at 64 and every reported CPU% comes
+/// out inflated by the ratio.
 pub fn nproc() -> u64 {
-    std::thread::available_parallelism()
-        .map(|n| n.get() as u64)
-        .unwrap_or(1)
-        .max(1)
+    // SAFETY: a pure query of a static system value.
+    let n = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+    (n as u64).max(1)
 }
 
 /// An open process handle that closes itself on drop; `None` when the process
@@ -298,11 +305,43 @@ mod tests {
     #[test]
     fn scan_includes_our_own_process_with_cpu_ticks() {
         let procs = scan_proc();
-        let me = procs
-            .get(&std::process::id())
-            .expect("our own pid is in the snapshot");
-        // Our own process is always openable, so its CPU counter is real.
-        assert!(me.jiffies > 0, "own cumulative CPU ticks read as zero");
+        assert!(
+            procs.contains_key(&std::process::id()),
+            "our own pid is in the snapshot"
+        );
+
+        // Our own process is always openable, so the counter is readable. It is
+        // NOT asserted non-zero straight away: `GetProcessTimes` is only charged
+        // on ~15.6 ms scheduler ticks, so a young test binary can legitimately
+        // still read zero. Burn CPU until the kernel charges us, with a deadline
+        // so a genuinely broken probe fails instead of hanging.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut ticks = 0;
+        while ticks == 0 && std::time::Instant::now() < deadline {
+            ticks = cpu_ticks(std::process::id()).expect("own cpu ticks are readable");
+            std::hint::black_box((0..200_000u64).sum::<u64>());
+        }
+        assert!(ticks > 0, "own cumulative CPU ticks never left zero");
+    }
+
+    #[test]
+    fn stop_process_terminates_a_child() {
+        // A child we own that does nothing but wait, so the only thing that can
+        // end it is our TerminateProcess. `ping` ships with every Windows SKU
+        // and paces one echo per second.
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "300", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ping");
+        stop_process(child.id());
+        // `wait` reaps it; without the terminate landing this blocks for ~300 s
+        // and the test times out, which is the failure we want to see.
+        let status = child.wait().expect("wait for ping");
+        assert!(
+            !status.success(),
+            "a terminated child must not exit cleanly"
+        );
     }
 
     #[test]
@@ -315,6 +354,22 @@ mod tests {
     #[test]
     fn machine_ram_total_is_positive() {
         assert!(mem_total_mb() > 0.0);
+    }
+
+    #[test]
+    fn nproc_counts_the_whole_machine() {
+        let n = nproc();
+        assert!(n >= 1, "nproc must never report zero");
+        // The machine-wide count can only be >= what this process is allowed to
+        // run on; `available_parallelism` is the affinity-limited, single-group
+        // answer this function deliberately does NOT use.
+        let affinity = std::thread::available_parallelism()
+            .map(|n| n.get() as u64)
+            .unwrap_or(1);
+        assert!(
+            n >= affinity,
+            "machine-wide count {n} is below the affinity-limited {affinity}"
+        );
     }
 
     #[test]
