@@ -67,8 +67,8 @@ Other entrypoints:
 ```sh
 herdr plugin pane open --plugin ez-corp.space-usage --entrypoint dashboard  # live dashboard
 herdr plugin action invoke report --plugin ez-corp.space-usage             # one-shot snapshot
+herdr plugin action invoke icons --plugin ez-corp.space-usage              # preview icon tiers
 ./target/release/space-usage --json                                        # machine-readable
-./target/release/space-usage --icons                                       # preview icon tiers
 ```
 
 Status **text** carries a TTL and self-clears if the updater dies. In
@@ -165,10 +165,10 @@ full-width `--once` report avoids this by putting it on the total line only.
 
 ## Icons and labels
 
-`icons` picks the glyph vocabulary. Run **`space-usage --icons`** to see all four
-drawn in your own terminal before choosing — whether a Nerd Font is installed,
-and whether your terminal draws emoji at one column or two, is something only you
-can see.
+`icons` picks the glyph vocabulary. Run the **Preview icon tiers** action (or
+`space-usage --icons`) to see all four drawn in your own terminal before
+choosing — whether a Nerd Font is installed, and whether your terminal draws
+emoji at one column or two, is something only you can see.
 
 | tier | renders | needs |
 |---|---|---|

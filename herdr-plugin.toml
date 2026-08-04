@@ -58,6 +58,16 @@ title = "Space usage report"
 contexts = ["workspace"]
 command = ["./target/release/space-usage", "--once"]
 
+# Draws the cpu/ram/battery row in all four icon tiers so the user can pick one
+# by eye. Whether a Nerd Font is installed, and whether the terminal draws emoji
+# at one column or two, is visible only to the person looking at the screen —
+# so the plugin shows the options rather than guessing. Needs no herdr
+# connection, so it still works with the server down.
+[[actions]]
+id = "icons"
+title = "Preview icon tiers"
+command = ["./target/release/space-usage", "--icons"]
+
 # Sidebar status updater: a background daemon that pushes each space's usage
 # as display-only metadata on a spare shell pane; the locally patched herdr
 # renders it as a third row in the sidebar spaces card. Statuses carry a TTL,
