@@ -16,13 +16,18 @@
 //!                     herdr/machine restart if the updater was enabled
 //!   --daemon          internal: run the updater loop (spawned by --enable)
 //!
-//! Linux-only: relies on `/proc`. herdr injects HERDR_BIN_PATH / HERDR_PLUGIN_*.
+//! Linux and Windows: the `proc` module reads `/proc` on Linux and the Win32
+//! process APIs on Windows. herdr injects HERDR_BIN_PATH / HERDR_PLUGIN_*.
 
 mod collect;
 mod config;
 mod daemon;
 mod herdr;
 mod model;
+#[cfg(unix)]
+mod proc;
+#[cfg(windows)]
+#[path = "proc_windows.rs"]
 mod proc;
 mod render;
 

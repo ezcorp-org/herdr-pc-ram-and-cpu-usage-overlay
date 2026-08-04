@@ -40,7 +40,10 @@ struct PaneRoles {
 /// The first pane with a non-empty cwd wins the branch lookup. `cwd` is optional
 /// in herdr's payload and can be briefly absent while a pane is still starting,
 /// so a later pane is allowed to supply it. Bucketing: our pseudo-agent first,
-/// then any other non-empty agent, else a plain shell pane.
+/// then any other non-empty agent, else a plain shell pane — EXCEPT panes owned
+/// by another plugin ([`is_plugin_pane`]), which are never status hosts. They
+/// still count toward the space's usage: measurement runs off `roots`, which
+/// covers every pane regardless of these buckets.
 fn classify_panes(panes: &[&PaneInfo]) -> PaneRoles {
     let mut roles = PaneRoles::default();
     for pane in panes {
@@ -52,10 +55,36 @@ fn classify_panes(panes: &[&PaneInfo]) -> PaneRoles {
         match pane.agent.as_deref() {
             Some(PSEUDO_AGENT) => roles.pseudo_panes.push(pane.pane_id.clone()),
             Some(agent) if !agent.is_empty() => roles.agent_panes.push(pane.pane_id.clone()),
+            _ if is_plugin_pane(pane) => {} // measured via roots, never a status host
             _ => roles.spare_panes.push(pane.pane_id.clone()),
         }
     }
     roles
+}
+
+/// Whether an agent-less pane belongs to another plugin: it carries metadata
+/// tokens other than our own `usage` token. Plugin panes (herdr-sidebar's
+/// explorer/git pane, llmtrim's dashboards, ..) stamp identity/heartbeat tokens
+/// on themselves; claiming our pseudo-agent there put a second "agent" row in
+/// the panel and pinned the usage text to the wrong pane. Our own fall-through
+/// `usage` token must NOT trip this, or a pane we reported once would stop
+/// being a spare pane on the next cycle.
+///
+/// A HEURISTIC, and deliberately so: herdr's `PaneInfo.tokens` is one flat
+/// `map<string,string>` merged across every reporting source, with no ownership
+/// field anywhere on the pane, so "someone else annotated this pane" is the
+/// strongest signal the API offers. Two known costs, both preferred to grabbing
+/// a pane that isn't ours:
+///
+/// - a plugin that badges PLAIN SHELL panes rather than opening its own shrinks
+///   the spare pool; if it badges every agent-less pane in a workspace, that
+///   space gets no dedicated row and its usage rides on an agent pane instead
+///   (see the fall-through in [`crate::daemon::push_statuses`]);
+/// - a plugin that names a token `usage` reads as a spare pane here.
+fn is_plugin_pane(pane: &PaneInfo) -> bool {
+    pane.tokens
+        .as_ref()
+        .is_some_and(|tokens| tokens.keys().any(|key| key != PSEUDO_AGENT))
 }
 
 /// Bucket a snapshot's flat pane list under each pane's `workspace_id`, keeping
@@ -317,7 +346,19 @@ mod tests {
             workspace_id: workspace_id.to_string(),
             cwd: cwd.map(str::to_string),
             agent: agent.map(str::to_string),
+            tokens: None,
         }
+    }
+
+    /// A [`PaneInfo`] carrying metadata tokens with the given keys.
+    fn pane_with_tokens(pane_id: &str, keys: &[&str]) -> PaneInfo {
+        let mut p = pane(pane_id, "w1", None, None);
+        p.tokens = Some(
+            keys.iter()
+                .map(|k| (k.to_string(), "x".to_string()))
+                .collect(),
+        );
+        p
     }
 
     // ---- pane bucketing + classification ------------------------------------
@@ -371,6 +412,105 @@ mod tests {
     #[test]
     fn classify_of_no_panes_is_all_empty() {
         assert_eq!(classify_panes(&[]), PaneRoles::default());
+    }
+
+    #[test]
+    fn classify_never_offers_another_plugins_pane_as_spare() {
+        // The herdr-sidebar pane: no agent, but identity/heartbeat tokens. It
+        // must not become the pseudo-agent host — that is the pane-grab that
+        // put a second "agent" row in the panel.
+        let panes = [
+            pane_with_tokens("sidebar", &["herdr-sidebar-explorer", "herdr-sidebar-git"]),
+            pane("shell", "w1", None, None),
+        ];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+        let roles = classify_panes(&refs);
+
+        assert_eq!(roles.spare_panes, ["shell"]);
+        assert!(roles.pseudo_panes.is_empty());
+        assert!(roles.agent_panes.is_empty());
+    }
+
+    #[test]
+    fn classify_keeps_a_pane_carrying_only_our_usage_token_as_spare() {
+        // The metadata fall-through pushes the `usage` token onto a spare pane
+        // WITHOUT claiming an agent; on the next cycle that pane must still be
+        // a spare pane, or the status would hop panes forever.
+        let panes = [pane_with_tokens("shell", &[PSEUDO_AGENT])];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+        assert_eq!(classify_panes(&refs).spare_panes, ["shell"]);
+    }
+
+    #[test]
+    fn classify_prefers_the_real_agent_bucket_over_plugin_detection() {
+        // An agent pane with plugin badges (e.g. llmtrim tokens on a claude
+        // pane) stays an agent pane — the token check only gates spares.
+        let mut p = pane_with_tokens("claude", &["llmtrim"]);
+        p.agent = Some("claude".to_string());
+        let refs: Vec<&PaneInfo> = [&p].to_vec();
+        assert_eq!(classify_panes(&refs).agent_panes, ["claude"]);
+    }
+
+    #[test]
+    fn classify_misreads_a_foreign_usage_token_as_ours() {
+        // KNOWN LIMITATION, pinned deliberately rather than left as prose.
+        //
+        // herdr merges every plugin's tokens into one flat map and does not say
+        // who wrote what, so `usage` from another plugin is indistinguishable
+        // from ours and its pane is offered as a spare — the pane-grab this
+        // guard otherwise prevents. Closing it means renaming our token, which
+        // silently blanks the sidebar of everyone whose herdr config says
+        // `$usage`; with the plugin already widely installed that trade is not
+        // worth a collision no plugin has yet caused. The real fix is upstream:
+        // expose on read the `source` that `pane.report_metadata` already
+        // requires on write.
+        //
+        // If this test ever fails, the rename happened — update the README's
+        // "Living alongside other plugins" section with it.
+        let panes = [pane_with_tokens("someone-elses", &[PSEUDO_AGENT])];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+        assert_eq!(classify_panes(&refs).spare_panes, ["someone-elses"]);
+    }
+
+    #[test]
+    fn classify_treats_an_empty_token_map_as_a_plain_pane() {
+        // herdr sends `tokens` as an empty object once every token on a pane has
+        // expired or been cleared. "Present but empty" is not ownership.
+        let panes = [pane_with_tokens("shell", &[])];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+        assert_eq!(classify_panes(&refs).spare_panes, ["shell"]);
+    }
+
+    #[test]
+    fn classification_drops_only_plugin_panes() {
+        // The safety property behind the new arm: a pane may be left out of
+        // every bucket ONLY for being plugin-owned. Anything else silently
+        // vanishing would be a space losing its status host for no reason.
+        let mut agent = pane("claude", "w1", None, None);
+        agent.agent = Some("claude".to_string());
+        let mut pseudo = pane("ours", "w1", None, None);
+        pseudo.agent = Some(PSEUDO_AGENT.to_string());
+        let panes = [
+            agent,
+            pseudo,
+            pane("shell", "w1", None, None),
+            pane_with_tokens("mine-only", &[PSEUDO_AGENT]),
+            pane_with_tokens("theirs", &["herdr-sidebar-git"]),
+        ];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+        let roles = classify_panes(&refs);
+
+        let mut bucketed: Vec<&str> = roles
+            .agent_panes
+            .iter()
+            .chain(&roles.spare_panes)
+            .chain(&roles.pseudo_panes)
+            .map(String::as_str)
+            .collect();
+        bucketed.sort_unstable();
+        // Everything is placed except the one pane another plugin owns.
+        assert_eq!(bucketed, ["claude", "mine-only", "ours", "shell"]);
+        assert_eq!(bucketed.len() + 1, panes.len());
     }
 
     /// Build a measured [`Space`] with just the aggregate-relevant fields set.

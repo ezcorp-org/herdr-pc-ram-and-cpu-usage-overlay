@@ -13,7 +13,7 @@
 
 id = "ez-corp.space-usage"
 name = "PC RAM & CPU Usage Overlay"
-version = "1.3.0"
+version = "1.5.0"
 # Oldest herdr with every API this plugin calls: `session.snapshot`, the `tokens`
 # metadata API on `pane.report_metadata` / `workspace.report_metadata`, and
 # `pane.process_info` — all 0.7.5. Diffing the two bundled API schemas
@@ -21,7 +21,7 @@ version = "1.3.0"
 # used here, so this stays put; developed and tested against 0.8.0.
 min_herdr_version = "0.7.5"
 description = "CPU and RAM usage per space, grouped under the branch name."
-platforms = ["linux"]
+platforms = ["linux", "windows"]
 
 # Commands are argv arrays (no shell) and run with the plugin dir as cwd,
 # per https://herdr.dev/docs/plugins/#trust-and-security
@@ -31,7 +31,7 @@ platforms = ["linux"]
 # what every pane/action command below invokes (relative to the plugin root).
 [[build]]
 command = ["cargo", "build", "--release"]
-platforms = ["linux"]
+platforms = ["linux", "windows"]
 
 # Restart recovery. herdr runs startup hooks on both a fresh server start and a
 # live handoff (`herdr update --handoff`), so this fires whenever herdr comes
@@ -42,7 +42,7 @@ platforms = ["linux"]
 # the sidebar stays blank until someone re-invokes status-enable by hand.
 [[startup]]
 command = ["./target/release/space-usage", "--restore"]
-platforms = ["linux"]
+platforms = ["linux", "windows"]
 
 # Live, self-refreshing dashboard. Opened as a temporary zoomed overlay pane.
 [[panes]]

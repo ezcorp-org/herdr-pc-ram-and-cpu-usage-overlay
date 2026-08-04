@@ -9,8 +9,6 @@ use std::io::{self, IsTerminal, Write};
 
 use serde::Serialize;
 use serde_json::Number;
-use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
 
 use crate::collect;
 use crate::config::Labels;
@@ -251,18 +249,11 @@ pub fn run_json(client: &mut Herdr) -> crate::Result<()> {
 
 /// `--interval`: live watch, redrawing every `interval_ms` (first frame quick).
 ///
-/// A background thread restores the cursor and exits on SIGINT/SIGTERM; the
-/// main loop hides the cursor, then clears + redraws each frame,
-/// widening the CPU window from the quick first frame to `interval_ms`.
+/// A SIGINT/SIGTERM hook (a console ctrl handler on Windows) restores the
+/// cursor and exits; the main loop hides the cursor, then clears + redraws each
+/// frame, widening the CPU window from the quick first frame to `interval_ms`.
 pub fn run_interval(client: &mut Herdr, labels: &Labels, interval_ms: u64) -> crate::Result<()> {
-    let mut signals = Signals::new([SIGINT, SIGTERM])?;
-    std::thread::spawn(move || {
-        if signals.forever().next().is_some() {
-            print!("\x1b[?25h"); // show cursor
-            let _ = io::stdout().flush();
-            std::process::exit(0);
-        }
-    });
+    install_quit_hook()?;
 
     let mut out = io::stdout();
     write!(out, "\x1b[?25l")?; // hide cursor
@@ -296,8 +287,46 @@ pub fn run_interval(client: &mut Herdr, labels: &Labels, interval_ms: u64) -> cr
     }
 }
 
+/// Show the cursor again and exit — the shared body of both quit hooks.
+fn restore_cursor_and_exit() -> ! {
+    print!("\x1b[?25h"); // show cursor
+    let _ = io::stdout().flush();
+    std::process::exit(0);
+}
+
+/// Restore the cursor on SIGINT/SIGTERM via a signal-hook thread.
+#[cfg(unix)]
+fn install_quit_hook() -> crate::Result<()> {
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ])?;
+    std::thread::spawn(move || {
+        if signals.forever().next().is_some() {
+            restore_cursor_and_exit();
+        }
+    });
+    Ok(())
+}
+
+/// Restore the cursor on Ctrl+C / console close via a console ctrl handler
+/// (Windows delivers these on their own thread, so exiting from it is fine).
+#[cfg(windows)]
+fn install_quit_hook() -> crate::Result<()> {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    unsafe extern "system" fn on_ctrl(_ctrl_type: u32) -> i32 {
+        restore_cursor_and_exit();
+    }
+    // SAFETY: registering a handler with a 'static function pointer.
+    if unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
 /// Local wall-clock `HH:MM:SS` for the live-watch footer stamp (cosmetic — not
 /// part of any output contract).
+#[cfg(unix)]
 fn local_time_string() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -308,6 +337,17 @@ fn local_time_string() -> String {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe { libc::localtime_r(&secs, &mut tm) };
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+/// Local wall-clock `HH:MM:SS` via `GetLocalTime` (already timezone-adjusted).
+#[cfg(windows)]
+fn local_time_string() -> String {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+    let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    // SAFETY: `GetLocalTime` fills the caller-owned SYSTEMTIME.
+    unsafe { GetLocalTime(&mut st) };
+    format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
 }
 
 #[cfg(test)]

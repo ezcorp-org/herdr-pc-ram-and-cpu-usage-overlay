@@ -77,7 +77,17 @@ pub struct WorkspaceInfo {
 }
 
 /// One entry of `panes`; only the fields we consume are modelled. `workspace_id`
-/// is what buckets each pane back under its workspace.
+/// is what buckets each pane back under its workspace. `tokens` is the pane's
+/// metadata-token map (`pane.report_metadata`): panes opened by other plugins
+/// stamp their identity there (e.g. herdr-sidebar's heartbeat), which is how
+/// the classifier keeps its status row off them.
+///
+/// Typed `String -> String` to match the schema exactly (`PaneInfo.tokens` is
+/// `map<string,string>`, keys `^[A-Za-z0-9_-]{1,32}$`) so a schema change lands
+/// as a parse error here rather than being silently swallowed by a `Value`.
+/// Note the map is FLAT across every reporting plugin — herdr attributes no
+/// source to it — which is what makes [`crate::collect`]'s ownership check a
+/// heuristic rather than a guarantee.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PaneInfo {
     pub pane_id: String,
@@ -87,6 +97,8 @@ pub struct PaneInfo {
     pub cwd: Option<String>,
     #[serde(default)]
     pub agent: Option<String>,
+    #[serde(default)]
+    pub tokens: Option<std::collections::HashMap<String, String>>,
 }
 
 // ---- pane.process_info ------------------------------------------------------
@@ -168,7 +180,9 @@ mod tests {
             "agent_status": "working", "revision": 1 },
           { "pane_id": "wT:p1", "terminal_id": "t3", "workspace_id": "wT",
             "tab_id": "wT:t1", "focused": false, "cwd": null,
-            "agent_status": "unknown", "revision": 0 }
+            "agent_status": "unknown", "revision": 0,
+            "tokens": { "herdr-sidebar-explorer": "1785860662",
+                        "herdr-sidebar-git": "1785860662" } }
         ],
         "layouts": [],
         "agents": []
@@ -195,6 +209,10 @@ mod tests {
         // An explicit `null` cwd must not be an error — herdr can omit it while a
         // pane is still starting.
         assert_eq!(snap.panes[2].cwd, None);
+        // Plugin panes surface their identity tokens; plain panes have none.
+        assert!(snap.panes[0].tokens.is_none());
+        let tokens = snap.panes[2].tokens.as_ref().expect("sidebar pane tokens");
+        assert!(tokens.contains_key("herdr-sidebar-explorer"));
     }
 
     #[test]
