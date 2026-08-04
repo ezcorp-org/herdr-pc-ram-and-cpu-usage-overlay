@@ -140,7 +140,9 @@ fn run() -> Result<()> {
 /// rows and lets them judge — a tier that comes out as boxes is one to avoid.
 ///
 /// The rows use the user's own herdr `[ui]` labels and go through the same
-/// [`render::metric_row`] the sidebar does, so what they see is what they get.
+/// [`render::metric_row`] every surface does, so what they see is what they get.
+/// All three metrics are drawn — a space's row is the first two cells, and the
+/// battery joins them on the window title and the report's total line.
 fn print_icon_preview(config: &config::Config, labels: &config::Labels) {
     let current = config.icon_set();
     println!(

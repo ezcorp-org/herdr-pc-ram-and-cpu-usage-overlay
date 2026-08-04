@@ -30,6 +30,10 @@ pub struct Config {
     pub window_title_totals: bool,
     /// Whether to show the battery cell at all. On by default; a host with no
     /// battery hides it regardless (see [`Config::battery_reading`]).
+    ///
+    /// The cell it gates is the machine-wide one — the window title, the
+    /// report's total line, and the JSON pair. Per-space rows carry no battery
+    /// on any setting; see [`crate::render::usage_row`].
     pub battery: bool,
     /// Glyph tier name as the user typed it — [`crate::icons::resolve`] is what
     /// gives it meaning, so an unknown value auto-detects instead of failing
@@ -45,6 +49,9 @@ pub struct Config {
     /// battery, so there is no second surface to keep in step. `cpu_label` and
     /// `ram_label` stay in herdr's config precisely because the sidebar's
     /// system-usage header does share those.
+    ///
+    /// Names the battery wherever the plugin draws it: the window title, the
+    /// report's total line, and the `--icons` preview.
     pub battery_label: Option<String>,
 }
 

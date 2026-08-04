@@ -183,24 +183,15 @@ pub fn run_daemon() -> crate::Result<()> {
                 if stopping.load(Ordering::SeqCst) {
                     park(); // shutdown ran during the sample window — do not re-report
                 }
-                // ONE reading per refresh: the battery is machine-wide, so the
-                // per-space push below must not re-walk sysfs (or fork `pmset`)
-                // for each space to be told the same number.
-                let battery = config.battery_reading();
                 {
                     let mut guard = tracked.lock().expect("tracked mutex poisoned");
-                    push_statuses(
-                        &mut client,
-                        &spaces,
-                        config,
-                        labels,
-                        icons,
-                        battery,
-                        &mut guard,
-                    );
+                    push_statuses(&mut client, &spaces, config, labels, icons, &mut guard);
                 }
+                // The title is the only surface here that draws a battery, so
+                // the read lives under its gate: a machine-wide reading nobody
+                // renders is a sysfs walk (or a `pmset` fork) for nothing.
                 if config.window_title_totals {
-                    set_title_totals(&mut client, &spaces, labels, icons, battery);
+                    set_title_totals(&mut client, &spaces, config, labels, icons);
                 }
                 failures = 0;
             }
@@ -318,23 +309,22 @@ pub fn toggle_updater() -> crate::Result<()> {
 /// fall-through when the pseudo report fails): release leftover pseudo-agents,
 /// then report TTL'd metadata on the first spare pane (else the first agent pane).
 ///
-/// `icons` and `battery` are the once-per-refresh presentation inputs the caller
-/// resolved: both are machine-wide, so taking them as parameters is what keeps
-/// the per-space loop below from re-deriving them once per space.
+/// `icons` is the once-per-refresh presentation input the caller resolved:
+/// machine-wide, so taking it as a parameter is what keeps the per-space loop
+/// below from re-deriving it once per space.
 pub fn push_statuses(
     client: &mut Herdr,
     spaces: &[Space],
     config: &Config,
     labels: &Labels,
     icons: IconSet,
-    battery: Option<Battery>,
     tracked: &mut Tracked,
 ) {
     let source = config::plugin_id();
     let ttl_ms = status_ttl_ms(config.interval_seconds);
 
     for sp in spaces {
-        let status = status_line(sp, labels, icons, battery);
+        let status = status_line(sp, labels, icons);
 
         if config.mode == Mode::AgentsPanel {
             // Drop stale claims from earlier runs so a space keeps one entry.
@@ -426,18 +416,23 @@ pub fn clear_all(client: &mut Herdr, tracked: &Tracked) {
 }
 
 /// Write the all-space CPU/RAM/battery totals to the client window title.
+///
+/// Takes the reading off the cycle's `config` rather than a battery argument:
+/// this is the one surface the daemon draws it on, so nothing else has to carry
+/// the value past a row that will not use it.
 pub fn set_title_totals(
     client: &mut Herdr,
     spaces: &[Space],
+    config: &Config,
     labels: &Labels,
     icons: IconSet,
-    battery: Option<Battery>,
 ) {
-    let _ = client.window_title_set(&title_totals(spaces, labels, icons, battery));
+    let title = title_totals(spaces, labels, icons, config.battery_reading());
+    let _ = client.window_title_set(&title);
 }
 
-/// The window title text: `"spaces · "` plus the same row the sidebar card
-/// shows, summed over every space.
+/// The window title text: `"spaces · "` plus the per-space row's cells summed
+/// over every space, and the machine's one battery cell.
 ///
 /// Pure, and split from [`set_title_totals`] so the formatting is testable
 /// without a live herdr connection.
@@ -455,7 +450,7 @@ fn title_totals(
     }
     format!(
         "spaces · {}",
-        render::usage_row(cpu, ram_mb, labels, icons, battery),
+        render::totals_row(cpu, ram_mb, labels, icons, battery),
     )
 }
 
@@ -632,10 +627,13 @@ fn status_ttl_ms(interval_seconds: u64) -> u64 {
     interval_seconds.saturating_mul(3_000).min(MAX_TTL_MS)
 }
 
-/// The per-space status text — `cpu ░26% · ram ░8% · bat ▓74%` in the Unicode
-/// tier, and the battery cell only when the host has one.
-fn status_line(sp: &Space, labels: &Labels, icons: IconSet, battery: Option<Battery>) -> String {
-    render::usage_row(sp.cpu, sp.ram_mb, labels, icons, battery)
+/// The per-space status text — `cpu ░26% · ram ░8%` in the Unicode tier.
+///
+/// No battery: it is one reading for the whole machine, so a copy of it on every
+/// space's row would read as if the space had its own. [`title_totals`] and the
+/// terminal report's total line are where it belongs — see [`render::usage_row`].
+fn status_line(sp: &Space, labels: &Labels, icons: IconSet) -> String {
+    render::usage_row(sp.cpu, sp.ram_mb, labels, icons)
 }
 
 /// Best-effort release of our pseudo-agent on `pane_id` (a closed pane errors and
@@ -689,86 +687,77 @@ mod tests {
         // The RAM cell depends on the host's MemTotal (percent when readable,
         // compact absolute when not), so assert the CPU rounding + label layout,
         // which are total-independent. `render::ram_cell_of` pins both branches.
-        let line = status_line(&space(5.6, 0.0), &labels, IconSet::Text, None);
+        let line = status_line(&space(5.6, 0.0), &labels, IconSet::Text);
         assert!(line.starts_with("CPU 6% · MEM "), "got: {line}");
     }
 
     #[test]
     fn status_line_rounds_cpu_half_away_from_zero() {
         let labels = Labels::default();
-        let line = |cpu| status_line(&space(cpu, 0.0), &labels, IconSet::Text, None);
+        let line = |cpu| status_line(&space(cpu, 0.0), &labels, IconSet::Text);
         assert!(line(2.5).starts_with("cpu 3%"));
         assert!(line(2.4).starts_with("cpu 2%"));
     }
 
     #[test]
-    fn status_line_adds_a_battery_cell_only_when_there_is_a_reading() {
+    fn a_space_row_is_the_machine_row_without_the_battery() {
+        // The battery is one reading for the whole machine, so it belongs on the
+        // surfaces that draw the machine once — never copied onto each space,
+        // where the same number repeated reads as if it were per-space.
+        //
+        // `status_line` cannot even be handed a battery now, so what is worth
+        // pinning is the consequence: the row a space gets is exactly the
+        // machine-wide row with the battery cell taken off. Host-independent —
+        // whether this box has a pack does not change either side.
         let labels = Labels::default();
         let sp = space(26.0, 0.0);
-        let with = status_line(
-            &sp,
+        let row = status_line(&sp, &labels, IconSet::Unicode);
+        let machine = render::totals_row(
+            sp.cpu,
+            sp.ram_mb,
             &labels,
             IconSet::Unicode,
             Some(bat(74.0, State::Discharging)),
         );
-        let without = status_line(&sp, &labels, IconSet::Unicode, None);
 
-        assert!(with.ends_with(" · bat ▓74%"), "got: {with}");
-        // A desktop/server/VM shows no battery at all — not `bat 0%`, and not a
-        // dangling separator.
-        assert!(!without.contains("bat"), "got: {without}");
-        // The cell is purely additive: everything before it is byte-identical.
-        assert_eq!(with.strip_suffix(" · bat ▓74%"), Some(without.as_str()));
+        assert!(!row.contains("bat"), "got: {row}");
+        assert_eq!(machine.strip_suffix(" · bat ▓74%"), Some(row.as_str()));
     }
 
     #[test]
-    fn status_line_has_no_battery_cell_when_the_config_turns_it_off() {
-        // `battery = false` is honoured at the read, so an opted-out user gets
-        // exactly the row a battery-less host gets — on any hardware, which is
-        // what makes this assertion safe on a developer's laptop too.
-        let config = Config {
-            battery: false,
-            ..Config::default()
-        };
-        let line = status_line(
-            &space(26.0, 0.0),
-            &Labels::default(),
-            IconSet::Unicode,
-            config.battery_reading(),
-        );
-        assert!(!line.contains("bat"), "got: {line}");
-    }
-
-    #[test]
-    fn status_line_draws_the_cpu_and_battery_cells_in_every_tier() {
+    fn status_line_draws_the_cpu_cell_in_every_tier_and_a_battery_in_none() {
         let labels = Labels::default();
         let sp = space(26.0, 0.0);
-        // Head and tail of the row per tier; the RAM cell in the middle is
-        // host-dependent, so `render`'s tests pin the whole row instead.
+        // Head of the row per tier; the RAM cell after it is host-dependent, so
+        // `render`'s tests pin the whole row instead.
         let expected = [
-            (IconSet::Text, "cpu 26%", "bat 74%"),
-            (IconSet::Unicode, "cpu ░26%", "bat ▓74%"),
-            (IconSet::NerdFont, "\u{f4bc} 26%", "\u{f241} 74%"),
-            (IconSet::Emoji, "💻26%", "🔋74%"),
+            (IconSet::Text, "cpu 26%"),
+            (IconSet::Unicode, "cpu ░26%"),
+            (IconSet::NerdFont, "\u{f4bc} 26%"),
+            (IconSet::Emoji, "💻26%"),
         ];
-        for (icons, cpu, battery) in expected {
-            let line = status_line(&sp, &labels, icons, Some(bat(74.0, State::Discharging)));
+        for (icons, cpu) in expected {
+            let line = status_line(&sp, &labels, icons);
             assert!(line.starts_with(&format!("{cpu} · ")), "{icons:?}: {line}");
-            assert!(
-                line.ends_with(&format!(" · {battery}")),
-                "{icons:?}: {line}"
-            );
+            // Each tier names the battery its own way, so check all three marks
+            // against every row — a glyph tier smuggling one back in would slip
+            // straight past a test that only looked for the word.
+            for mark in ["bat", "\u{f241}", "🔋"] {
+                assert!(!line.contains(mark), "{icons:?} drew {mark}: {line}");
+            }
         }
     }
 
+    // ---- the window title ----------------------------------------------------
+
     #[test]
-    fn status_line_battery_cell_shows_the_charge_state() {
-        // Same charge, three states: a glance at the sidebar has to tell a pack
+    fn title_battery_cell_shows_the_charge_state() {
+        // Same charge, three states: a glance at the title has to tell a pack
         // that is filling from one that is draining.
         let labels = Labels::default();
         let line = |state| {
-            status_line(
-                &space(26.0, 0.0),
+            title_totals(
+                &[space(26.0, 0.0)],
                 &labels,
                 IconSet::Unicode,
                 Some(bat(74.0, state)),
@@ -779,8 +768,6 @@ mod tests {
         assert!(line(State::Full).ends_with("bat ▓74%="));
         assert_ne!(line(State::Charging), line(State::Discharging));
     }
-
-    // ---- the window title ----------------------------------------------------
 
     #[test]
     fn title_totals_sums_the_spaces_and_carries_one_battery() {

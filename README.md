@@ -8,23 +8,25 @@ a glance which space is eating your machine.
 ```
 ● web-app
     main
-    cpu 26% · ram 8% · bat 74%+     ← spaces card (sidebar mode)
+    cpu 26% · ram 8%                ← spaces card (sidebar mode)
 
 ⚡ web-app
     idle · usage · cpu 26% · ram 8%   ← agents panel (default mode)
 ```
 
 With a Nerd Font installed it detects that and uses icons instead —
-` 26% ·  8% ·  74%+`. See [Icons](#icons-and-labels).
+` 26% ·  8%`. See [Icons](#icons-and-labels).
 
 - Per-space CPU% and RAM%, both a share of the **whole machine** (0–100%, so a
   busy space reads e.g. `cpu 4%` — not a per-core figure that can exceed 100%),
   refreshed every 5s
-- **Battery** next to them, with a charge-level gauge — and **hidden entirely on
-  a machine that has none**, so desktops and servers see no empty cell
+- **Battery**, with a charge-level gauge, on the surfaces that draw the machine
+  once — never repeated per space — and **hidden entirely on a machine that has
+  none**, so desktops and servers see no empty cell
 - **Worktree-aware**: workspaces opened as worktree children are folded into
   their parent space's total
-- All-space totals in your terminal's window title: `spaces · cpu 39% · ram 8%`
+- All-space totals in your terminal's window title:
+  `spaces · cpu 39% · ram 8% · bat 74%+`
 - A live dashboard pane and one-shot report/JSON actions
 - A small static Rust binary (~2–5 MB resident) that talks to herdr over its
   unix socket (a named pipe on Windows) — no per-sample subprocess spawns, no
@@ -103,7 +105,7 @@ mode = "agents-panel"       # default — works on stock herdr
 # mode = "sidebar"          # for herdr builds with the sidebar patch (below)
 interval_seconds = 5        # 1..28800; statuses get a TTL of three intervals
 window_title_totals = true
-battery = true              # show the battery cell when the machine has one
+battery = true              # machine-wide cell on the title/report, not the rows
 icons = "auto"              # auto | text | unicode | nerdfont | emoji
 ```
 
@@ -139,9 +141,19 @@ space-usage-line and git-dirty herdr patches are retired. Requires herdr ≥ 0.7
 
 ## Battery
 
-The battery cell sits next to cpu and ram, and **disappears completely on a
-machine that has no battery** — a desktop, a server, or a VM shows nothing
-rather than a fabricated `0%`.
+The battery is **one reading for the whole machine**, so it is drawn on the
+surfaces that show the machine once and nowhere else:
+
+| surface | battery |
+|---|---|
+| window title (`window_title_totals`) | yes — `spaces · cpu 39% · ram 8% · bat 74%+` |
+| `--once` / dashboard report | yes, on the total line |
+| `--json` payload | yes, `battery_percent` / `battery_state` |
+| per-space sidebar rows | **no** — see below |
+
+It **disappears completely on a machine that has no battery** — a desktop, a
+server, or a VM shows nothing rather than a fabricated `0%`. The machine-wide
+row, in the Unicode tier:
 
 ```
 cpu ░26% · ram ░8% · bat ▓74%+      74% and charging
@@ -153,6 +165,14 @@ A trailing `+` means charging; `=` means on power but holding (full, or capped
 by a vendor charge limit). Turn the cell off with `battery = false`, which also
 skips the read entirely — no sysfs walk, no `pmset` process.
 
+**Why not on the space rows.** herdr's sidebar has no machine-wide row of its
+own, so a plugin that put the battery in each space's `$usage` token would draw
+the same figure once per space — three spaces, the same `bat 74%` three times —
+and a number repeated beside a per-space cpu and ram reads as if the space had
+its own pack. The rows stay `cpu · ram`. If you want a battery *in the sidebar*,
+it belongs in herdr's own spaces header next to the cpu/ram readout, which is
+herdr's to render, not a plugin's.
+
 Two details worth knowing:
 
 - On Linux, peripherals register as batteries too. A wireless mouse appears in
@@ -161,10 +181,6 @@ Two details worth knowing:
 - Plugins run on the machine hosting the **herdr server**. Attach from a laptop
   to a remote server and the battery shown is the *server's* — usually none.
   That is consistent with cpu and ram, which are also the server's.
-
-Because herdr's sidebar has no machine-wide row, one battery reading is drawn
-once per space card. With three spaces open you will see it three times. The
-full-width `--once` report avoids this by putting it on the total line only.
 
 ## Icons and labels
 
@@ -179,6 +195,10 @@ emoji at one column or two, is something only you can see.
 | `unicode` | `cpu ░26% · ram ░8% · bat ▓74%` | nothing (opt-in) |
 | `nerdfont` | ` 26% ·  8% ·  74%` | a Nerd Font |
 | `emoji` | `💻26% · 🧠8% · 🔋74%` | a colour emoji font |
+
+The preview draws all three metrics so you can judge every glyph at once. A
+space's row is the first two cells only — the battery rides the machine-wide
+surfaces ([Battery](#battery)).
 
 ### What `auto` does
 
@@ -240,7 +260,7 @@ ram_label = ""
 ```
 
 ```toml
-# in the plugin's config.toml — battery only
+# in the plugin's config.toml — battery only (title, report, JSON)
 battery_label = ""
 icons = "text"          # the labels are doing the naming now
 ```

@@ -6,9 +6,9 @@
 //! `run_interval` clearing and redrawing each frame.
 //!
 //! Every surface's metric cells are assembled here — including the narrow ones
-//! the sidebar daemon and the `--icons` preview draw ([`usage_row`]) — so there
-//! is one place that decides what a metric looks like and the surfaces cannot
-//! drift apart.
+//! the sidebar daemon and the `--icons` preview draw ([`usage_row`] for one
+//! space, [`totals_row`] for the whole machine) — so there is one place that
+//! decides what a metric looks like and the surfaces cannot drift apart.
 
 use std::io::{self, IsTerminal, Write};
 
@@ -166,24 +166,43 @@ pub fn metric_row(cpu: String, ram: String, battery: Option<String>) -> String {
     cells.join(CELL_SEPARATOR)
 }
 
-/// One set of totals as a narrow row — what the sidebar card and the window
-/// title show.
+/// The two per-space cells both narrow rows start with, built once so the row
+/// that carries a battery and the row that cannot still agree on the first two.
+fn usage_cells(cpu: f64, ram_mb: f64, labels: &Labels, icons: IconSet) -> (String, String) {
+    (
+        icons.cpu(labels.cpu(), cpu),
+        ram_cell(icons, labels.ram(), ram_mb),
+    )
+}
+
+/// One space's narrow row — what the sidebar card and the agents panel show.
 ///
-/// `battery` is the machine-wide reading taken once per refresh cycle by
-/// [`Config::battery_reading`] and passed down, never re-read here: this runs
-/// once per space, and the battery is one value for the whole machine.
-pub fn usage_row(
+/// Takes no battery, and that is the point rather than an omission: the battery
+/// is one reading for the whole machine, so repeating it on every space's row
+/// says the same number N times and reads as if each space had its own pack. The
+/// machine-wide surfaces draw it instead — the window title via [`totals_row`],
+/// the terminal report on its total line, and (on a patched build) herdr's own
+/// sidebar header. Keeping the parameter off the signature is what stops a
+/// future caller from putting it back by accident.
+pub fn usage_row(cpu: f64, ram_mb: f64, labels: &Labels, icons: IconSet) -> String {
+    let (cpu_cell, ram) = usage_cells(cpu, ram_mb, labels, icons);
+    metric_row(cpu_cell, ram, None)
+}
+
+/// The all-space totals as a narrow row — [`usage_row`] plus the machine's one
+/// battery cell. This is the window title.
+///
+/// `battery` is the reading taken once per refresh cycle by
+/// [`Config::battery_reading`] and passed down, never re-read here.
+pub fn totals_row(
     cpu: f64,
     ram_mb: f64,
     labels: &Labels,
     icons: IconSet,
     battery: Option<Battery>,
 ) -> String {
-    metric_row(
-        icons.cpu(labels.cpu(), cpu),
-        ram_cell(icons, labels.ram(), ram_mb),
-        battery_cell(icons, labels, battery),
-    )
+    let (cpu_cell, ram) = usage_cells(cpu, ram_mb, labels, icons);
+    metric_row(cpu_cell, ram, battery_cell(icons, labels, battery))
 }
 
 // ---- human render -----------------------------------------------------------
@@ -599,9 +618,9 @@ mod tests {
     }
 
     #[test]
-    fn usage_row_is_cpu_then_ram_then_battery() {
+    fn a_narrow_row_is_cpu_then_ram_then_battery() {
         // The whole row, spelled out with the machine total pinned (1310.72 MB
-        // of 16384 MB is 8%) — `usage_row` itself reads that total from the host.
+        // of 16384 MB is 8%) — the row builders read that total from the host.
         let row = metric_row(
             IconSet::Unicode.cpu(None, 26.0),
             ram_cell_of(IconSet::Unicode, None, 1310.72, 16384.0),
