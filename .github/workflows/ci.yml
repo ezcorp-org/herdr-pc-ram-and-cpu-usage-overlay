@@ -50,4 +50,3 @@ jobs:
 
       - name: Build release
         run: cargo build --release
-</content>

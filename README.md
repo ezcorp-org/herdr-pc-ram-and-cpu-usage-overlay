@@ -200,5 +200,3 @@ build step, so run `cargo build --release` first — the linked commands invoke
 ## License
 
 MIT — see [LICENSE](LICENSE).
-</content>
-</invoke>
