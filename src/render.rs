@@ -17,7 +17,7 @@ use serde_json::Number;
 
 use crate::battery::{Battery, State};
 use crate::collect;
-use crate::config::{Config, Labels};
+use crate::config::{Config, Labels, DEFAULT_RAM_LABEL};
 use crate::herdr::Herdr;
 use crate::icons::IconSet;
 use crate::model::Space;
@@ -122,7 +122,7 @@ const CELL_SEPARATOR: &str = " · ";
 /// tier deliberately contributes nothing in that branch: a gauge glyph measures
 /// a level, and drawing one beside an absolute figure would be inventing a
 /// reading we do not have.
-fn ram_cell(icons: IconSet, label: &str, mb: f64) -> String {
+fn ram_cell(icons: IconSet, label: Option<&str>, mb: f64) -> String {
     ram_cell_of(icons, label, mb, proc::mem_total_mb())
 }
 
@@ -131,13 +131,16 @@ fn ram_cell(icons: IconSet, label: &str, mb: f64) -> String {
 /// The seam exists for the tests: the real total is read once and cached for the
 /// process, so a test host with a readable `/proc/meminfo` could never reach the
 /// fallback branch (and one without it could never reach the percent branch).
-fn ram_cell_of(icons: IconSet, label: &str, mb: f64, mem_total_mb: f64) -> String {
+fn ram_cell_of(icons: IconSet, label: Option<&str>, mb: f64, mem_total_mb: f64) -> String {
     if mem_total_mb > 0.0 {
         // Same arithmetic and rounding as `proc::ram_pct`, so the Text tier
         // reproduces the pre-icons sidebar byte for byte.
         icons.ram(label, 100.0 * mb / mem_total_mb)
     } else {
-        format!("{label} {}", compact_ram(mb))
+        // No total to be a percent OF, so the tier contributes nothing: a gauge
+        // glyph measures a level, and drawing one beside an absolute figure
+        // would invent a reading we do not have.
+        format!("{} {}", label.unwrap_or(DEFAULT_RAM_LABEL), compact_ram(mb))
     }
 }
 
@@ -148,7 +151,7 @@ fn ram_cell_of(icons: IconSet, label: &str, mb: f64, mem_total_mb: f64) -> Strin
 /// like. `reading` is already `None` when the user turned the metric off — see
 /// [`Config::battery_reading`].
 fn battery_cell(icons: IconSet, labels: &Labels, reading: Option<Battery>) -> Option<String> {
-    reading.map(|reading| icons.battery(&labels.battery, reading))
+    reading.map(|reading| icons.battery(labels.battery(), reading))
 }
 
 /// Join the cells of one narrow row: `cpu ░26% · ram ░8% · bat ▓74%`.
@@ -177,8 +180,8 @@ pub fn usage_row(
     battery: Option<Battery>,
 ) -> String {
     metric_row(
-        icons.cpu(&labels.cpu, cpu),
-        ram_cell(icons, &labels.ram, ram_mb),
+        icons.cpu(labels.cpu(), cpu),
+        ram_cell(icons, labels.ram(), ram_mb),
         battery_cell(icons, labels, battery),
     )
 }
@@ -257,9 +260,9 @@ fn render_styled(
         lines.push(format!("      {}", style.dim(branch)));
         lines.push(format!(
             "      {} {}   {} {}{}   {}",
-            labels.cpu,
+            labels.cpu_word(),
             cpu_str,
-            labels.ram,
+            labels.ram_word(),
             ram_cell,
             pct_str,
             style.dim(&notes.join(" ")),
@@ -280,9 +283,9 @@ fn render_styled(
         .unwrap_or_default();
     lines.push(style.dim(&format!(
         "  ── total   {} {:.1}%   {} {}{}{}",
-        labels.cpu,
+        labels.cpu_word(),
         total_cpu,
-        labels.ram,
+        labels.ram_word(),
         fmt_ram(total_ram),
         total_pct_str,
         total_battery_str,
@@ -561,12 +564,12 @@ mod tests {
     fn ram_cell_rounds_exactly_as_ram_pct_does() {
         // The pre-icons sidebar showed `proc::ram_pct`, so the Text tier has to
         // reproduce it byte for byte — these are that function's own cases.
-        assert_eq!(ram_cell_of(IconSet::Text, "ram", 1024.0, 16384.0), "ram 6%");
+        assert_eq!(ram_cell_of(IconSet::Text, None, 1024.0, 16384.0), "ram 6%");
         // 100 * 250 / 10000 = 2.5 -> 3 (half away from zero).
-        assert_eq!(ram_cell_of(IconSet::Text, "ram", 250.0, 10000.0), "ram 3%");
+        assert_eq!(ram_cell_of(IconSet::Text, None, 250.0, 10000.0), "ram 3%");
         // The tier decorates that same number, it does not change it.
         assert_eq!(
-            ram_cell_of(IconSet::Unicode, "ram", 1024.0, 16384.0),
+            ram_cell_of(IconSet::Unicode, None, 1024.0, 16384.0),
             "ram ░6%",
         );
     }
@@ -576,13 +579,10 @@ mod tests {
         // No MemTotal means no scale to be a percentage of. The absolute is
         // shown with the label and *no* gauge: a gauge glyph claims a level, and
         // in this branch we have none to claim.
-        assert_eq!(
-            ram_cell_of(IconSet::Unicode, "ram", 1536.0, 0.0),
-            "ram 1.5G"
-        );
-        assert_eq!(ram_cell_of(IconSet::Text, "ram", 512.0, 0.0), "ram 512M");
+        assert_eq!(ram_cell_of(IconSet::Unicode, None, 1536.0, 0.0), "ram 1.5G");
+        assert_eq!(ram_cell_of(IconSet::Text, None, 512.0, 0.0), "ram 512M");
         // Same for a nonsensical total, which would otherwise divide by zero.
-        assert_eq!(ram_cell_of(IconSet::Emoji, "ram", 0.0, -1.0), "ram 0M");
+        assert_eq!(ram_cell_of(IconSet::Emoji, None, 0.0, -1.0), "ram 0M");
     }
 
     #[test]
@@ -603,8 +603,8 @@ mod tests {
         // The whole row, spelled out with the machine total pinned (1310.72 MB
         // of 16384 MB is 8%) — `usage_row` itself reads that total from the host.
         let row = metric_row(
-            IconSet::Unicode.cpu("cpu", 26.0),
-            ram_cell_of(IconSet::Unicode, "ram", 1310.72, 16384.0),
+            IconSet::Unicode.cpu(None, 26.0),
+            ram_cell_of(IconSet::Unicode, None, 1310.72, 16384.0),
             battery_cell(
                 IconSet::Unicode,
                 &Labels::default(),
@@ -691,11 +691,7 @@ mod tests {
 
     #[test]
     fn render_honours_custom_labels() {
-        let labels = Labels {
-            cpu: "CPU".to_string(),
-            ram: "MEM".to_string(),
-            battery: "PWR".to_string(),
-        };
+        let labels = Labels::new(Some("CPU"), Some("MEM"), Some("PWR"));
         let out = render_styled(
             &[space("s", false, 1.0, 1.0, 1)],
             &labels,

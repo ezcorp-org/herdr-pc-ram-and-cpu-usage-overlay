@@ -220,10 +220,33 @@ against both faces and is present in both; a test asserts they stay inside the
 BMP, outside the Private Use Area, and on that measured list, so the "no font
 install" promise cannot rot.
 
-The words themselves come from herdr's own `config.toml` `[ui]` — `cpu_label`,
-`ram_label`, and `battery_label` (default `cpu`/`ram`/`bat`). An explicit label
-always wins over the tier's own wording, so you can still set them to whatever
-you like. Restart the updater to pick up a change.
+### One setting for both the header and these rows
+
+On a patched build the sidebar has a **whole-machine system-usage header** as
+well as these per-space rows, and the header is herdr's own — it renders from
+`cpu_label` / `ram_label` in herdr's `config.toml`. Setting only the plugin's
+`icons` changes the rows and leaves the header spelling `cpu` in words directly
+above a row of glyphs.
+
+Those two keys are the single point that changes both, because this plugin
+honours them too — and **an explicit label replaces the tier's glyph rather than
+stacking with it**, so you never get the icon drawn twice:
+
+```toml
+# in herdr's own config.toml
+[ui]
+cpu_label = ""
+ram_label = ""
+battery_label = ""     # plugin-only; the header has no battery
+```
+
+`space-usage --icons` prints exactly this block for whichever tier you are
+previewing, so you can copy it straight across. Pair it with `icons = "text"` in
+the plugin config — with the labels doing the naming, the tier has nothing left
+to add.
+
+Defaults are `cpu` / `ram` / `bat` when herdr names nothing. Restart the updater
+to pick up a change.
 
 ## How it works
 

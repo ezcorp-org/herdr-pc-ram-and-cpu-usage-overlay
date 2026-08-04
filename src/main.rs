@@ -147,19 +147,46 @@ fn print_icon_preview(config: &config::Config, labels: &config::Labels) {
     );
     for (name, set) in ICON_TIERS {
         let row = render::metric_row(
-            set.cpu(&labels.cpu, SAMPLE_CPU),
-            set.ram(&labels.ram, SAMPLE_RAM),
-            Some(set.battery(&labels.battery, SAMPLE_BATTERY)),
+            set.cpu(labels.cpu(), SAMPLE_CPU),
+            set.ram(labels.ram(), SAMPLE_RAM),
+            Some(set.battery(labels.battery(), SAMPLE_BATTERY)),
         );
         let marker = if set == current { "   <- current" } else { "" };
         println!("    {name:<10}{row}{marker}");
     }
     println!(
         "\n  text and unicode need no font installed. nerdfont needs a Nerd Font\n  \
-         and emoji needs a colour emoji font — if either row above came out as\n  \
-         boxes or blanks, that tier is not available here.\n\n  \
+         and emoji needs a colour emoji font — if a row above came out as boxes\n  \
+         or blanks, that tier is not available here.\n\n  \
          Choose one with `icons = \"<tier>\"` in the plugin's config.toml. The\n  \
-         default, `auto`, picks unicode on a UTF-8 locale and text otherwise.\n"
+         default, `auto`, uses a Nerd Font when it finds one installed and plain\n  \
+         text otherwise.\n"
+    );
+    print_one_setting_hint(current);
+}
+
+/// Explain — and print — the single edit that keeps herdr's own sidebar header
+/// in step with these rows.
+///
+/// Worth the extra paragraph because the failure it prevents is invisible until
+/// you look at the sidebar: on a patched build the whole-machine system-usage
+/// header renders from herdr's `cpu_label` / `ram_label`, so setting only the
+/// plugin's `icons` leaves that header spelling `cpu` in words directly above a
+/// row of glyphs. Those two keys are the one place that changes both.
+fn print_one_setting_hint(current: icons::IconSet) {
+    let snippet = icons::herdr_ui_snippet(current);
+    let indented: String = snippet
+        .lines()
+        .map(|line| format!("      {line}\n"))
+        .collect();
+    println!(
+        "  One setting for both: herdr's own sidebar system-usage header reads\n  \
+         `cpu_label` / `ram_label` from ITS config, and this plugin honours the\n  \
+         same keys — an explicit label replaces the tier's glyph rather than\n  \
+         stacking with it. Set them once and the header and these rows agree.\n\n  \
+         For the tier above, put this in herdr's config.toml\n  \
+         (alongside `icons = \"text\"` here, since the labels now do the naming):\n\n\
+         {indented}"
     );
 }
 

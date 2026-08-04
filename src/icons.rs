@@ -34,7 +34,7 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 use crate::battery::{Battery, State};
-use crate::config::non_empty_env;
+use crate::config::{non_empty_env, DEFAULT_BATTERY_LABEL, DEFAULT_CPU_LABEL, DEFAULT_RAM_LABEL};
 
 /// Which glyph vocabulary to render metrics with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,9 +139,9 @@ impl Metric {
     /// [`IconSet::render`].
     fn default_word(self) -> &'static str {
         match self {
-            Metric::Cpu => "cpu",
-            Metric::Ram => "ram",
-            Metric::Battery => "bat",
+            Metric::Cpu => DEFAULT_CPU_LABEL,
+            Metric::Ram => DEFAULT_RAM_LABEL,
+            Metric::Battery => DEFAULT_BATTERY_LABEL,
         }
     }
 
@@ -168,18 +168,18 @@ impl Metric {
 
 impl IconSet {
     /// Render CPU load — `cpu ░26%` in the [`IconSet::Unicode`] tier.
-    pub fn cpu(self, label: &str, percent: f64) -> String {
+    pub fn cpu(self, label: Option<&str>, percent: f64) -> String {
         self.render(Metric::Cpu, label, percent, None)
     }
 
     /// Render RAM use — `ram ░8%` in the [`IconSet::Unicode`] tier.
-    pub fn ram(self, label: &str, percent: f64) -> String {
+    pub fn ram(self, label: Option<&str>, percent: f64) -> String {
         self.render(Metric::Ram, label, percent, None)
     }
 
     /// Render a battery reading — `bat ▓74%+` for 74% and charging in the
     /// [`IconSet::Unicode`] tier.
-    pub fn battery(self, label: &str, reading: Battery) -> String {
+    pub fn battery(self, label: Option<&str>, reading: Battery) -> String {
         self.render(
             Metric::Battery,
             label,
@@ -188,42 +188,75 @@ impl IconSet {
         )
     }
 
+    /// This tier's naming as herdr `[ui]` label values: `(cpu, ram, battery)`.
+    ///
+    /// Exists so [`herdr_ui_snippet`] can hand the user a block that pins the
+    /// same naming into herdr's own config. That matters on a patched build,
+    /// where the sidebar's system-usage header renders from `cpu_label` /
+    /// `ram_label` and would otherwise keep saying `cpu`/`ram` in words while
+    /// these rows switched to icons — the drift this whole mechanism exists to
+    /// prevent.
+    ///
+    /// The battery ramp needs a percentage to pick a glyph, and a static config
+    /// value cannot ramp, so the full-battery glyph stands in for the family.
+    fn label_values(self) -> (String, String, String) {
+        let of = |metric: Metric| match self {
+            IconSet::Text | IconSet::Unicode => metric.default_word().to_string(),
+            IconSet::NerdFont => metric.nerd_glyph(100.0).to_string(),
+            IconSet::Emoji => metric.emoji().to_string(),
+        };
+        (of(Metric::Cpu), of(Metric::Ram), of(Metric::Battery))
+    }
+
     /// `[word ][glyph]<n>%[mark]` — the one assembly every tier and metric goes
     /// through, so the tiers cannot drift apart in spacing or ordering.
-    fn render(self, metric: Metric, label: &str, percent: f64, mark: Option<char>) -> String {
-        // The glyph tiers put a picture where the word would go, so they print a
-        // word only when the user actually chose one (herdr `[ui]` beats the
-        // tier — the config escape hatch has to keep working at every setting).
-        // Text and Unicode always carry it: there, the word is the only thing
-        // naming the number.
-        let names_metric = self.spells_out_the_word() || label != metric.default_word();
-        let word = if names_metric && !label.is_empty() {
-            format!("{label} ")
-        } else {
-            String::new() // an empty label must not leave a stray leading space
-        };
+    fn render(
+        self,
+        metric: Metric,
+        label: Option<&str>,
+        percent: f64,
+        mark: Option<char>,
+    ) -> String {
+        let mark = mark.map(String::from).unwrap_or_default();
+        let number = format!("{}%{mark}", round_percent(percent));
 
-        let glyph = match self {
-            IconSet::Text => String::new(),
-            // The gauge runs straight into the number it is measuring.
-            IconSet::Unicode => ramp_pick(&GAUGE_RAMP, percent).to_string(),
+        // An explicit herdr `[ui]` label REPLACES the tier's naming — it does not
+        // stack on top of it.
+        //
+        // This is what makes those labels a genuine single source of truth. On a
+        // patched build the sidebar's system-usage header renders from the same
+        // two keys, so a user who sets `cpu_label` once gets the header and these
+        // rows agreeing no matter which tier is active. Prefixing the label to
+        // the tier's glyph instead would draw the icon twice for exactly the
+        // user who took the trouble to configure it.
+        //
+        // An empty label is a deliberate "name nothing": no word, no glyph, no
+        // stray leading space.
+        if let Some(label) = label {
+            return if label.is_empty() {
+                number
+            } else {
+                format!("{label} {number}")
+            };
+        }
+
+        // No explicit label, so the tier decides how the metric is named.
+        let naming = match self {
+            IconSet::Text => format!("{} ", metric.default_word()),
+            // The word still carries the meaning; the gauge runs straight into
+            // the number it measures.
+            IconSet::Unicode => format!(
+                "{} {}",
+                metric.default_word(),
+                ramp_pick(&GAUGE_RAMP, percent)
+            ),
             // Nerd Font glyphs are drawn edge-to-edge in their cell; without the
             // space the digits touch them.
             IconSet::NerdFont => format!("{} ", metric.nerd_glyph(percent)),
             // Emoji already occupy two columns — a space on top reads as a gap.
             IconSet::Emoji => metric.emoji().to_string(),
         };
-
-        let mark = mark.map(String::from).unwrap_or_default();
-        format!("{word}{glyph}{}%{mark}", round_percent(percent))
-    }
-
-    /// Whether this tier spells the metric out in words rather than drawing it.
-    fn spells_out_the_word(self) -> bool {
-        match self {
-            IconSet::Text | IconSet::Unicode => true,
-            IconSet::NerdFont | IconSet::Emoji => false,
-        }
+        format!("{naming}{number}")
     }
 }
 
@@ -329,6 +362,27 @@ fn auto_detect(env: impl Fn(&str) -> Option<String>, has_nerd_font: impl Fn() ->
     } else {
         IconSet::Text
     }
+}
+
+// ---- one-setting config snippet -------------------------------------------------
+
+/// A paste-ready herdr `[ui]` block pinning `tier`'s naming.
+///
+/// There are two places a metric gets named on a patched build: these per-space
+/// rows, and the sidebar's whole-machine system-usage header. The header is
+/// herdr's own and reads `cpu_label` / `ram_label`, which this plugin also
+/// honours — so those keys, not the plugin's `icons`, are the single point that
+/// changes both at once. `icons` alone would leave the header saying `cpu` in
+/// words under a row of glyphs.
+///
+/// Emitting the block rather than describing it keeps the two in step without
+/// the user reverse-engineering which codepoints a tier uses. Pairing it with
+/// `icons = "text"` is deliberate: with an explicit label present the tier adds
+/// no glyph of its own (see [`IconSet::render`]), so `text` is simply the
+/// honest way to say "the labels are doing the naming now".
+pub fn herdr_ui_snippet(tier: IconSet) -> String {
+    let (cpu, ram, battery) = tier.label_values();
+    format!("[ui]\ncpu_label = \"{cpu}\"\nram_label = \"{ram}\"\nbattery_label = \"{battery}\"")
 }
 
 // ---- Nerd Font probe ------------------------------------------------------------
@@ -639,54 +693,54 @@ mod tests {
 
     #[test]
     fn text_tier_is_words_and_numbers_only() {
-        assert_eq!(IconSet::Text.cpu("cpu", 26.0), "cpu 26%");
-        assert_eq!(IconSet::Text.ram("ram", 8.0), "ram 8%");
+        assert_eq!(IconSet::Text.cpu(None, 26.0), "cpu 26%");
+        assert_eq!(IconSet::Text.ram(None, 8.0), "ram 8%");
         assert_eq!(
-            IconSet::Text.battery("bat", bat(74.0, State::Discharging)),
+            IconSet::Text.battery(None, bat(74.0, State::Discharging)),
             "bat 74%",
         );
     }
 
     #[test]
     fn unicode_tier_keeps_the_word_and_adds_a_gauge() {
-        assert_eq!(IconSet::Unicode.cpu("cpu", 26.0), "cpu ░26%");
-        assert_eq!(IconSet::Unicode.ram("ram", 8.0), "ram ░8%");
+        assert_eq!(IconSet::Unicode.cpu(None, 26.0), "cpu ░26%");
+        assert_eq!(IconSet::Unicode.ram(None, 8.0), "ram ░8%");
         assert_eq!(
-            IconSet::Unicode.battery("bat", bat(74.0, State::Discharging)),
+            IconSet::Unicode.battery(None, bat(74.0, State::Discharging)),
             "bat ▓74%",
         );
     }
 
     #[test]
     fn nerdfont_tier_replaces_the_word_with_a_glyph() {
-        assert_eq!(IconSet::NerdFont.cpu("cpu", 26.0), "\u{f4bc} 26%");
-        assert_eq!(IconSet::NerdFont.ram("ram", 8.0), "\u{efc5} 8%");
+        assert_eq!(IconSet::NerdFont.cpu(None, 26.0), "\u{f4bc} 26%");
+        assert_eq!(IconSet::NerdFont.ram(None, 8.0), "\u{efc5} 8%");
         assert_eq!(
-            IconSet::NerdFont.battery("bat", bat(74.0, State::Discharging)),
+            IconSet::NerdFont.battery(None, bat(74.0, State::Discharging)),
             "\u{f241} 74%",
         );
     }
 
     #[test]
     fn emoji_tier_sits_flush_against_the_number() {
-        assert_eq!(IconSet::Emoji.cpu("cpu", 26.0), "💻26%");
-        assert_eq!(IconSet::Emoji.ram("ram", 8.0), "🧠8%");
+        assert_eq!(IconSet::Emoji.cpu(None, 26.0), "💻26%");
+        assert_eq!(IconSet::Emoji.ram(None, 8.0), "🧠8%");
         assert_eq!(
-            IconSet::Emoji.battery("bat", bat(74.0, State::Discharging)),
+            IconSet::Emoji.battery(None, bat(74.0, State::Discharging)),
             "🔋74%",
         );
     }
 
     #[test]
     fn percentages_round_to_whole_and_survive_impossible_readings() {
-        assert_eq!(IconSet::Text.cpu("cpu", 25.4), "cpu 25%");
-        assert_eq!(IconSet::Text.cpu("cpu", 25.5), "cpu 26%");
+        assert_eq!(IconSet::Text.cpu(None, 25.4), "cpu 25%");
+        assert_eq!(IconSet::Text.cpu(None, 25.5), "cpu 26%");
         // Out of range is reported honestly rather than clamped — a CPU sum can
         // legitimately land past 100 — and must never panic.
-        assert_eq!(IconSet::Text.cpu("cpu", -3.0), "cpu -3%");
-        assert_eq!(IconSet::Unicode.cpu("cpu", 150.0), "cpu █150%");
-        assert_eq!(IconSet::Text.cpu("cpu", f64::NAN), "cpu 0%");
-        assert_eq!(IconSet::Text.cpu("cpu", 1e30), "cpu 9223372036854775807%");
+        assert_eq!(IconSet::Text.cpu(None, -3.0), "cpu -3%");
+        assert_eq!(IconSet::Unicode.cpu(None, 150.0), "cpu █150%");
+        assert_eq!(IconSet::Text.cpu(None, f64::NAN), "cpu 0%");
+        assert_eq!(IconSet::Text.cpu(None, 1e30), "cpu 9223372036854775807%");
     }
 
     // ---- charge state ----------------------------------------------------------
@@ -703,7 +757,7 @@ mod tests {
         ];
         for set in ALL_TIERS {
             for (state, mark) in expected {
-                let line = set.battery("bat", bat(74.0, state));
+                let line = set.battery(None, bat(74.0, state));
                 assert!(
                     line.ends_with(&format!("74%{mark}")),
                     "{set:?} / {state:?}: {line}",
@@ -712,11 +766,11 @@ mod tests {
         }
         // Spelled out once, so the shape of the whole line is pinned too.
         assert_eq!(
-            IconSet::Unicode.battery("bat", bat(74.0, State::Charging)),
+            IconSet::Unicode.battery(None, bat(74.0, State::Charging)),
             "bat ▓74%+",
         );
         assert_eq!(
-            IconSet::Unicode.battery("bat", bat(100.0, State::Full)),
+            IconSet::Unicode.battery(None, bat(100.0, State::Full)),
             "bat █100%=",
         );
     }
@@ -724,38 +778,93 @@ mod tests {
     // ---- herdr label overrides --------------------------------------------------
 
     #[test]
-    fn a_custom_herdr_label_wins_in_every_tier() {
-        // The `[ui]` label is the documented escape hatch, so it outranks even a
-        // glyph tier's picture — the glyph stays, the user's word leads.
+    fn a_custom_herdr_label_replaces_the_tier_glyph_in_every_tier() {
+        // An explicit `[ui]` label REPLACES the tier's naming rather than
+        // stacking on top of it. This is the property that makes herdr's
+        // `cpu_label` / `ram_label` a single source of truth: the patched
+        // sidebar's system-usage header renders from those same keys, so setting
+        // them once has to make the header and these rows agree whatever tier is
+        // active. Stacking would draw the icon twice for precisely the user who
+        // bothered to configure it.
         for set in ALL_TIERS {
-            let cpu = set.cpu("CPU", 26.0);
-            let ram = set.ram("MEM", 8.0);
-            let battery = set.battery("PWR", bat(74.0, State::Discharging));
-            assert!(cpu.starts_with("CPU "), "{set:?}: {cpu}");
-            assert!(ram.starts_with("MEM "), "{set:?}: {ram}");
-            assert!(battery.starts_with("PWR "), "{set:?}: {battery}");
-            // The word is added, not swapped in: the tier still contributes.
-            assert!(cpu.ends_with("26%"), "{set:?}: {cpu}");
+            assert_eq!(set.cpu(Some("CPU"), 26.0), "CPU 26%", "{set:?}");
+            assert_eq!(set.ram(Some("MEM"), 8.0), "MEM 8%", "{set:?}");
+            assert_eq!(
+                set.battery(Some("PWR"), bat(74.0, State::Discharging)),
+                "PWR 74%",
+                "{set:?}",
+            );
         }
-        assert_eq!(IconSet::Text.cpu("CPU", 26.0), "CPU 26%");
-        assert_eq!(IconSet::Unicode.cpu("CPU", 26.0), "CPU ░26%");
-        assert_eq!(IconSet::NerdFont.cpu("CPU", 26.0), "CPU \u{f4bc} 26%");
-        assert_eq!(IconSet::Emoji.cpu("CPU", 26.0), "CPU 💻26%");
+    }
+
+    #[test]
+    fn a_label_set_to_a_tier_glyph_is_not_doubled() {
+        // The concrete regression: someone follows `herdr_ui_snippet`, pins the
+        // Nerd Font CPU glyph into herdr's `[ui]`, and leaves the tier on
+        // nerdfont. Exactly one glyph must come out.
+        let rendered = IconSet::NerdFont.cpu(Some(&NERD_CPU.to_string()), 26.0);
+        assert_eq!(rendered.matches(NERD_CPU).count(), 1, "{rendered}");
+        assert_eq!(rendered, format!("{NERD_CPU} 26%"));
+    }
+
+    #[test]
+    fn an_empty_label_names_nothing_and_leaves_no_stray_space() {
+        // `cpu_label = ""` is a deliberate "just the number" — no word, no
+        // glyph, and critically no leading space that would misalign the row.
+        for set in ALL_TIERS {
+            let rendered = set.cpu(Some(""), 26.0);
+            assert_eq!(rendered, "26%", "{set:?}");
+        }
+    }
+
+    #[test]
+    fn the_snippet_round_trips_through_the_renderer_without_doubling() {
+        // End to end on the "one setting" promise: whatever `herdr_ui_snippet`
+        // tells the user to paste must render as exactly that naming, once, in
+        // every tier — including the tier it was generated from.
+        for source in ALL_TIERS {
+            let (cpu_label, ram_label, battery_label) = source.label_values();
+            for target in ALL_TIERS {
+                let cpu = target.cpu(Some(&cpu_label), 26.0);
+                assert_eq!(cpu, format!("{cpu_label} 26%"), "{source:?} -> {target:?}");
+                assert_eq!(target.ram(Some(&ram_label), 8.0), format!("{ram_label} 8%"));
+                assert_eq!(
+                    target.battery(Some(&battery_label), bat(74.0, State::Discharging)),
+                    format!("{battery_label} 74%"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_snippet_is_valid_toml_naming_all_three_keys() {
+        for set in ALL_TIERS {
+            let snippet = herdr_ui_snippet(set);
+            assert!(snippet.starts_with("[ui]\n"), "{set:?}: {snippet}");
+            for key in ["cpu_label", "ram_label", "battery_label"] {
+                assert!(snippet.contains(&format!("{key} = \"")), "{set:?}: {key}");
+            }
+            // One line per key plus the table header — nothing stray.
+            assert_eq!(snippet.lines().count(), 4, "{set:?}: {snippet}");
+        }
+        // The text tier reproduces the documented defaults exactly.
+        assert!(herdr_ui_snippet(IconSet::Text).contains("cpu_label = \"cpu\""));
+        assert!(herdr_ui_snippet(IconSet::Text).contains("battery_label = \"bat\""));
     }
 
     #[test]
     fn the_default_word_is_not_repeated_by_the_glyph_tiers() {
         // Handed herdr's own default, a glyph tier shows only the picture — the
         // word would be redundant with it.
-        assert_eq!(IconSet::Emoji.cpu("cpu", 26.0), "💻26%");
-        assert_eq!(IconSet::NerdFont.ram("ram", 8.0), "\u{efc5} 8%");
+        assert_eq!(IconSet::Emoji.cpu(None, 26.0), "💻26%");
+        assert_eq!(IconSet::NerdFont.ram(None, 8.0), "\u{efc5} 8%");
         assert_eq!(
-            IconSet::Emoji.battery("bat", bat(74.0, State::Discharging)),
+            IconSet::Emoji.battery(None, bat(74.0, State::Discharging)),
             "🔋74%",
         );
         // An empty label never leaves a stray leading space in any tier.
         for set in ALL_TIERS {
-            let line = set.cpu("", 26.0);
+            let line = set.cpu(Some(""), 26.0);
             assert!(!line.starts_with(' '), "{set:?}: {line:?}");
         }
     }
@@ -773,12 +882,14 @@ mod tests {
         let sweep = (0..=100).map(f64::from).chain(impossible);
         let mut out = Vec::new();
         for percent in sweep {
-            // Labels are herdr's defaults: a word the *user* supplies is their
-            // own business, and is the one thing a tier does not control.
-            out.push(set.cpu(Metric::Cpu.default_word(), percent));
-            out.push(set.ram(Metric::Ram.default_word(), percent));
+            // No herdr label, so the TIER does the naming — which is exactly
+            // what this sweep exists to inspect. A user-supplied label replaces
+            // the tier's glyph, so passing one would test their font choice
+            // rather than ours.
+            out.push(set.cpu(None, percent));
+            out.push(set.ram(None, percent));
             for state in ALL_STATES {
-                out.push(set.battery(Metric::Battery.default_word(), bat(percent, state)));
+                out.push(set.battery(None, bat(percent, state)));
             }
         }
         out

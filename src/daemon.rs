@@ -635,11 +635,7 @@ mod tests {
 
     #[test]
     fn status_line_uses_labels_and_rounds_cpu() {
-        let labels = Labels {
-            cpu: "CPU".to_string(),
-            ram: "MEM".to_string(),
-            battery: "PWR".to_string(),
-        };
+        let labels = Labels::new(Some("CPU"), Some("MEM"), Some("PWR"));
         // The RAM cell depends on the host's MemTotal (percent when readable,
         // compact absolute when not), so assert the CPU rounding + label layout,
         // which are total-independent. `render::ram_cell_of` pins both branches.

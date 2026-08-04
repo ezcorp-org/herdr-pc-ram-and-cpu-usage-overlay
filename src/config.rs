@@ -78,22 +78,65 @@ impl Config {
     }
 }
 
-/// CPU / RAM / battery label tokens sourced from herdr's `[ui]` config
-/// (default cpu/ram/bat).
-#[derive(Debug, Clone)]
+/// Default naming for each metric when herdr's `[ui]` config sets none.
+pub const DEFAULT_CPU_LABEL: &str = "cpu";
+pub const DEFAULT_RAM_LABEL: &str = "ram";
+pub const DEFAULT_BATTERY_LABEL: &str = "bat";
+
+/// CPU / RAM / battery label tokens sourced from herdr's `[ui]` config.
+///
+/// Each is `None` until herdr's config actually names it. That distinction is
+/// load-bearing rather than tidiness: an explicit label *replaces* an icon
+/// tier's glyph (see [`crate::icons`]), so the renderer has to know whether the
+/// user chose a word or whether it is merely looking at a default. Inferring
+/// that by comparing against the default string cannot tell `cpu_label = "cpu"`
+/// apart from an unset key — which silently made the two behave differently for
+/// no reason a user could see.
+#[derive(Debug, Clone, Default)]
 pub struct Labels {
-    pub cpu: String,
-    pub ram: String,
-    pub battery: String,
+    cpu: Option<String>,
+    ram: Option<String>,
+    battery: Option<String>,
 }
 
-impl Default for Labels {
-    fn default() -> Self {
+impl Labels {
+    /// Build a set of labels directly, bypassing herdr's config file.
+    ///
+    /// `None` means "herdr named nothing for this metric", which is what lets an
+    /// icon tier supply its own naming. Test-only: production always arrives
+    /// here through [`parse_herdr_labels`], and an unused constructor on a
+    /// public type is an invitation to construct one some other way.
+    #[cfg(test)]
+    pub fn new(cpu: Option<&str>, ram: Option<&str>, battery: Option<&str>) -> Self {
         Self {
-            cpu: "cpu".to_string(),
-            ram: "ram".to_string(),
-            battery: "bat".to_string(),
+            cpu: cpu.map(str::to_string),
+            ram: ram.map(str::to_string),
+            battery: battery.map(str::to_string),
         }
+    }
+
+    /// The label herdr's config set for this metric, or `None` when it set none.
+    /// Feed these to the icon tier, which decides how an unnamed metric is drawn.
+    pub fn cpu(&self) -> Option<&str> {
+        self.cpu.as_deref()
+    }
+
+    pub fn ram(&self) -> Option<&str> {
+        self.ram.as_deref()
+    }
+
+    pub fn battery(&self) -> Option<&str> {
+        self.battery.as_deref()
+    }
+
+    /// The word to print on surfaces that always spell one out regardless of
+    /// tier — the full-width terminal report's columns and its total line.
+    pub fn cpu_word(&self) -> &str {
+        self.cpu().unwrap_or(DEFAULT_CPU_LABEL)
+    }
+
+    pub fn ram_word(&self) -> &str {
+        self.ram().unwrap_or(DEFAULT_RAM_LABEL)
     }
 }
 
@@ -263,9 +306,9 @@ fn parse_herdr_labels(text: &str) -> Labels {
             continue;
         }
         match parse_kv_line(line) {
-            Some(("cpu_label", value)) => labels.cpu = value.to_string(),
-            Some(("ram_label", value)) => labels.ram = value.to_string(),
-            Some(("battery_label", value)) => labels.battery = value.to_string(),
+            Some(("cpu_label", value)) => labels.cpu = Some(value.to_string()),
+            Some(("ram_label", value)) => labels.ram = Some(value.to_string()),
+            Some(("battery_label", value)) => labels.battery = Some(value.to_string()),
             _ => {}
         }
     }
@@ -280,25 +323,55 @@ fn section_name(line: &str) -> Option<&str> {
     (!inner.is_empty()).then_some(inner)
 }
 
-/// Split one flat `key = value` line into `(key, unquoted_value)`.
+/// Split one flat `key = value` line into `(key, value)`, unquoted and with any
+/// inline `#` comment removed.
 ///
 /// Deliberately naive, matching the subset of TOML these config files use: the
-/// key is one or more ASCII letters/underscores,
-/// the value is everything after the FIRST `=` with surrounding whitespace
-/// trimmed (non-empty required) and at most one leading and one trailing quote
-/// (`"` or `'`) removed. Inline `#` comments are NOT stripped — by design, to
-/// keep the parser predictable.
+/// key is one or more ASCII letters/underscores, and the value is everything
+/// after the FIRST `=`, handed to [`value_of`].
 fn parse_kv_line(line: &str) -> Option<(&str, &str)> {
     let (key, value) = line.split_once('=')?;
     let key = key.trim();
     if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphabetic() || b == b'_') {
         return None;
     }
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
+    value_of(value.trim()).map(|value| (key, value))
+}
+
+/// The value of a `key = value` right-hand side.
+///
+/// **Quoted**: everything between the opening quote and the next matching one.
+/// Whatever follows is discarded, which is what makes an inline comment work.
+/// This is not cosmetic — herdr's own `config.toml` documents its keys with
+/// trailing comments, e.g.
+///
+/// ```toml
+/// cpu_label = ""   #  nf-oct-cpu
+/// ```
+///
+/// and the previous parser handed back `"   #  nf-oct-cpu` as the label, which
+/// then rendered verbatim into the sidebar. Anyone following herdr's own
+/// documented example got garbage.
+///
+/// An explicit `""` survives as an empty value rather than being rejected: for a
+/// label that is a meaningful setting — "name nothing, just show the number".
+///
+/// **Unquoted**: everything up to the first `#`, trimmed, and non-empty. One
+/// stray trailing quote is still forgiven, matching the older lenient
+/// behaviour so a half-quoted value keeps working.
+fn value_of(rest: &str) -> Option<&str> {
+    let quote = rest.chars().next()?;
+    if quote == '"' || quote == '\'' {
+        let body = &rest[quote.len_utf8()..];
+        return Some(match body.find(quote) {
+            Some(end) => &body[..end],
+            // Unterminated: fall back to lenient stripping rather than dropping
+            // a setting the user plainly meant.
+            None => strip_quotes(body),
+        });
     }
-    Some((key, strip_quotes(value)))
+    let bare = strip_quotes(rest.split('#').next().unwrap_or("").trim());
+    (!bare.is_empty()).then_some(bare)
 }
 
 /// Remove at most one leading and one trailing quote (`"` or `'`), independently
@@ -438,11 +511,27 @@ mod tests {
     // ---- herdr labels: [ui] gating + quotes ---------------------------------
 
     #[test]
-    fn labels_default_when_no_ui_section() {
+    fn labels_are_unset_when_there_is_no_ui_section() {
         let labels = parse_herdr_labels("[server]\ncpu_label = \"NOPE\"\n");
-        assert_eq!(labels.cpu, "cpu");
-        assert_eq!(labels.ram, "ram");
-        assert_eq!(labels.battery, "bat");
+        // Unset, NOT "the default string": the renderer treats a label the user
+        // actually chose differently from one it invented, so the two must not
+        // collapse into the same value here.
+        assert_eq!(labels.cpu(), None);
+        assert_eq!(labels.ram(), None);
+        assert_eq!(labels.battery(), None);
+        // Surfaces that always spell a word still get one.
+        assert_eq!(labels.cpu_word(), "cpu");
+        assert_eq!(labels.ram_word(), "ram");
+    }
+
+    #[test]
+    fn a_label_set_to_the_default_word_is_still_explicitly_set() {
+        // The distinction the old string-comparison could not make. Someone who
+        // writes `cpu_label = "cpu"` has chosen a word, and a glyph tier must
+        // honour that choice rather than treating it as "nothing configured".
+        let labels = parse_herdr_labels("[ui]\ncpu_label = \"cpu\"\n");
+        assert_eq!(labels.cpu(), Some("cpu"));
+        assert_eq!(labels.ram(), None);
     }
 
     #[test]
@@ -457,9 +546,9 @@ mod tests {
             ram_label = \"WRONG\"\n\
             battery_label = \"WRONG\"\n";
         let labels = parse_herdr_labels(text);
-        assert_eq!(labels.cpu, "C"); // from [ui], not [ui.toast]
-        assert_eq!(labels.ram, "M");
-        assert_eq!(labels.battery, "PWR");
+        assert_eq!(labels.cpu(), Some("C")); // from [ui], not [ui.toast]
+        assert_eq!(labels.ram(), Some("M"));
+        assert_eq!(labels.battery(), Some("PWR"));
     }
 
     #[test]
@@ -469,15 +558,15 @@ mod tests {
             [ui]\n\
             ram_label = \"R\"\n";
         let labels = parse_herdr_labels(text);
-        assert_eq!(labels.cpu, "cpu"); // key before any section is ignored
-        assert_eq!(labels.ram, "R");
+        assert_eq!(labels.cpu(), None); // key before any section is ignored
+        assert_eq!(labels.ram(), Some("R"));
     }
 
     #[test]
     fn labels_section_header_is_trimmed_before_matching() {
         // `[ ui ]` still counts as the ui table — the name is trimmed.
         let labels = parse_herdr_labels("[ ui ]\ncpu_label = X\n");
-        assert_eq!(labels.cpu, "X");
+        assert_eq!(labels.cpu(), Some("X"));
     }
 
     // ---- shared helpers ------------------------------------------------------
@@ -491,6 +580,33 @@ mod tests {
         assert_eq!(strip_quotes("\"foo'"), "foo"); // mismatched
         assert_eq!(strip_quotes("\""), ""); // lone quote collapses to empty
         assert_eq!(strip_quotes("bare"), "bare");
+    }
+
+    #[test]
+    fn parse_kv_line_strips_inline_comments_from_herdrs_own_config_style() {
+        // herdr's config.toml documents its keys with trailing comments. The
+        // parser used to hand the whole tail back as the value, so following
+        // herdr's own example put `"   #  nf-oct-cpu` in the sidebar.
+        assert_eq!(
+            parse_kv_line(r#"cpu_label = "X"   #  nf-oct-cpu"#),
+            Some(("cpu_label", "X")),
+        );
+        assert_eq!(
+            parse_kv_line("interval_seconds = 12  # seconds"),
+            Some(("interval_seconds", "12")),
+        );
+        assert_eq!(
+            parse_kv_line("mode = sidebar # why"),
+            Some(("mode", "sidebar"))
+        );
+        // A `#` INSIDE quotes is part of the value, not a comment.
+        assert_eq!(
+            parse_kv_line(r##"cpu_label = "#1""##),
+            Some(("cpu_label", "#1"))
+        );
+        // An explicit empty string is a real setting — "name nothing" — and must
+        // survive rather than being rejected as a missing value.
+        assert_eq!(parse_kv_line(r#"cpu_label = """#), Some(("cpu_label", "")));
     }
 
     #[test]
