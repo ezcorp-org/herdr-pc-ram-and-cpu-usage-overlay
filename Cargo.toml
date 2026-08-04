@@ -1,6 +1,6 @@
 [package]
 name = "space-usage"
-version = "1.4.1"
+version = "1.5.0"
 edition = "2021"
 description = "CPU and RAM usage per herdr space, grouped under the branch name."
 license = "MIT"
@@ -19,6 +19,7 @@ signal-hook = "0.3"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",           # SECURITY_IDENTIFICATION (pipe SQOS)
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",

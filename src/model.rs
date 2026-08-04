@@ -81,6 +81,13 @@ pub struct WorkspaceInfo {
 /// metadata-token map (`pane.report_metadata`): panes opened by other plugins
 /// stamp their identity there (e.g. herdr-sidebar's heartbeat), which is how
 /// the classifier keeps its status row off them.
+///
+/// Typed `String -> String` to match the schema exactly (`PaneInfo.tokens` is
+/// `map<string,string>`, keys `^[A-Za-z0-9_-]{1,32}$`) so a schema change lands
+/// as a parse error here rather than being silently swallowed by a `Value`.
+/// Note the map is FLAT across every reporting plugin — herdr attributes no
+/// source to it — which is what makes [`crate::collect`]'s ownership check a
+/// heuristic rather than a guarantee.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PaneInfo {
     pub pane_id: String,
@@ -91,7 +98,7 @@ pub struct PaneInfo {
     #[serde(default)]
     pub agent: Option<String>,
     #[serde(default)]
-    pub tokens: Option<std::collections::HashMap<String, serde_json::Value>>,
+    pub tokens: Option<std::collections::HashMap<String, String>>,
 }
 
 // ---- pane.process_info ------------------------------------------------------

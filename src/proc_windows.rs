@@ -20,8 +20,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_TERMINATE,
+    GetActiveProcessorCount, GetProcessTimes, OpenProcess, TerminateProcess, ALL_PROCESSOR_GROUPS,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
 /// Per-process sample: parent PID and cumulative CPU time in [`clk_tck`] units
@@ -40,11 +40,21 @@ pub fn clk_tck() -> u64 {
 
 /// Number of logical CPUs; normalizes CPU% to a share of the whole machine.
 /// At least 1.
+///
+/// `GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)`, NOT
+/// `available_parallelism()`. The metric is a share of the WHOLE MACHINE, to
+/// match the Linux twin's `_SC_NPROCESSORS_ONLN`. On Windows
+/// `available_parallelism` is `GetSystemInfo().dwNumberOfProcessors`, which is
+/// documented as the count for the CALLER'S PROCESSOR GROUP — so on a box with
+/// more than 64 logical CPUs it saturates at 64, halving the divisor and
+/// doubling every reported CPU%. (It is not affinity-aware either; std's own
+/// docs note it can overcount under a process affinity mask or job object
+/// limit. Neither function honours affinity, which is what keeps this in step
+/// with `_SC_NPROCESSORS_ONLN`.)
 pub fn nproc() -> u64 {
-    std::thread::available_parallelism()
-        .map(|n| n.get() as u64)
-        .unwrap_or(1)
-        .max(1)
+    // SAFETY: a pure query of a static system value.
+    let n = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+    (n as u64).max(1)
 }
 
 /// An open process handle that closes itself on drop; `None` when the process
@@ -249,6 +259,35 @@ pub fn rss_mb(pids: &HashSet<u32>) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
+/// Shared by the two platform twins' `stop_process` tests: stop `child` and
+/// require it to actually be gone soon after.
+///
+/// Polls rather than blocking in `wait`, so a `stop_process` that does nothing
+/// fails the test in seconds instead of hanging until the CI job times out, and
+/// the child is always reaped either way. Says nothing about the exit status —
+/// the platforms disagree there (unix reports the signal, Windows reports the
+/// exit code TerminateProcess was given).
+#[cfg(test)]
+pub(crate) fn assert_stopped_promptly(mut child: std::process::Child) {
+    use std::time::{Duration, Instant};
+
+    stop_process(child.id());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        if child.try_wait().expect("try_wait on child").is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !exited {
+        let _ = child.kill(); // never leave a 5-minute process behind
+        let _ = child.wait();
+    }
+    assert!(exited, "stop_process did not terminate the child");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,11 +337,40 @@ mod tests {
     #[test]
     fn scan_includes_our_own_process_with_cpu_ticks() {
         let procs = scan_proc();
-        let me = procs
-            .get(&std::process::id())
-            .expect("our own pid is in the snapshot");
-        // Our own process is always openable, so its CPU counter is real.
-        assert!(me.jiffies > 0, "own cumulative CPU ticks read as zero");
+        assert!(
+            procs.contains_key(&std::process::id()),
+            "our own pid is in the snapshot"
+        );
+
+        // Our own process is always openable, so the counter is readable. It is
+        // NOT asserted non-zero straight away: `GetProcessTimes` is only charged
+        // on ~15.6 ms scheduler ticks, so a young test binary can legitimately
+        // still read zero. Burn CPU until the kernel charges us, with a deadline
+        // so a genuinely broken probe fails instead of hanging.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut ticks = 0;
+        while ticks == 0 && std::time::Instant::now() < deadline {
+            ticks = cpu_ticks(std::process::id()).expect("own cpu ticks are readable");
+            std::hint::black_box((0..200_000u64).sum::<u64>());
+        }
+        assert!(ticks > 0, "own cumulative CPU ticks never left zero");
+    }
+
+    #[test]
+    fn stop_process_terminates_a_child() {
+        // A child we own that does nothing but wait, so the only thing that can
+        // end it is our TerminateProcess. `ping` ships with every Windows SKU
+        // and paces one echo per second.
+        let child = std::process::Command::new("ping")
+            .args(["-n", "300", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ping");
+        // Asserted by "did it die", NOT by exit status: `stop_process` calls
+        // TerminateProcess with exit code 0, so a killed process is
+        // indistinguishable from a clean one by `ExitStatus::success` — unlike
+        // unix, where a SIGTERMed child reports the signal.
+        assert_stopped_promptly(child);
     }
 
     #[test]
@@ -315,6 +383,23 @@ mod tests {
     #[test]
     fn machine_ram_total_is_positive() {
         assert!(mem_total_mb() > 0.0);
+    }
+
+    #[test]
+    fn nproc_counts_the_whole_machine() {
+        let n = nproc();
+        assert!(n >= 1, "nproc must never report zero");
+        // Every processor group can only be >= the caller's single group, which
+        // is the answer `available_parallelism` gives and this function
+        // deliberately does NOT use. Equal on any box with <= 64 logical CPUs;
+        // strictly greater is exactly the case that used to double CPU%.
+        let one_group = std::thread::available_parallelism()
+            .map(|n| n.get() as u64)
+            .unwrap_or(1);
+        assert!(
+            n >= one_group,
+            "all-groups count {n} is below the single-group {one_group}"
+        );
     }
 
     #[test]

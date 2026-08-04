@@ -55,16 +55,52 @@ fn open_stream(path: &Path) -> io::Result<Stream> {
 
 /// Connect the platform stream to the herdr socket at `path`.
 ///
-/// No read/write timeouts: a pipe opened as `File` has no such knobs. herdr
-/// answers in milliseconds; a wedged host is the only hang, as on unix when the
-/// timeout fires late.
+/// `SECURITY_IDENTIFICATION` is not optional. A named pipe lives in a global
+/// namespace that any local account may create names in, and our name is
+/// guessable (it embeds `%APPDATA%`, which contains the user name). Without an
+/// explicit SQOS level Windows hands the pipe SERVER `SecurityImpersonation`,
+/// so a local attacker who squats the name before herdr binds it can call
+/// `ImpersonateNamedPipeClient` and act as whoever runs this plugin.
+/// `SecurityIdentification` lets the server learn who we are but never act as
+/// us, which is all herdr needs to serve JSON-RPC. std ORs in
+/// `SECURITY_SQOS_PRESENT` for us, and without that flag the level is ignored.
+///
+/// No read/write timeouts: a pipe opened as `File` has no such knobs. That is
+/// the one thing unix gets for free here, so the daemon carries a watchdog
+/// instead — see [`crate::daemon::run_daemon`].
 #[cfg(windows)]
 fn open_stream(path: &Path) -> io::Result<Stream> {
-    let pipe = format!(r"\\.\pipe\{}", path.display());
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(pipe)
+        .security_qos_flags(SECURITY_IDENTIFICATION)
+        .open(pipe_name(path))
+}
+
+/// herdr's socket path folded into a named-pipe name. interprocess' namespaced
+/// naming puts the WHOLE path after the prefix, drive letter and separators
+/// included, so this is a plain concatenation and not a basename.
+#[cfg(windows)]
+fn pipe_name(path: &Path) -> String {
+    format!(r"\\.\pipe\{}", path.display())
+}
+
+/// What we actually open, named for error messages.
+///
+/// Worth the indirection: on Windows the connection is to a pipe, not to the
+/// file the path spells. Reporting the raw path there sends a user hunting for
+/// a `herdr.sock` file that neither exists nor should — and since the pipe-name
+/// construction is the one part of the Windows transport no automated test can
+/// exercise (CI has no herdr to talk to), its failure has to name the thing it
+/// actually tried.
+fn endpoint(path: &Path) -> String {
+    #[cfg(windows)]
+    return pipe_name(path);
+    #[cfg(unix)]
+    path.display().to_string()
 }
 
 use crate::model::{
@@ -99,7 +135,7 @@ impl Herdr {
     /// Connect to `path` and wire up the read/write halves.
     fn open(path: PathBuf) -> crate::Result<Herdr> {
         let stream = open_stream(&path)
-            .map_err(|e| format!("cannot connect to herdr socket {}: {e}", path.display()))?;
+            .map_err(|e| format!("cannot connect to herdr at {}: {e}", endpoint(&path)))?;
         let reader = BufReader::new(stream.try_clone()?);
         Ok(Herdr {
             stream,
@@ -111,12 +147,8 @@ impl Herdr {
 
     /// Re-open the socket after a broken pipe, replacing both halves.
     fn reconnect(&mut self) -> crate::Result<()> {
-        let stream = open_stream(&self.path).map_err(|e| {
-            format!(
-                "cannot reconnect to herdr socket {}: {e}",
-                self.path.display()
-            )
-        })?;
+        let stream = open_stream(&self.path)
+            .map_err(|e| format!("cannot reconnect to herdr at {}: {e}", endpoint(&self.path)))?;
         self.reader = BufReader::new(stream.try_clone()?);
         self.stream = stream;
         Ok(())
@@ -508,5 +540,27 @@ mod tests {
             socket_path_from(None, config_home),
             PathBuf::from("/home/u/.config/herdr/herdr.sock"),
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_name_folds_the_whole_path_after_the_prefix() {
+        // Pins the one piece of the Windows transport nothing else can check:
+        // CI has no herdr to connect to, so a silent change to this format
+        // would only ever surface as "cannot connect" on a user's machine.
+        // interprocess' namespaced naming keeps the drive letter and every
+        // separator — it is NOT the basename.
+        assert_eq!(
+            pipe_name(Path::new(r"C:\Users\u\AppData\Roaming\herdr\herdr.sock")),
+            r"\\.\pipe\C:\Users\u\AppData\Roaming\herdr\herdr.sock",
+        );
+        // The error path must name the pipe, not the file that never exists.
+        assert!(endpoint(Path::new(r"C:\x\herdr.sock")).starts_with(r"\\.\pipe\"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_is_the_plain_socket_path() {
+        assert_eq!(endpoint(Path::new("/run/herdr.sock")), "/run/herdr.sock");
     }
 }
