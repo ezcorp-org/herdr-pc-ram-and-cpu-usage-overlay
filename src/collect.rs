@@ -40,7 +40,10 @@ struct PaneRoles {
 /// The first pane with a non-empty cwd wins the branch lookup. `cwd` is optional
 /// in herdr's payload and can be briefly absent while a pane is still starting,
 /// so a later pane is allowed to supply it. Bucketing: our pseudo-agent first,
-/// then any other non-empty agent, else a plain shell pane.
+/// then any other non-empty agent, else a plain shell pane — EXCEPT panes owned
+/// by another plugin ([`is_plugin_pane`]), which are never status hosts. They
+/// still count toward the space's usage: measurement runs off `roots`, which
+/// covers every pane regardless of these buckets.
 fn classify_panes(panes: &[&PaneInfo]) -> PaneRoles {
     let mut roles = PaneRoles::default();
     for pane in panes {
@@ -52,10 +55,24 @@ fn classify_panes(panes: &[&PaneInfo]) -> PaneRoles {
         match pane.agent.as_deref() {
             Some(PSEUDO_AGENT) => roles.pseudo_panes.push(pane.pane_id.clone()),
             Some(agent) if !agent.is_empty() => roles.agent_panes.push(pane.pane_id.clone()),
+            _ if is_plugin_pane(pane) => {} // measured via roots, never a status host
             _ => roles.spare_panes.push(pane.pane_id.clone()),
         }
     }
     roles
+}
+
+/// Whether an agent-less pane belongs to another plugin: it carries metadata
+/// tokens other than our own `usage` token. Plugin panes (herdr-sidebar's
+/// explorer/git pane, llmtrim's dashboards, ..) stamp identity/heartbeat tokens
+/// on themselves; claiming our pseudo-agent there put a second "agent" row in
+/// the panel and pinned the usage text to the wrong pane. Our own fall-through
+/// `usage` token must NOT trip this, or a pane we reported once would stop
+/// being a spare pane on the next cycle.
+fn is_plugin_pane(pane: &PaneInfo) -> bool {
+    pane.tokens
+        .as_ref()
+        .is_some_and(|tokens| tokens.keys().any(|key| key != PSEUDO_AGENT))
 }
 
 /// Bucket a snapshot's flat pane list under each pane's `workspace_id`, keeping
@@ -317,7 +334,19 @@ mod tests {
             workspace_id: workspace_id.to_string(),
             cwd: cwd.map(str::to_string),
             agent: agent.map(str::to_string),
+            tokens: None,
         }
+    }
+
+    /// A [`PaneInfo`] carrying metadata tokens with the given keys.
+    fn pane_with_tokens(pane_id: &str, keys: &[&str]) -> PaneInfo {
+        let mut p = pane(pane_id, "w1", None, None);
+        p.tokens = Some(
+            keys.iter()
+                .map(|k| (k.to_string(), serde_json::Value::from("x")))
+                .collect(),
+        );
+        p
     }
 
     // ---- pane bucketing + classification ------------------------------------
@@ -371,6 +400,43 @@ mod tests {
     #[test]
     fn classify_of_no_panes_is_all_empty() {
         assert_eq!(classify_panes(&[]), PaneRoles::default());
+    }
+
+    #[test]
+    fn classify_never_offers_another_plugins_pane_as_spare() {
+        // The herdr-sidebar pane: no agent, but identity/heartbeat tokens. It
+        // must not become the pseudo-agent host — that is the pane-grab that
+        // put a second "agent" row in the panel.
+        let panes = [
+            pane_with_tokens("sidebar", &["herdr-sidebar-explorer", "herdr-sidebar-git"]),
+            pane("shell", "w1", None, None),
+        ];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+        let roles = classify_panes(&refs);
+
+        assert_eq!(roles.spare_panes, ["shell"]);
+        assert!(roles.pseudo_panes.is_empty());
+        assert!(roles.agent_panes.is_empty());
+    }
+
+    #[test]
+    fn classify_keeps_a_pane_carrying_only_our_usage_token_as_spare() {
+        // The metadata fall-through pushes the `usage` token onto a spare pane
+        // WITHOUT claiming an agent; on the next cycle that pane must still be
+        // a spare pane, or the status would hop panes forever.
+        let panes = [pane_with_tokens("shell", &[PSEUDO_AGENT])];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+        assert_eq!(classify_panes(&refs).spare_panes, ["shell"]);
+    }
+
+    #[test]
+    fn classify_prefers_the_real_agent_bucket_over_plugin_detection() {
+        // An agent pane with plugin badges (e.g. llmtrim tokens on a claude
+        // pane) stays an agent pane — the token check only gates spares.
+        let mut p = pane_with_tokens("claude", &["llmtrim"]);
+        p.agent = Some("claude".to_string());
+        let refs: Vec<&PaneInfo> = [&p].to_vec();
+        assert_eq!(classify_panes(&refs).agent_panes, ["claude"]);
     }
 
     /// Build a measured [`Space`] with just the aggregate-relevant fields set.
