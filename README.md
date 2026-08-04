@@ -22,7 +22,9 @@ a glance which space is eating your machine.
 - All-space totals in your terminal's window title: `spaces · cpu 39% · ram 8%`
 - A live dashboard pane and one-shot report/JSON actions
 - A small static Rust binary (~2–5 MB resident) that talks to herdr over its
-  unix socket — no per-sample subprocess spawns, no Node runtime
+  unix socket (a named pipe on Windows) — no per-sample subprocess spawns, no
+  Node runtime
+- Runs on **Linux and Windows** (herdr Windows beta)
 
 ## Install
 
@@ -30,10 +32,17 @@ a glance which space is eating your machine.
 herdr plugin install ezcorp-org/herdr-pc-ram-and-cpu-usage-overlay
 ```
 
-Requirements: Linux (reads `/proc`) and the **Rust toolchain** (`cargo`) on the
-box hosting the herdr server — herdr compiles the plugin at install time via
+Requirements: Linux or Windows, and the **Rust toolchain** (`cargo`) on the box
+hosting the herdr server — herdr compiles the plugin at install time via
 `cargo build --release`. Plugins run on the machine hosting the herdr server, so
 remote setups need these on the server box only. `node` is no longer required.
+
+On Windows the sampling uses the Win32 process APIs instead of `/proc`, and the
+herdr socket is reached through its named pipe; both are handled automatically.
+If your Rust toolchain targets `x86_64-pc-windows-gnu`, the MinGW binutils
+(`dlltool`, `as`) must be on `PATH` for the build (rustup's self-contained set
+is not sufficient); the MSVC target needs the Visual C++ build tools plus the
+Windows SDK, as usual.
 
 ## Usage
 
@@ -121,13 +130,20 @@ which reads the same two keys. Restart the updater to pick up a change.
 
 ## How it works
 
-The binary opens one persistent connection to the herdr unix socket and speaks
-its newline-delimited JSON-RPC. Per refresh: `session.snapshot` returns every
-workspace and pane in a single call → `pane.process_info` yields each pane's
-`shell_pid` → the process walks that PID's `/proc` subtree, summing CPU
-(utime+stime jiffie deltas over a sample window) and RSS. Branch comes from the
-pane cwd's git checkout, and worktree families from `worktree.list`. Clock ticks
-(`_SC_CLK_TCK`) and page size (`_SC_PAGESIZE`) are probed via `sysconf`.
+The binary opens one persistent connection to the herdr unix socket (on Windows
+the same JSON-RPC rides the named pipe `\\.\pipe\<HERDR_SOCKET_PATH>`) and
+speaks its newline-delimited JSON-RPC. Per refresh: `session.snapshot` returns
+every workspace and pane in a single call → `pane.process_info` yields each
+pane's `shell_pid` → the process walks that PID's process subtree, summing CPU
+and RSS over a sample window. Branch comes from the pane cwd's git checkout, and
+worktree families from `worktree.list`.
+
+Per platform: Linux reads `/proc/<pid>/stat` (utime+stime jiffie deltas,
+`sysconf` clock ticks/page size) and `statm` RSS; Windows snapshots the process
+table via Toolhelp32, reads cumulative CPU from `GetProcessTimes` (100 ns
+FILETIME ticks), working sets via `K32GetProcessMemoryInfo`, and the machine
+total via `GlobalMemoryStatusEx`. Processes the plugin cannot open still keep
+their pid→ppid edge so subtree topology stays correct.
 
 Workspaces and panes deliberately come from the **one** `session.snapshot` call
 rather than `workspace.list` plus a `pane.list` per workspace: the two can be

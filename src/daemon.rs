@@ -9,15 +9,15 @@
 //! restart when an `enabled` marker alongside the pid file says it was wanted.
 
 use std::collections::HashSet;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-
-use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
 
 use crate::collect::{self, PSEUDO_AGENT};
 use crate::config::{self, Config, Labels, Mode};
@@ -40,20 +40,16 @@ pub struct Tracked {
 /// PID of a live updater daemon, or `None` (missing pid file / dead process /
 /// a pid that no longer belongs to us).
 ///
-/// Reads `<state_dir>/updater.pid`, probes the process with `kill(pid, 0)`
-/// (signal 0 checks existence only), and then confirms the pid really is one of
-/// our processes. That last check matters: the state dir outlives reboots, so an
-/// unclean shutdown can leave a pid file pointing at a pid the kernel later
-/// recycled for something else — and without it `--enable` would no-op forever
-/// against that impostor, leaving the sidebar permanently blank.
+/// Reads `<state_dir>/updater.pid` and confirms the pid is live AND really one
+/// of our processes ([`is_our_process`] answers both: a vanished pid has no
+/// image name to read). That second check matters: the state dir outlives
+/// reboots, so an unclean shutdown can leave a pid file pointing at a pid the
+/// kernel later recycled for something else — and without it `--enable` would
+/// no-op forever against that impostor, leaving the sidebar permanently blank.
 pub fn daemon_pid() -> Option<u32> {
     let text = std::fs::read_to_string(config::pid_file()).ok()?;
     let pid: i32 = text.trim().parse().ok()?;
     if pid <= 0 {
-        return None;
-    }
-    // SAFETY: `kill` with signal 0 performs no delivery, only a liveness probe.
-    if unsafe { libc::kill(pid, 0) } != 0 {
         return None;
     }
     is_our_process(pid as u32).then_some(pid as u32)
@@ -92,8 +88,15 @@ pub fn run_daemon() -> crate::Result<()> {
     // Signal thread: on the first SIGINT/SIGTERM, win the shutdown race and clear
     // everything via a fresh connection, then exit. The main loop must not
     // re-report after this runs, so it parks once it observes `stopping`.
-    let mut signals = Signals::new([SIGINT, SIGTERM])?;
+    // Windows has no equivalent graceful signal: `--disable` terminates the
+    // daemon outright there, and the pushed statuses self-clear via their TTL
+    // (plus `--disable`'s own sweep).
+    #[cfg(unix)]
     {
+        let mut signals = signal_hook::iterator::Signals::new([
+            signal_hook::consts::SIGINT,
+            signal_hook::consts::SIGTERM,
+        ])?;
         let stopping = Arc::clone(&stopping);
         let tracked = Arc::clone(&tracked);
         thread::spawn(move || {
@@ -174,11 +177,10 @@ pub fn disable_updater() -> crate::Result<()> {
     set_enabled(&config::enabled_flag(), false);
 
     if let Some(pid) = daemon_pid() {
-        // The daemon clears its own statuses + title on shutdown; best-effort.
-        // SAFETY: `kill` merely posts SIGTERM to the pid; failure is ignored.
-        unsafe {
-            libc::kill(pid as i32, SIGTERM);
-        }
+        // Unix: SIGTERM, and the daemon clears its own statuses + title on the
+        // way down. Windows: TerminateProcess — abrupt, but the sweep below and
+        // the status TTLs cover the cleanup the daemon can no longer do.
+        proc::stop_process(pid);
     }
 
     // Belt and braces: sweep every current pane in case the daemon died — release
@@ -330,9 +332,9 @@ pub fn set_title_totals(client: &mut Herdr, spaces: &[Space], labels: &Labels) {
 
 /// Re-exec ourselves as a detached `--daemon` process.
 ///
-/// Fully detached: a new session (setsid) so it survives the controlling
-/// terminal — which is what lets the daemon outlive the short-lived `--enable` /
-/// `--restore` command herdr spawned it from — and null stdio.
+/// Fully detached so it survives the short-lived `--enable` / `--restore`
+/// command herdr spawned it from: a new session (setsid) on unix; no console
+/// window and its own process group on Windows. Null stdio on both.
 fn spawn_daemon() -> crate::Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
@@ -342,13 +344,20 @@ fn spawn_daemon() -> crate::Result<()> {
         .stderr(Stdio::null());
     // SAFETY: `setsid` is async-signal-safe and the only action taken in the
     // forked child before exec; it starts a new session, detaching the daemon.
+    #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| match libc::setsid() {
             -1 => Err(std::io::Error::last_os_error()),
             _ => Ok(()),
         });
     }
-    cmd.spawn()?; // do not wait — the child outlives us and is reaped by init
+    // CREATE_NO_WINDOW (0x0800_0000): no console at all — a herdr hook child
+    // with a visible console flashes a window on Windows Terminal hosts.
+    // CREATE_NEW_PROCESS_GROUP (0x0000_0200): detaches Ctrl+C delivery from the
+    // spawning command's group.
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000 | 0x0000_0200);
+    cmd.spawn()?; // do not wait — the child outlives us
     Ok(())
 }
 
@@ -372,7 +381,8 @@ fn enabled_flag_set(path: &std::path::Path) -> bool {
     path.exists()
 }
 
-/// Whether `pid` is one of *our* processes, compared via `/proc/<pid>/comm`
+/// Whether `pid` is live and one of *our* processes, compared by executable
+/// image name (`/proc/<pid>/comm` on Linux, the Toolhelp exe name on Windows)
 /// against our own.
 ///
 /// Guards pid reuse behind a stale pid file. Anything unreadable — a vanished
@@ -380,19 +390,12 @@ fn enabled_flag_set(path: &std::path::Path) -> bool {
 /// safe answer: we then treat the updater as down and start a fresh one.
 fn is_our_process(pid: u32) -> bool {
     match (
-        comm_of(&format!("/proc/{pid}/comm")),
-        comm_of("/proc/self/comm"),
+        proc::process_image_name(pid),
+        proc::process_image_name(std::process::id()),
     ) {
         (Some(theirs), Some(ours)) => theirs == ours,
         _ => false,
     }
-}
-
-/// Trimmed contents of a `/proc/<pid>/comm` path, or `None` if unreadable.
-fn comm_of(path: &str) -> Option<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|text| text.trim().to_string())
 }
 
 /// Clear tracked statuses + title, unlink the pid file, and `exit(0)`.
@@ -583,13 +586,8 @@ mod tests {
 
     #[test]
     fn vanished_pid_is_not_ours() {
-        // No `/proc/<pid>/comm` to read — the stale-pid-file case must read as
-        // "not ours" so the caller starts a fresh daemon.
+        // No image name to read for a dead pid — the stale-pid-file case must
+        // read as "not ours" so the caller starts a fresh daemon.
         assert!(!is_our_process(u32::MAX));
-    }
-
-    #[test]
-    fn comm_of_unreadable_path_is_none() {
-        assert_eq!(comm_of("/proc/nonexistent-pid/comm"), None);
     }
 }

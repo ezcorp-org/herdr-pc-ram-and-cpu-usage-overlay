@@ -170,6 +170,24 @@ pub fn rss_mb(pids: &HashSet<u32>) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
+/// Executable name of `pid` from `/proc/<pid>/comm`, or `None` when the process
+/// is gone or unreadable. Used by the daemon's stale-pid-file guard; also
+/// doubles as the liveness probe (a vanished pid has no `comm` to read).
+pub fn process_image_name(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|text| text.trim().to_string())
+}
+
+/// Best-effort graceful stop of `pid` via SIGTERM (failure is ignored — the
+/// daemon's statuses self-clear via their TTL either way).
+pub fn stop_process(pid: u32) {
+    // SAFETY: `kill` merely posts SIGTERM to the pid.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -18,15 +18,54 @@
 //!
 //! The socket path is resolved `HERDR_SOCKET_PATH` → `$XDG_CONFIG_HOME/herdr` →
 //! `~/.config/herdr/herdr.sock` (the XDG/home resolution is reused from
-//! [`crate::config`]).
+//! [`crate::config`]; on Windows the config home is `%APPDATA%`). On unix the
+//! transport is a persistent `UnixStream`; on Windows the same value names a
+//! pipe (`\\.\pipe\<path>`) opened as a read+write `File` — see [`open_stream`].
 
 use std::io::{self, BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
+
+/// The platform transport speaking herdr's newline-delimited JSON-RPC.
+///
+/// unix: a unix domain socket. windows: herdr (via interprocess' namespaced
+/// naming) exposes the socket as a named pipe at `\\.\pipe\<HERDR_SOCKET_PATH>`
+/// — the WHOLE path is folded into the pipe name — and an ordinary
+/// read+write `File` can speak it (same pattern as herdr-sidebar's ipc.rs,
+/// verified on the herdr 0.8 Windows beta).
+#[cfg(unix)]
+type Stream = UnixStream;
+#[cfg(windows)]
+type Stream = std::fs::File;
+
+/// Connect the platform stream to the herdr socket at `path`.
+#[cfg(unix)]
+fn open_stream(path: &Path) -> io::Result<Stream> {
+    let stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    Ok(stream)
+}
+
+/// Connect the platform stream to the herdr socket at `path`.
+///
+/// No read/write timeouts: a pipe opened as `File` has no such knobs. herdr
+/// answers in milliseconds; a wedged host is the only hang, as on unix when the
+/// timeout fires late.
+#[cfg(windows)]
+fn open_stream(path: &Path) -> io::Result<Stream> {
+    let pipe = format!(r"\\.\pipe\{}", path.display());
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pipe)
+}
 
 use crate::model::{
     ProcessInfo, ProcessInfoResult, SessionSnapshot, SessionSnapshotResult, WorktreeListResult,
@@ -34,15 +73,16 @@ use crate::model::{
 
 /// Read/write timeout for a single JSON-RPC round-trip. Generous — herdr answers
 /// in milliseconds; this only guards against a wedged host hanging the plugin.
+#[cfg(unix)]
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A live JSON-RPC connection to the herdr host.
 pub struct Herdr {
     /// Write half — requests are written here and flushed.
-    stream: UnixStream,
+    stream: Stream,
     /// Read half — a `BufReader` over a cloned fd so we can `read_line` while the
     /// write half stays borrowable.
-    reader: BufReader<UnixStream>,
+    reader: BufReader<Stream>,
     /// Socket path, retained so a broken connection can be re-opened.
     path: PathBuf,
     /// Monotonic request id counter (unique per connection, and across reconnects
@@ -58,9 +98,8 @@ pub fn connect() -> crate::Result<Herdr> {
 impl Herdr {
     /// Connect to `path` and wire up the read/write halves.
     fn open(path: PathBuf) -> crate::Result<Herdr> {
-        let stream = UnixStream::connect(&path)
+        let stream = open_stream(&path)
             .map_err(|e| format!("cannot connect to herdr socket {}: {e}", path.display()))?;
-        configure(&stream)?;
         let reader = BufReader::new(stream.try_clone()?);
         Ok(Herdr {
             stream,
@@ -72,13 +111,12 @@ impl Herdr {
 
     /// Re-open the socket after a broken pipe, replacing both halves.
     fn reconnect(&mut self) -> crate::Result<()> {
-        let stream = UnixStream::connect(&self.path).map_err(|e| {
+        let stream = open_stream(&self.path).map_err(|e| {
             format!(
                 "cannot reconnect to herdr socket {}: {e}",
                 self.path.display()
             )
         })?;
-        configure(&stream)?;
         self.reader = BufReader::new(stream.try_clone()?);
         self.stream = stream;
         Ok(())
@@ -354,18 +392,15 @@ fn parse_envelope(line: &str) -> crate::Result<Value> {
 
 /// Socket path from an optional `HERDR_SOCKET_PATH` override and the resolved
 /// config home: the override wins, else `<config_home>/herdr/herdr.sock`.
+///
+/// On Windows the config home resolves to `%APPDATA%` (see
+/// [`crate::config::config_home`]), matching where the herdr beta puts
+/// `herdr\herdr.sock`; the value then names the pipe (see [`open_stream`]).
 fn socket_path_from(explicit: Option<&str>, config_home: &Path) -> PathBuf {
     match explicit {
         Some(path) => PathBuf::from(path),
         None => config_home.join("herdr").join("herdr.sock"),
     }
-}
-
-/// Apply the round-trip read/write timeouts to a freshly connected stream.
-fn configure(stream: &UnixStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    Ok(())
 }
 
 #[cfg(test)]

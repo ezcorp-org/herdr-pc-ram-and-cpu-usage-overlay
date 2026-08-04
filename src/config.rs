@@ -135,8 +135,14 @@ fn home_dir() -> PathBuf {
         .unwrap_or_default()
 }
 
-/// XDG config base: `$XDG_CONFIG_HOME` if set (and non-empty), else `~/.config`.
+/// Config base: `%APPDATA%` on Windows (where the herdr beta keeps its config
+/// and socket), else `$XDG_CONFIG_HOME` if set (and non-empty), else
+/// `~/.config`.
 pub(crate) fn config_home() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(appdata) = non_empty_env("APPDATA") {
+        return PathBuf::from(appdata);
+    }
     non_empty_env("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".config"))
