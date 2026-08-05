@@ -25,6 +25,7 @@ mod collect;
 mod config;
 mod daemon;
 mod herdr;
+mod herdr_config;
 mod icons;
 mod model;
 // One `proc` module per platform, selected here so every consumer just says

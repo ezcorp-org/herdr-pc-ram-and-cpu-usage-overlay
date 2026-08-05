@@ -8,11 +8,15 @@ a glance which space is eating your machine.
 ```
 ● web-app
     main
-    cpu 26% · ram 8%                ← spaces card (sidebar mode)
+    cpu 26% · ram 8%                ← spaces card (sidebar mode, the default)
 
 ⚡ web-app
-    idle · usage · cpu 26% · ram 8%   ← agents panel (default mode)
+    idle · usage · cpu 26% · ram 8%   ← agents panel (mode = "agents-panel")
 ```
+
+**It works the moment you install it.** No action to invoke, no config to paste
+— see [Zero-setup](#zero-setup) for exactly what that involves, including the one
+line it adds to herdr's own `config.toml` and how to take it back out.
 
 With a Nerd Font installed it detects that and uses icons instead —
 ` 26% ·  8%`. See [Icons](#icons-and-labels).
@@ -59,13 +63,66 @@ If your Rust toolchain targets `x86_64-pc-windows-gnu`, the MinGW binutils
 is not sufficient); the MSVC target needs the Visual C++ build tools plus the
 Windows SDK, as usual.
 
+## Zero-setup
+
+Installing is the whole setup. Within a few seconds of the install — or the next
+time you switch spaces — every space card is showing its CPU and RAM.
+
+Three things have to be true for a reading to appear, and the plugin arranges all
+three itself:
+
+| | What it needs | How it gets there |
+|---|---|---|
+| 1 | The updater running | Wanted by default. Only an explicit `status-disable` turns it off, and that decision survives restarts. |
+| 2 | `mode = "sidebar"` | The default since 1.8.0. |
+| 3 | A `$usage` row in **herdr's** `config.toml` | Added once, on first run. |
+
+Point 3 is the one worth reading about, because it edits a file you own.
+
+**Why it is necessary.** herdr only draws a `$name` token that some row in its own
+config references, and herdr's built-in rows reference none. There is no plugin
+API and no manifest section for contributing one — so without this step the
+daemon runs, pushes a perfectly good token, and the sidebar stays empty. That is
+what "the plugin does nothing" used to mean.
+
+**What it does.** Appends one row to `[ui.sidebar.spaces]`, wrapped in a marker:
+
+```toml
+[ui.sidebar.spaces]
+rows = [
+  ["state_icon", "workspace"],
+  ["branch", "git_status"],
+  # --- added by ez-corp.space-usage (removed by `status-disable`) ---
+  ["$usage"],
+  # --- end ez-corp.space-usage ---
+]
+```
+
+**The guarantees.**
+
+- **Once.** First run only. A later `status-enable` will not re-add a row you
+  deleted.
+- **Guarded.** If your config already references `$usage` anywhere in that table
+  — because you set this up by hand before 1.8.0 — nothing is written at all.
+- **Reversible.** `status-disable` removes the marked block. A `$usage` row *you*
+  wrote carries no marker and is left alone.
+- **Recoverable.** The previous config is copied to
+  `config.toml.space-usage.bak` before every write, and the write itself is a
+  temp-file rename, so an interrupted run cannot leave a truncated config.
+- **Announced.** The enable toast says when it edited your config.
+
+If you would rather it never touched your config, add the row yourself first —
+the guard then sees it and stays out of the way.
+
 ## Usage
 
-Toggle the background updater (statuses appear in the sidebar within ~5s):
+It is already running. To turn it off (and take the config row back out):
 
 ```sh
-herdr plugin action invoke status-toggle --plugin ez-corp.space-usage
+herdr plugin action invoke status-disable --plugin ez-corp.space-usage
 ```
+
+`status-enable` brings it back; `status-toggle` flips whichever way it is.
 
 Other entrypoints:
 
@@ -82,18 +139,24 @@ agents-panel mode the `usage` pseudo-agent row itself has no TTL (herdr's
 behind until the next `status-enable`/`status-disable`. Disabling clears
 everything immediately either way.
 
-The updater **survives herdr restarts**. Enabling it records that you want it;
-herdr then runs the manifest's `[[startup]]` hook (`--restore`) on every server
-start — including a live `herdr update --handoff` — which brings the daemon back
-if it isn't already running. Disabling clears that record, so a deliberate
-`status-disable` stays disabled across restarts. A fresh install starts with no
-record, so nothing runs until you enable it once. Requires herdr ≥ 0.7.5;
-verified against 0.7.5 and 0.8.0.
+The updater **survives herdr restarts**, and comes up on its own after an
+install. herdr runs the manifest's `[[startup]]` hook (`--restore`) on every
+server start — including a live `herdr update --handoff` — and the `[[events]]`
+hook on `workspace.focused`. The second exists because `herdr plugin install`
+does *not* run startup hooks: without it, a plugin installed into a herdr that is
+already running would sit inert until the next restart.
 
-> **Upgrading from < 1.2.0?** The record is only written when you enable the
-> updater, so an updater enabled under an older version isn't yet marked as
-> wanted. Run `status-enable` (or `status-toggle` twice) once after upgrading —
-> from then on it is permanent.
+Whether it runs comes down to one marker with three states: never decided (a
+fresh install → run), enabled, and disabled. Only the last keeps it down, so a
+deliberate `status-disable` stays disabled across restarts while a new install
+starts itself. Requires herdr ≥ 0.7.5; verified against 0.7.5 and 0.8.0.
+
+> **Upgrading from < 1.8.0?** Two defaults changed, both toward "works without
+> being told": the updater now runs unless you have disabled it, and `mode`
+> defaults to `sidebar` rather than `agents-panel`. If you had deliberately left
+> the updater off, run `status-disable` once — the old version recorded "off" by
+> deleting its marker, which now reads as a fresh install. If you preferred the
+> agents panel, set `mode = "agents-panel"` in the plugin config.
 
 ## Modes
 
@@ -101,27 +164,33 @@ Configure in `$HERDR_PLUGIN_CONFIG_DIR/config.toml`
 (herdr prints the config dir via `herdr plugin config-dir ez-corp.space-usage`):
 
 ```toml
-mode = "agents-panel"       # default — works on stock herdr
-# mode = "sidebar"          # for herdr builds with the sidebar patch (below)
+mode = "sidebar"            # default — usage inside each spaces card
+# mode = "agents-panel"     # usage on the agents-panel row instead
 interval_seconds = 5        # 1..28800; statuses get a TTL of three intervals
 window_title_totals = true
 battery = true              # machine-wide cell on the title/report, not the rows
 icons = "auto"              # auto | text | unicode | nerdfont | emoji
 ```
 
-- **agents-panel** (default): each space gets its own entry in the sidebar agents
-  panel via a `usage` pseudo-agent on a spare shell pane, carrying the usage token.
-- **sidebar**: renders usage inside each spaces card, under the branch name.
+- **sidebar** (default): renders usage inside each spaces card, under the branch
+  name. Needs no patched build — see below.
+- **agents-panel**: each space gets its own entry in the sidebar agents panel via
+  a `usage` pseudo-agent on a spare shell pane, carrying the usage token.
 
-Switching modes cleans up after the other mode automatically.
+Switching modes cleans up after the other mode automatically. The first run
+writes its `$usage` row into whichever table the mode renders from
+(`[ui.sidebar.spaces]` or `[ui.sidebar.agents]`), so if you change `mode` after
+setup you will need the row in the other table — add it by hand, or
+`status-disable` and `status-enable` to have it moved for you.
 
 ### herdr 0.7.5+ (native sidebar tokens — no patch needed)
 
 Since herdr **0.7.5** the sidebar is drawn from configurable **token rows**, so
 sidebar mode no longer needs a patched build. This plugin pushes a named
-**`usage`** metadata token (`pane.report_metadata`, replacing the old
-`custom_status`), and you reference it as **`$usage`** in herdr's own
-`config.toml`:
+**`usage`** metadata token (`workspace.report_metadata`, replacing the old
+`custom_status`), referenced as **`$usage`** in herdr's own `config.toml`. Since
+1.8.0 the plugin adds that reference itself ([Zero-setup](#zero-setup)); this is
+what it writes, and what to write by hand if you would rather it did not:
 
 ```toml
 [ui.sidebar.spaces]          # sidebar mode → usage under each space

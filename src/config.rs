@@ -16,10 +16,37 @@ use crate::icons::{self, IconSet};
 /// Status-surfacing strategy (plugin `config.toml` `mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Stock herdr: a "usage" pseudo-agent per space in the agents panel.
+    /// A "usage" pseudo-agent per space in the agents panel.
     AgentsPanel,
-    /// Patched herdr: display-only metadata rendered inside the spaces card.
+    /// Display-only metadata rendered inside the spaces card. The default since
+    /// 1.8.0 — herdr has drawn the spaces card from configurable token rows
+    /// since 0.7.5, which the manifest already requires, so this needs no
+    /// patched build and puts the reading on the surface people look at.
     Sidebar,
+}
+
+impl Mode {
+    /// herdr config table whose rows render this mode's `$usage` token, and the
+    /// rows herdr uses when that table is absent.
+    ///
+    /// Both halves live here because a caller that knew one without the other
+    /// would write a table header with the wrong defaults under it — silently
+    /// dropping `branch` and `git_status` off every space card.
+    pub fn sidebar_table(self) -> (&'static str, &'static [&'static str]) {
+        match self {
+            Mode::Sidebar => (
+                "ui.sidebar.spaces",
+                &[
+                    r#"["state_icon", "workspace"]"#,
+                    r#"["branch", "git_status"]"#,
+                ],
+            ),
+            Mode::AgentsPanel => (
+                "ui.sidebar.agents",
+                &[r#"["state_icon", "workspace", "tab"]"#, r#"["agent"]"#],
+            ),
+        }
+    }
 }
 
 /// Plugin user config from `$HERDR_PLUGIN_CONFIG_DIR/config.toml`.
@@ -58,7 +85,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            mode: Mode::AgentsPanel,
+            mode: Mode::Sidebar,
             interval_seconds: 5,
             window_title_totals: true,
             battery: true,
@@ -227,14 +254,70 @@ pub fn pid_file() -> PathBuf {
     state_dir().join("updater.pid")
 }
 
-/// Marker recording that the updater is *wanted* (`<state_dir>/enabled`).
+/// Marker recording what the user has *decided* about the updater
+/// (`<state_dir>/enabled`).
 ///
-/// The pid file says whether a daemon is live *right now*; this says whether the
-/// user ever asked for one. `--restore` (the manifest `[[startup]]` hook) reads
-/// it so the updater comes back after a herdr or machine restart instead of
-/// silently staying off until someone re-invokes `status-enable`.
+/// The pid file says whether a daemon is live *right now*; this says what the
+/// user wants. `--restore` (the manifest `[[startup]]` and `[[events]]` hooks)
+/// reads it so the updater comes back after a herdr or machine restart.
+///
+/// Three states, not two — see [`Wanted`]. The absent case is the fresh install,
+/// and it means "wanted", which is what makes the plugin work out of the box.
 pub fn enabled_flag() -> PathBuf {
     state_dir().join("enabled")
+}
+
+/// Marker recording that we have run first-time setup (`<state_dir>/bootstrapped`).
+///
+/// Separate from [`enabled_flag`] because the two answer different questions and
+/// are written at different times: "does the user want the updater" versus "have
+/// we already offered to edit herdr's config". Folding them together would make
+/// a later `status-enable` re-add a `$usage` row the user had deliberately taken
+/// out of their own config.
+pub fn bootstrapped_flag() -> PathBuf {
+    state_dir().join("bootstrapped")
+}
+
+/// What the user has decided about the updater.
+///
+/// The old marker was a plain present/absent boolean, which conflated "never
+/// asked for" with "asked to be off" — so a fresh install, which has written
+/// nothing, looked identical to a deliberate `status-disable` and stayed dark
+/// until someone found `status-enable` by hand. That was the bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wanted {
+    /// Nothing written yet: a fresh install. Treated as wanted, and first-run
+    /// setup still has to happen.
+    Undecided,
+    /// `status-enable` was run.
+    Enabled,
+    /// `status-disable` was run. The one state that keeps the updater down
+    /// across restarts.
+    Disabled,
+}
+
+impl Wanted {
+    /// Whether the updater should be running. Only an explicit `Disabled` says no
+    /// — "never decided" defaults to on, which is what makes a fresh install
+    /// render without a manual step.
+    pub fn wants_daemon(self) -> bool {
+        self != Wanted::Disabled
+    }
+}
+
+/// Read the decision marker at `path`.
+///
+/// Absent file → [`Wanted::Undecided`]. A `0` (the marker `--disable` writes) →
+/// [`Wanted::Disabled`]. Anything else, including the bare `1` older versions
+/// wrote, → [`Wanted::Enabled`]: an unreadable or garbled marker resolves to the
+/// state the user is more likely to want, and one that self-heals on the next
+/// enable/disable.
+pub fn read_wanted(path: &std::path::Path) -> Wanted {
+    match std::fs::read_to_string(path) {
+        Err(_) => Wanted::Undecided,
+        Ok(text) if text.trim() == "0" => Wanted::Disabled,
+        Ok(_) => Wanted::Enabled,
+    }
 }
 
 // ---- env / path resolution --------------------------------------------------
@@ -269,7 +352,7 @@ pub(crate) fn config_home() -> PathBuf {
 }
 
 /// Path to herdr's OWN `config.toml` (`<config_home>/herdr/config.toml`).
-fn herdr_config_path() -> PathBuf {
+pub(crate) fn herdr_config_path() -> PathBuf {
     config_home().join("herdr").join("config.toml")
 }
 
@@ -442,7 +525,10 @@ mod tests {
     #[test]
     fn config_empty_text_yields_documented_defaults() {
         let cfg = parse_config("");
-        assert_eq!(cfg.mode, Mode::AgentsPanel);
+        // Sidebar since 1.8.0: a fresh install writes no config at all, so this
+        // default IS what a new user gets, and the spaces card is the surface
+        // they are looking at when they say the plugin shows nothing.
+        assert_eq!(cfg.mode, Mode::Sidebar);
         assert_eq!(cfg.interval_seconds, 5);
         assert!(cfg.window_title_totals);
         assert!(cfg.battery, "the battery cell is on unless opted out");
@@ -454,7 +540,23 @@ mod tests {
         assert_eq!(parse_config("mode = sidebar").mode, Mode::Sidebar);
         assert_eq!(parse_config("mode = agents-panel").mode, Mode::AgentsPanel);
         // Unknown value leaves the default untouched.
-        assert_eq!(parse_config("mode = bogus").mode, Mode::AgentsPanel);
+        assert_eq!(parse_config("mode = bogus").mode, Mode::Sidebar);
+    }
+
+    #[test]
+    fn each_mode_names_the_table_that_renders_it() {
+        // The two modes render from different herdr tables. Writing the `$usage`
+        // row into the wrong one produces exactly the symptom we are fixing —
+        // everything works and nothing appears.
+        let (spaces, spaces_rows) = Mode::Sidebar.sidebar_table();
+        let (agents, agents_rows) = Mode::AgentsPanel.sidebar_table();
+        assert_eq!(spaces, "ui.sidebar.spaces");
+        assert_eq!(agents, "ui.sidebar.agents");
+        assert_ne!(spaces, agents);
+        // The defaults carried alongside each name are herdr's own, so appending
+        // a table cannot silently drop the rows a user already had.
+        assert!(spaces_rows.iter().any(|row| row.contains("git_status")));
+        assert!(agents_rows.iter().any(|row| row.contains("agent")));
     }
 
     #[test]
@@ -548,13 +650,13 @@ mod tests {
     #[test]
     fn config_skips_comments_and_malformed_lines() {
         let text = "\
-            # mode = sidebar\n\
+            # mode = agents-panel\n\
             not a config line\n\
-            mode2 = sidebar\n\
+            mode2 = agents-panel\n\
             interval_seconds = 9\n";
         let cfg = parse_config(text);
         // The commented and digit-keyed lines are ignored; the valid one applies.
-        assert_eq!(cfg.mode, Mode::AgentsPanel);
+        assert_eq!(cfg.mode, Mode::Sidebar);
         assert_eq!(cfg.interval_seconds, 9);
     }
 

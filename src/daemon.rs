@@ -5,8 +5,17 @@
 //! (sidebar mode). A pid file under the state dir enforces a single instance;
 //! statuses self-clear via their TTL if the daemon dies. `enable`/`disable`/
 //! `toggle` spawn or signal that daemon and sweep leftover statuses, and
-//! `restore` (herdr's `[[startup]]` hook) brings it back after a herdr or machine
-//! restart when an `enabled` marker alongside the pid file says it was wanted.
+//! `restore` (herdr's `[[startup]]` and `[[events]]` hooks) brings it back after
+//! a herdr or machine restart unless the `enabled` marker alongside the pid file
+//! says the user turned it off.
+//!
+//! That marker is tri-state, and the third state is the whole point: absent means
+//! *nobody has decided*, which is a fresh install, and a fresh install wants the
+//! updater. The old present/absent boolean could not tell that apart from a
+//! deliberate `status-disable`, so a new install stayed dark until someone found
+//! `status-enable` by hand. The first run also does the one-time setup in
+//! [`bootstrap_sidebar`], because on a fresh install there is no earlier moment
+//! to do it in.
 
 use std::collections::HashSet;
 #[cfg(unix)]
@@ -21,8 +30,9 @@ use std::time::Duration;
 
 use crate::battery::Battery;
 use crate::collect::{self, PSEUDO_AGENT};
-use crate::config::{self, Config, Labels, Mode};
+use crate::config::{self, Config, Labels, Mode, Wanted};
 use crate::herdr::{self, Herdr};
+use crate::herdr_config::{self, Change};
 use crate::icons::IconSet;
 use crate::model::Space;
 use crate::proc;
@@ -210,42 +220,67 @@ pub fn run_daemon() -> crate::Result<()> {
     }
 }
 
-/// `--enable`: record that the updater is wanted and spawn a detached `--daemon`
-/// process (spawn is a no-op if one is already running).
+/// `--enable`: record that the updater is wanted, make sure herdr's sidebar
+/// draws our token, and spawn a detached `--daemon` process (spawn is a no-op if
+/// one is already running).
 pub fn enable_updater() -> crate::Result<()> {
-    // Record the intent first, so the `[[startup]]` hook restores the updater
-    // after a restart even if the spawn below fails.
-    set_enabled(&config::enabled_flag(), true);
+    // Record the intent first, so the restore hooks bring the updater back after
+    // a restart even if the spawn below fails.
+    set_wanted(&config::enabled_flag(), Wanted::Enabled);
+    let added = bootstrap_sidebar();
 
     if daemon_pid().is_some() {
-        notify("sidebar usage already enabled");
+        notify(enabled_message("sidebar usage already enabled", added));
         return Ok(());
     }
     spawn_daemon()?;
-    notify("sidebar usage enabled");
+    notify(enabled_message("sidebar usage enabled", added));
     Ok(())
 }
 
-/// `--restore`: herdr's `[[startup]]` hook — bring the updater back after a herdr
-/// or machine restart, but only if it was enabled when herdr went away.
+/// `--restore`: herdr's `[[startup]]` and `[[events]]` hooks — bring the updater
+/// up whenever herdr is running and the user has not turned it off.
 ///
-/// Silent by design: a restart is not a user action, so it raises no toast. Both
-/// gates are no-ops rather than errors — an updater that was never enabled stays
-/// off, and a live one (herdr re-runs startup hooks on every live handoff too) is
-/// left alone.
+/// Runs on a fresh server start, on a live `herdr update --handoff`, and on
+/// `workspace.focused`. That last one exists because `herdr plugin install` does
+/// NOT run startup hooks: without it a plugin installed into a running herdr
+/// stays inert until the next restart, which is most of what "the plugin does
+/// nothing" used to mean.
+///
+/// Silent by design: none of those are user actions, so none raise a toast.
+/// Every gate is a no-op rather than an error — a deliberate `status-disable`
+/// stays off, and a live daemon is left alone.
+///
+/// The first run also does the one-time setup [`enable_updater`] would have
+/// done, because on a fresh install there is no earlier moment: nobody has run
+/// `status-enable`, and that is precisely the bug.
 pub fn restore_updater() -> crate::Result<()> {
-    if !enabled_flag_set(&config::enabled_flag()) || daemon_pid().is_some() {
+    let flag = config::enabled_flag();
+    let wanted = config::read_wanted(&flag);
+    if !wanted.wants_daemon() {
+        return Ok(());
+    }
+    if wanted == Wanted::Undecided {
+        bootstrap_sidebar();
+    }
+    if daemon_pid().is_some() {
         return Ok(());
     }
     spawn_daemon()
 }
 
-/// `--disable`: clear the wanted flag, signal the daemon, and sweep any leftover
-/// statuses / title.
+/// `--disable`: record that the updater is NOT wanted, take our config row back
+/// out, signal the daemon, and sweep any leftover statuses / title.
 pub fn disable_updater() -> crate::Result<()> {
-    // Clear the intent so the `[[startup]]` hook does not resurrect the updater
-    // on the next herdr restart.
-    set_enabled(&config::enabled_flag(), false);
+    // Record the intent so the restore hooks do not resurrect the updater on the
+    // next herdr restart or space switch. This writes an explicit "off" rather
+    // than deleting the marker: an absent marker now means "fresh install", and
+    // deleting it would make every disable undo itself on the next restart.
+    set_wanted(&config::enabled_flag(), Wanted::Disabled);
+    // Reversible, as promised: whatever we added to herdr's config comes out.
+    if herdr_config::remove_usage_row().is_ok_and(Change::needs_reload) {
+        reload_herdr_config();
+    }
 
     if let Some(pid) = daemon_pid() {
         // Unix: SIGTERM, and the daemon clears its own statuses + title on the
@@ -487,24 +522,69 @@ fn spawn_daemon() -> crate::Result<()> {
     Ok(())
 }
 
-/// Create (`true`) or remove (`false`) the "updater wanted" marker at `path`.
+/// Record the user's decision in the marker at `path`.
+///
+/// Always writes — never deletes. An absent marker is its own state now
+/// ([`Wanted::Undecided`], the fresh install), so removing the file to mean
+/// "off" would make every `--disable` undo itself at the next restart.
 ///
 /// Best-effort: the marker only drives restart recovery, so a state dir we cannot
 /// write must not fail the enable/disable the user actually asked for.
-fn set_enabled(path: &std::path::Path, enabled: bool) {
-    if !enabled {
-        let _ = std::fs::remove_file(path);
-        return;
-    }
+fn set_wanted(path: &std::path::Path, wanted: Wanted) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, "1\n");
+    let _ = std::fs::write(
+        path,
+        if wanted == Wanted::Disabled {
+            "0\n"
+        } else {
+            "1\n"
+        },
+    );
 }
 
-/// Whether the "updater wanted" marker at `path` exists.
-fn enabled_flag_set(path: &std::path::Path) -> bool {
-    path.exists()
+/// One-time setup: make herdr's sidebar draw the token this plugin pushes.
+///
+/// Returns whether a row was added, which the caller turns into a toast — a
+/// plugin that edits your config should say so.
+///
+/// Guarded by its own marker rather than by the enable/disable one, so this runs
+/// at most once. Without that a later `status-enable` would re-add a row the
+/// user had deliberately deleted from their own config, which is the behaviour
+/// that makes people distrust a tool that writes to their files.
+fn bootstrap_sidebar() -> bool {
+    let marker = config::bootstrapped_flag();
+    if marker.exists() {
+        return false;
+    }
+    let mode = config::load_config().mode;
+    let added = herdr_config::ensure_usage_row(mode).is_ok_and(Change::needs_reload);
+    set_wanted(&marker, Wanted::Enabled);
+    if added {
+        reload_herdr_config();
+    }
+    added
+}
+
+/// Ask herdr to re-read its config so a row we just wrote renders now rather
+/// than after the next restart. Best-effort over a throwaway connection.
+fn reload_herdr_config() {
+    if let Ok(mut client) = herdr::connect() {
+        let _ = client.server_reload_config();
+    }
+}
+
+/// Toast text for `--enable`, naming the config edit when there was one.
+///
+/// Silence would be the wrong default here: the plugin has just written to a
+/// file the user owns, and a `.bak` they never hear about is not a safety net
+/// they can use.
+fn enabled_message(base: &str, added_row: bool) -> String {
+    match added_row {
+        false => base.to_string(),
+        true => format!("{base} — added a $usage row to herdr's config.toml (backup alongside it)"),
+    }
 }
 
 /// Whether `pid` is live and one of *our* processes, compared by executable
@@ -643,9 +723,9 @@ fn release_pseudo(client: &mut Herdr, pane_id: &str, source: &str) {
 }
 
 /// Best-effort "Space usage" toast over a throwaway connection.
-fn notify(body: &str) {
+fn notify(body: impl AsRef<str>) {
     if let Ok(mut client) = herdr::connect() {
-        let _ = client.notification_show("Space usage", body);
+        let _ = client.notification_show("Space usage", body.as_ref());
     }
 }
 
@@ -805,24 +885,71 @@ mod tests {
     }
 
     #[test]
-    fn enabled_flag_round_trips_and_creates_missing_state_dir() {
-        // Point at a *nested* dir that does not exist yet — enabling must create
+    fn a_fresh_install_wants_the_daemon_without_anyone_asking() {
+        // THE bug. A fresh install has written no marker, and the old present/
+        // absent flag read that as "off" — identical to a deliberate disable —
+        // so `--restore` no-opped forever and the sidebar stayed blank until
+        // someone found `status-enable` by hand.
+        let flag = scratch("fresh").join("nested").join("enabled");
+        assert_eq!(config::read_wanted(&flag), Wanted::Undecided);
+        assert!(
+            config::read_wanted(&flag).wants_daemon(),
+            "a fresh install must start itself",
+        );
+    }
+
+    #[test]
+    fn the_marker_round_trips_and_creates_a_missing_state_dir() {
+        // Point at a *nested* dir that does not exist yet — writing must create
         // it, mirroring a fresh install whose state dir herdr has not made.
         let flag = scratch("flag").join("nested").join("enabled");
+
+        set_wanted(&flag, Wanted::Enabled);
+        assert_eq!(config::read_wanted(&flag), Wanted::Enabled);
+        assert!(config::read_wanted(&flag).wants_daemon());
+
+        set_wanted(&flag, Wanted::Disabled);
+        assert_eq!(config::read_wanted(&flag), Wanted::Disabled);
+        assert!(!config::read_wanted(&flag).wants_daemon());
+
+        // Re-enabling after a disable must actually come back on.
+        set_wanted(&flag, Wanted::Enabled);
+        assert!(config::read_wanted(&flag).wants_daemon());
+    }
+
+    #[test]
+    fn disabling_writes_a_marker_rather_than_deleting_one() {
+        // The one state that has to survive a restart. Deleting the file to mean
+        // "off" would now read back as a fresh install, so every `--disable`
+        // would quietly undo itself the next time herdr started.
+        let flag = scratch("disable").join("enabled");
+        set_wanted(&flag, Wanted::Disabled);
+        assert!(flag.exists(), "the off state needs a file of its own");
+        assert!(!config::read_wanted(&flag).wants_daemon());
+    }
+
+    #[test]
+    fn a_marker_from_an_older_version_still_reads_as_enabled() {
+        // Versions before 1.8.0 wrote a bare "1" and deleted the file to
+        // disable. That "1" has to keep meaning enabled across the upgrade.
+        let flag = scratch("legacy").join("enabled");
+        std::fs::create_dir_all(flag.parent().unwrap()).unwrap();
+        std::fs::write(&flag, "1\n").unwrap();
+        assert_eq!(config::read_wanted(&flag), Wanted::Enabled);
+    }
+
+    #[test]
+    fn the_enable_toast_names_the_config_edit() {
+        // A plugin that writes to a file the user owns has to say so; a backup
+        // nobody is told about is not a safety net anyone can use.
+        let quiet = enabled_message("sidebar usage enabled", false);
+        let loud = enabled_message("sidebar usage enabled", true);
+        assert_eq!(quiet, "sidebar usage enabled");
+        assert!(loud.starts_with(&quiet), "got: {loud}");
         assert!(
-            !enabled_flag_set(&flag),
-            "absent before anything is written"
+            loud.contains("config.toml") && loud.contains("backup"),
+            "{loud}"
         );
-
-        set_enabled(&flag, true);
-        assert!(enabled_flag_set(&flag), "set after --enable");
-
-        set_enabled(&flag, false);
-        assert!(!enabled_flag_set(&flag), "cleared after --disable");
-
-        // Clearing an already-absent flag is a no-op, not an error.
-        set_enabled(&flag, false);
-        assert!(!enabled_flag_set(&flag));
     }
 
     #[test]

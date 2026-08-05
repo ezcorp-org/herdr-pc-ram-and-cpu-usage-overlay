@@ -358,6 +358,17 @@ impl Herdr {
         Ok(())
     }
 
+    /// `server.reload_config` — ask herdr to re-read its own `config.toml`.
+    ///
+    /// Called after [`crate::herdr_config`] adds the `$usage` row, so the row
+    /// takes effect in the running session instead of at the next herdr restart.
+    /// Without it the plugin would look broken for exactly as long as the user
+    /// kept herdr open, which is the failure the row was added to prevent.
+    pub fn server_reload_config(&mut self) -> crate::Result<()> {
+        self.call("server.reload_config", &json!({}))?;
+        Ok(())
+    }
+
     /// `notification.show` — best-effort toast.
     pub fn notification_show(&mut self, title: &str, body: &str) -> crate::Result<()> {
         self.call(

@@ -1,8 +1,9 @@
 # herdr plugin: PC RAM & CPU Usage Overlay (CPU / RAM per space)
 #
 # Shows CPU and RAM usage per space (workspace), grouped under each space's
-# git branch name. herdr plugin v1 has no API to draw into the sidebar, so the
-# data is surfaced two ways:
+# git branch name. The sidebar row is the main surface — herdr draws it from a
+# `$usage` token row this plugin adds to herdr's config on first run, since no
+# plugin API can contribute one. Two more surfaces come along with it:
 #   - a live terminal pane  ("Space usage" overlay)
 #   - a one-shot action     ("Space usage report")
 #
@@ -13,7 +14,7 @@
 
 id = "ez-corp.space-usage"
 name = "PC RAM & CPU Usage Overlay"
-version = "1.7.0"
+version = "1.8.0"
 # Oldest herdr with every API this plugin calls: `session.snapshot`, the `tokens`
 # metadata API on `pane.report_metadata` / `workspace.report_metadata`, and
 # `pane.process_info` — all 0.7.5. Diffing the two bundled API schemas
@@ -35,12 +36,28 @@ platforms = ["linux", "macos", "windows"]
 
 # Restart recovery. herdr runs startup hooks on both a fresh server start and a
 # live handoff (`herdr update --handoff`), so this fires whenever herdr comes
-# back. `--restore` re-spawns the updater ONLY if it was enabled when herdr went
-# away (it reads a marker written by --enable / removed by --disable), and is a
-# silent no-op otherwise — so a deliberate --disable stays disabled, and an
-# already-live daemon is left alone. Without this the updater dies with herdr and
-# the sidebar stays blank until someone re-invokes status-enable by hand.
+# back. `--restore` brings the updater up unless the user turned it OFF (it reads
+# a tri-state marker: absent = fresh install = wanted, "1" = enabled, "0" =
+# deliberately disabled), and is a silent no-op otherwise — so a deliberate
+# --disable stays disabled and an already-live daemon is left alone. Without this
+# the updater dies with herdr and the sidebar stays blank.
 [[startup]]
+command = ["./target/release/space-usage", "--restore"]
+platforms = ["linux", "macos", "windows"]
+
+# Install-time recovery, which the startup hook cannot give us: `herdr plugin
+# install` registers a plugin but does NOT run its startup hooks (herdr runs
+# those only on a server start or a handoff import). So a plugin installed into
+# a herdr that is already running sits inert until the next restart — most of
+# what "I installed it and nothing happened" used to mean.
+#
+# `workspace.focused` is the earliest event a real user reliably produces, and
+# `--restore` is idempotent and exits in microseconds once the daemon is live
+# (a marker read plus a pid check), so the cost of firing it on every space
+# switch is one short-lived process. That is the trade: a little churn for a
+# plugin that works the moment it is installed.
+[[events]]
+on = "workspace.focused"
 command = ["./target/release/space-usage", "--restore"]
 platforms = ["linux", "macos", "windows"]
 
@@ -68,10 +85,11 @@ id = "icons"
 title = "Preview icon tiers"
 command = ["./target/release/space-usage", "--icons"]
 
-# Sidebar status updater: a background daemon that pushes each space's usage
-# as display-only metadata on a spare shell pane; the locally patched herdr
-# renders it as a third row in the sidebar spaces card. Statuses carry a TTL,
-# so the text self-clears if the daemon dies.
+# Sidebar status updater: a background daemon that pushes each space's usage as
+# display-only workspace metadata, which herdr's spaces card renders through the
+# `$usage` token row. Statuses carry a TTL, so the text self-clears if the daemon
+# dies. Enabling also adds that row to herdr's config if it is missing; disabling
+# takes it back out.
 [[actions]]
 id = "status-toggle"
 title = "Toggle sidebar usage status"
