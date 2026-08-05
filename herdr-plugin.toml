@@ -14,7 +14,7 @@
 
 id = "ez-corp.space-usage"
 name = "PC RAM & CPU Usage Overlay"
-version = "1.8.0"
+version = "1.9.0"
 # Oldest herdr with every API this plugin calls: `session.snapshot`, the `tokens`
 # metadata API on `pane.report_metadata` / `workspace.report_metadata`, and
 # `pane.process_info` — all 0.7.5. Diffing the two bundled API schemas
@@ -50,6 +50,13 @@ platforms = ["linux", "macos", "windows"]
 # those only on a server start or a handoff import). So a plugin installed into
 # a herdr that is already running sits inert until the next restart — most of
 # what "I installed it and nothing happened" used to mean.
+#
+# That covers a FIRST install. A reinstall needs one more thing: the previous
+# version's daemon is still running, and `--restore` leaves any live daemon
+# alone, so the replaced binary would keep serving the old build until the next
+# herdr restart. The daemon therefore watches its own executable and hands over
+# to a replacement when it is rebuilt or reinstalled underneath it (see
+# `run_daemon`), since nothing outside it is in a position to notice.
 #
 # `workspace.focused` is the earliest event a real user reliably produces, and
 # `--restore` is idempotent and exits in microseconds once the daemon is live

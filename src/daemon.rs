@@ -120,6 +120,9 @@ pub fn run_daemon() -> crate::Result<()> {
     }
     std::fs::create_dir_all(config::state_dir())?;
     std::fs::write(config::pid_file(), format!("{}\n", std::process::id()))?;
+    // Taken once, before any work: this is the build we are, and the loop
+    // compares it against the file on disk to notice being replaced.
+    let launched = current_stamp();
 
     // Re-read every cycle rather than once here — see `reload_settings`. The
     // first read also fixes the refresh cadence for the life of the daemon,
@@ -131,8 +134,10 @@ pub fn run_daemon() -> crate::Result<()> {
         Ok(client) => client,
         Err(err) => {
             // Nothing to run without a host connection — don't leave a pid file
-            // pointing at a process that is about to exit.
-            let _ = std::fs::remove_file(config::pid_file());
+            // pointing at a process that is about to exit. Guarded: losing the
+            // single-instance race and failing to connect are both ordinary, and
+            // together they would otherwise erase the winner's claim.
+            release_pid_claim();
             return Err(err);
         }
     };
@@ -187,6 +192,22 @@ pub fn run_daemon() -> crate::Result<()> {
         // cadence mid-flight would desynchronise the TTL from the refresh rate.
         settings = reload_settings();
         let (config, labels, icons) = (&settings.config, &settings.labels, settings.icons);
+
+        // Reinstalled or rebuilt underneath us? Then this process is the old
+        // version and nothing else will ever notice: herdr runs no hook on
+        // install or uninstall, and `--restore` — the one thing that fires
+        // afterwards — leaves any live daemon alone by design. So the daemon
+        // that is being replaced is the only party in a position to act, and it
+        // acts on itself. Doing it here rather than from the outside also keeps
+        // the single-instance claim honest: one process decides, releases, and
+        // hands over, instead of two short-lived hooks racing to kill and spawn.
+        if let Some(launched) = launched.as_deref() {
+            if build_changed(launched, current_stamp().as_deref())
+                && !stopping.swap(true, Ordering::SeqCst)
+            {
+                hand_off(Some(&mut client), &tracked);
+            }
+        }
 
         match collect::snapshot(&mut client, window_ms) {
             Ok(spaces) => {
@@ -300,7 +321,7 @@ pub fn disable_updater() -> crate::Result<()> {
         // and must keep it, or this would silently break its single-instance
         // guard.
         #[cfg(windows)]
-        if read_pid_file() == Some(pid) {
+        if claims_pid_file(read_pid_file(), pid) {
             let _ = std::fs::remove_file(config::pid_file());
         }
     }
@@ -596,6 +617,63 @@ fn enabled_message(base: &str, added_row: bool) -> String {
     }
 }
 
+/// Whether the pid file still names `me`, and so is mine to remove.
+///
+/// A daemon that hands over spawns its successor, which immediately writes its
+/// own pid. Removing the file unconditionally on the way out would take that
+/// newcomer's claim with it and leave the next `--restore` free to start a
+/// second updater alongside it. `disable_updater` guards its own removal the
+/// same way, for the same reason.
+fn claims_pid_file(recorded: Option<u32>, me: u32) -> bool {
+    recorded == Some(me)
+}
+
+/// Give up the single-instance claim, but only where it still names us.
+///
+/// Every exit path this process has goes through here, so none of them can undo
+/// a claim that has since passed to another daemon — the failure that leaves one
+/// updater running with no pid file, and so no way for `--disable` or `--toggle`
+/// to ever find it again.
+fn release_pid_claim() {
+    if claims_pid_file(read_pid_file(), std::process::id()) {
+        let _ = std::fs::remove_file(config::pid_file());
+    }
+}
+
+/// [`stamp`] for the executable this process is running from, or `None` if it
+/// cannot be read — see [`build_changed`] for why that answer stands nobody down.
+fn current_stamp() -> Option<String> {
+    let meta = std::fs::metadata(std::env::current_exe().ok()?).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(stamp(mtime, meta.len()))
+}
+
+/// Identity of one build of our executable.
+///
+/// Deliberately not the crate version: a reinstall of the *same* version still
+/// replaces the binary, and local `cargo build` iterations never bump it at all.
+/// Modification time plus length moves on any rebuild that matters, needs no
+/// process introspection, and is a plain string on every platform.
+fn stamp(mtime_nanos: u128, len: u64) -> String {
+    format!("{mtime_nanos}:{len}")
+}
+
+/// Whether the executable on disk is no longer the one this daemon launched
+/// from — i.e. someone reinstalled or rebuilt underneath us.
+///
+/// An unreadable `current` is NOT a change. Failing to stat our own executable
+/// says nothing about which build is running, and standing down on that guess
+/// would blank the sidebar for no reason; the next cycle asks again seconds
+/// later.
+fn build_changed(launched: &str, current: Option<&str>) -> bool {
+    matches!(current, Some(current) if current != launched)
+}
+
 /// Whether `pid` is live and one of *our* processes, compared by executable
 /// image name (`/proc/<pid>/comm` on Linux, the Toolhelp exe name on Windows)
 /// against our own.
@@ -630,20 +708,45 @@ fn is_our_process(pid: u32) -> bool {
     }
 }
 
-/// Clear tracked statuses + title, unlink the pid file, and `exit(0)`.
+/// Clear tracked statuses + title, give up the pid claim, and `exit(0)`.
 ///
 /// Shared by the signal thread (own connection) and the five-failure path (main
 /// connection). `client` is `None` only when no socket could be opened, in which
-/// case the pid file is still removed before exiting. Never returns.
+/// case the claim is still given up before exiting. Never returns.
 fn shutdown(client: Option<&mut Herdr>, tracked: &Mutex<Tracked>) -> ! {
+    release(client, tracked);
+    std::process::exit(0);
+}
+
+/// Stand down in favour of a replacement built from the binary now on disk.
+///
+/// The ordering is the whole point. [`release`] unlinks the pid file *before*
+/// the replacement is spawned, so the newcomer's single-instance check finds the
+/// claim free and takes it. Spawning first would have it look up, see us still
+/// holding the pid, and exit immediately — leaving the sidebar served by the
+/// build we just decided to retire.
+///
+/// A spawn that fails costs nothing permanent: `--restore` runs on every
+/// `workspace.focused`, so the next space switch starts one.
+fn hand_off(client: Option<&mut Herdr>, tracked: &Mutex<Tracked>) -> ! {
+    release(client, tracked);
+    let _ = spawn_daemon();
+    std::process::exit(0);
+}
+
+/// Clear every status this run pushed and give up the single-instance claim.
+///
+/// Shared by [`shutdown`] and [`hand_off`] so the two cannot drift on what
+/// "stop being the updater" means — the only difference between them is what
+/// happens afterwards.
+fn release(client: Option<&mut Herdr>, tracked: &Mutex<Tracked>) {
     if let Some(client) = client {
         if let Ok(tracked) = tracked.lock() {
             clear_all(client, &tracked);
         }
         let _ = client.window_title_clear();
     }
-    let _ = std::fs::remove_file(config::pid_file());
-    std::process::exit(0);
+    release_pid_claim();
 }
 
 /// Idle forever while the signal thread completes its shutdown and `exit(0)`s the
@@ -686,7 +789,7 @@ fn spawn_watchdog(heartbeat: Arc<AtomicU64>, started: std::time::Instant, interv
             .as_secs()
             .saturating_sub(heartbeat.load(Ordering::SeqCst));
         if stalled >= deadline {
-            let _ = std::fs::remove_file(config::pid_file());
+            release_pid_claim();
             std::process::exit(1);
         }
     });
@@ -755,6 +858,47 @@ mod tests {
     /// Terse [`Battery`] builder for the cell tests.
     fn bat(percent: f64, state: State) -> Battery {
         Battery { percent, state }
+    }
+
+    // ---- standing down when the binary underneath us is replaced -------------
+
+    #[test]
+    fn both_halves_of_the_stamp_can_move_it_on_their_own() {
+        // Size rides along with mtime because neither alone is enough: a coarse
+        // filesystem clock or a restored timestamp can repeat an mtime, and a
+        // rebuild can land on the same length.
+        assert_ne!(stamp(42, 500), stamp(42, 505));
+        assert_ne!(stamp(42, 500), stamp(43, 500));
+        assert_eq!(stamp(42, 500), stamp(42, 500));
+    }
+
+    #[test]
+    fn a_daemon_gives_up_only_a_claim_that_still_names_it() {
+        // Handing over spawns a successor that writes its own pid. If the
+        // outgoing daemon then deleted the file regardless, it would erase the
+        // newcomer's single-instance claim and let a third daemon start
+        // alongside it — which is how two updaters end up pushing the same rows.
+        assert!(claims_pid_file(Some(42), 42));
+        assert!(!claims_pid_file(Some(43), 42));
+        assert!(!claims_pid_file(None, 42));
+    }
+
+    #[test]
+    fn a_replaced_binary_is_a_changed_build() {
+        assert!(build_changed("111:500", Some("222:505")));
+    }
+
+    #[test]
+    fn the_binary_we_launched_from_is_not_a_changed_build() {
+        assert!(!build_changed("222:505", Some("222:505")));
+    }
+
+    #[test]
+    fn an_unreadable_binary_is_not_a_changed_build() {
+        // Statting our own executable can fail — deleted mid-upgrade, an odd
+        // mount. Standing down on that guess would blank the sidebar for no
+        // reason, and the next cycle asks again seconds later.
+        assert!(!build_changed("111:500", None));
     }
 
     #[test]
