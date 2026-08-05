@@ -559,12 +559,21 @@ fn bootstrap_sidebar() -> bool {
         return false;
     }
     let mode = config::load_config().mode;
-    let added = herdr_config::ensure_usage_row(mode).is_ok_and(Change::needs_reload);
+    // Mark it done only when the edit actually settled the question — written,
+    // or already present. An Err leaves the marker alone so the next `--restore`
+    // tries again, and those are frequent (every server start, every space
+    // focus). Marking regardless would turn one unwritable-config moment into a
+    // permanently blank sidebar, recoverable only by deleting a marker file the
+    // user has no reason to know exists.
+    let Ok(change) = herdr_config::ensure_usage_row(mode) else {
+        return false;
+    };
     set_wanted(&marker, Wanted::Enabled);
-    if added {
+    if change.needs_reload() {
         reload_herdr_config();
+        return true;
     }
-    added
+    false
 }
 
 /// Ask herdr to re-read its config so a row we just wrote renders now rather
