@@ -49,6 +49,19 @@ impl Mode {
     }
 }
 
+/// How the narrow RAM cell renders its number (plugin `config.toml`
+/// `ram_display`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RamDisplay {
+    /// Percent of the machine's total, falling back to the compact absolute
+    /// form when the total is unreadable.
+    Percent,
+    /// Always the compact absolute form (`513M` / `1.5G`), even when a percent
+    /// could be computed — for readers who want the figure itself, not its
+    /// share of whatever this machine happens to have.
+    Absolute,
+}
+
 /// Plugin user config from `$HERDR_PLUGIN_CONFIG_DIR/config.toml`.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -66,6 +79,9 @@ pub struct Config {
     /// gives it meaning, so an unknown value auto-detects instead of failing
     /// here.
     pub icons: String,
+    /// How the narrow RAM cell renders: percent of the machine's total (the
+    /// default), or always the compact absolute form.
+    pub ram_display: RamDisplay,
     /// Naming for the battery cell, overriding herdr's `[ui] battery_label`.
     ///
     /// Battery lives here rather than only in herdr's config because herdr has
@@ -73,13 +89,26 @@ pub struct Config {
     /// putting it in herdr's `[ui]` makes `herdr server reload-config` report
     /// `unknown config key ui.battery_label; ignoring key` on every reload.
     /// Harmless but noisy, and needless — nothing outside this plugin renders a
-    /// battery, so there is no second surface to keep in step. `cpu_label` and
-    /// `ram_label` stay in herdr's config precisely because the sidebar's
-    /// system-usage header does share those.
+    /// battery, so there is no second surface to keep in step.
     ///
     /// Names the battery wherever the plugin draws it: the window title, the
     /// report's total line, and the `--icons` preview.
     pub battery_label: Option<String>,
+    /// Per-key overrides for herdr's `[ui] cpu_label` / `ram_label`.
+    ///
+    /// Unset (the default) keeps herdr's config the single source of truth for
+    /// these two, which is what keeps a patched build's system-usage header and
+    /// these rows agreeing. Setting one here is for stock builds, where herdr
+    /// has no header and does not know the keys — putting them in herdr's
+    /// `[ui]` earns the same `unknown config key` noise on every reload that
+    /// moved `battery_label` into this file. The trade is explicit: a plugin
+    /// override names only what this plugin draws, so a header (if you later
+    /// run a patched build) will not follow it.
+    ///
+    /// Unlike the herdr-side keys, an EMPTY value here is not read as unset —
+    /// see [`parse_config`].
+    pub cpu_label: Option<String>,
+    pub ram_label: Option<String>,
 }
 
 impl Default for Config {
@@ -90,7 +119,10 @@ impl Default for Config {
             window_title_totals: true,
             battery: true,
             icons: "auto".to_string(),
+            ram_display: RamDisplay::Percent,
             battery_label: None,
+            cpu_label: None,
+            ram_label: None,
         }
     }
 }
@@ -177,10 +209,18 @@ impl Labels {
 
     /// Apply the plugin config's own label overrides on top of herdr's.
     ///
-    /// Only battery has one, for the reason given on [`Config::battery_label`].
-    /// Returning `Self` keeps the load-then-override pair a single expression at
-    /// each call site, so no caller can load the labels and forget the overrides.
+    /// Each key wins independently, so overriding one label does not detach the
+    /// others from herdr's config — see [`Config::battery_label`] and
+    /// [`Config::cpu_label`] for why each override exists. Returning `Self`
+    /// keeps the load-then-override pair a single expression at each call site,
+    /// so no caller can load the labels and forget the overrides.
     pub fn with_overrides(mut self, config: &Config) -> Self {
+        if let Some(label) = &config.cpu_label {
+            self.cpu = Some(label.clone());
+        }
+        if let Some(label) = &config.ram_label {
+            self.ram = Some(label.clone());
+        }
         if let Some(label) = &config.battery_label {
             self.battery = Some(label.clone());
         }
@@ -189,12 +229,22 @@ impl Labels {
 
     /// The word to print on surfaces that always spell one out regardless of
     /// tier — the full-width terminal report's columns and its total line.
+    ///
+    /// An empty label (the plugin config's "name nothing") falls back to the
+    /// default word here: the report's columns need a word to head them, and a
+    /// blank one would leave a bare figure floating in a wide table.
     pub fn cpu_word(&self) -> &str {
-        self.cpu().unwrap_or(DEFAULT_CPU_LABEL)
+        match self.cpu() {
+            Some(word) if !word.is_empty() => word,
+            _ => DEFAULT_CPU_LABEL,
+        }
     }
 
     pub fn ram_word(&self) -> &str {
-        self.ram().unwrap_or(DEFAULT_RAM_LABEL)
+        match self.ram() {
+            Some(word) if !word.is_empty() => word,
+            _ => DEFAULT_RAM_LABEL,
+        }
     }
 }
 
@@ -363,9 +413,10 @@ pub(crate) fn herdr_config_path() -> PathBuf {
 ///
 /// Recognised keys: `mode` (`agents-panel` | `sidebar`), `interval_seconds`
 /// (numeric `>= 1`), `window_title_totals` and `battery` (`false` only when
-/// they equal the literal `false`, any other value is truthy), and `icons`
-/// (a tier name kept verbatim for [`crate::icons::resolve`]). Unknown keys are
-/// ignored.
+/// they equal the literal `false`, any other value is truthy), `icons`
+/// (a tier name kept verbatim for [`crate::icons::resolve`]), `ram_display`
+/// (`percent` | `gb` | `absolute`), and the three label overrides. Unknown
+/// keys are ignored.
 fn parse_config(text: &str) -> Config {
     let mut cfg = Config::default();
     for line in text.split('\n') {
@@ -391,7 +442,23 @@ fn parse_config(text: &str) -> Config {
                 }
             }
             "window_title_totals" => cfg.window_title_totals = value != "false",
+            // `gb` is the name users reach for ("show it in GB"); `absolute` is
+            // what the setting actually does, since the cell stays in MB below
+            // a gigabyte. Both spellings land on the same behaviour.
+            "ram_display" if value == "gb" || value == "absolute" => {
+                cfg.ram_display = RamDisplay::Absolute
+            }
+            "ram_display" if value == "percent" => cfg.ram_display = RamDisplay::Percent,
             "battery_label" => cfg.battery_label = non_empty(value),
+            // Unlike the herdr-side labels, EMPTY is not read as unset here.
+            // The herdr rule exists because herdr ships those keys as blank
+            // commented templates, so a blank there is usually an accident.
+            // Nothing ships these two keys at all — writing `cpu_label = ""`
+            // in the plugin's own file can only be the deliberate "name
+            // nothing" that [`crate::icons::IconSet`] renders as the bare
+            // number.
+            "cpu_label" => cfg.cpu_label = Some(value.to_string()),
+            "ram_label" => cfg.ram_label = Some(value.to_string()),
             "battery" => cfg.battery = value != "false",
             // Stored raw: naming the tiers in two places would let the parser
             // and `icons::resolve` disagree about what `Nerd-Font` means.
@@ -693,6 +760,65 @@ mod tests {
         // With nothing set plugin-side, herdr's value still applies.
         let bare = Config::default();
         assert_eq!(from_herdr.with_overrides(&bare).battery(), Some("HERDR"));
+    }
+
+    #[test]
+    fn plugin_cpu_and_ram_label_overrides_win_per_key() {
+        // Each key overrides independently: naming one metric plugin-side must
+        // not detach the other from herdr's config.
+        let herdr = parse_herdr_labels("[ui]\ncpu_label = \"H\"\nram_label = \"R\"\n");
+        let cfg = parse_config("ram_label = 'M'\n");
+        let labels = herdr.with_overrides(&cfg);
+        assert_eq!(labels.cpu(), Some("H")); // untouched key keeps herdr's value
+        assert_eq!(labels.ram(), Some("M"));
+
+        let bare = parse_config("");
+        assert_eq!(bare.cpu_label, None);
+        assert_eq!(bare.ram_label, None);
+    }
+
+    #[test]
+    fn an_empty_plugin_label_is_name_nothing_not_unset() {
+        // The herdr-side blank-means-unset rule exists because herdr ships the
+        // keys as commented templates with empty quotes. Nothing ships these
+        // plugin keys at all, so an empty value here can only be deliberate —
+        // it reaches the renderer as the bare-number "name nothing".
+        let cfg = parse_config("cpu_label = \"\"\n");
+        assert_eq!(cfg.cpu_label.as_deref(), Some(""));
+        let labels = Labels::default().with_overrides(&cfg);
+        assert_eq!(labels.cpu(), Some(""));
+        assert_eq!(labels.ram(), None); // the other key stays unset
+
+        // Surfaces that always spell a word still get one — a wide report
+        // column headed by nothing would be a bare figure floating in a table.
+        assert_eq!(labels.cpu_word(), "cpu");
+    }
+
+    #[test]
+    fn ram_display_defaults_to_percent_and_ignores_unknown_values() {
+        assert_eq!(parse_config("").ram_display, RamDisplay::Percent);
+        assert_eq!(
+            parse_config("ram_display = \"both\"").ram_display,
+            RamDisplay::Percent
+        );
+    }
+
+    #[test]
+    fn ram_display_gb_and_absolute_both_select_the_absolute_form() {
+        // `gb` is what users reach for, `absolute` is what it does — the cell
+        // stays in MB below a gigabyte either way.
+        assert_eq!(
+            parse_config("ram_display = \"gb\"").ram_display,
+            RamDisplay::Absolute
+        );
+        assert_eq!(
+            parse_config("ram_display = \"absolute\"").ram_display,
+            RamDisplay::Absolute
+        );
+        assert_eq!(
+            parse_config("ram_display = \"percent\"").ram_display,
+            RamDisplay::Percent
+        );
     }
 
     #[test]

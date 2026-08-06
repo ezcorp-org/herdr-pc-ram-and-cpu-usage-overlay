@@ -170,6 +170,7 @@ interval_seconds = 5        # 1..28800; statuses get a TTL of three intervals
 window_title_totals = true
 battery = true              # machine-wide cell on the title/report, not the rows
 icons = "auto"              # auto | text | unicode | nerdfont | emoji
+ram_display = "percent"     # or "gb" — always the compact absolute (513M / 1.5G)
 ```
 
 - **sidebar** (default): renders usage inside each spaces card, under the branch
@@ -344,6 +345,24 @@ every `herdr server reload-config` report
 renders a battery, so there is no second surface to keep in step. `cpu_label`
 and `ram_label` live in herdr's config precisely because the header does share
 them.
+
+**No header to share with?** On a stock (unpatched) build herdr draws no
+system-usage header, so `cpu_label` / `ram_label` are not keys it knows either —
+they still work from herdr's `[ui]`, but `herdr config check` and every reload
+flag them as unknown, the same noise that moved `battery_label` out. For that
+case the plugin's own `config.toml` accepts the same two keys, each overriding
+the herdr-side value only when set:
+
+```toml
+cpu_label = "C"
+ram_label = ""          # empty = name nothing: just the figure
+```
+
+Unlike herdr's file, where a blank label reads as unset (see below), nothing
+ships these plugin keys as blank templates — an empty value here is honoured as
+the deliberate "name nothing". Leave a key out to keep herdr's value; on a
+patched build, remember the header follows only the herdr-side keys, so
+overriding here lets the two surfaces name things differently.
 
 **Applying a change.** The updater re-reads both files every refresh, so the
 rows follow within one interval — no `status-toggle` needed. herdr's header
