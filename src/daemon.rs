@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use crate::battery::Battery;
 use crate::collect::{self, PSEUDO_AGENT};
-use crate::config::{self, Config, Labels, Mode, Wanted};
+use crate::config::{self, Config, Labels, Mode, RamDisplay, Wanted};
 use crate::herdr::{self, Herdr};
 use crate::herdr_config::{self, Change};
 use crate::icons::IconSet;
@@ -380,7 +380,7 @@ pub fn push_statuses(
     let ttl_ms = status_ttl_ms(config.interval_seconds);
 
     for sp in spaces {
-        let status = status_line(sp, labels, icons);
+        let status = status_line(sp, labels, icons, config.ram_display);
 
         if config.mode == Mode::AgentsPanel {
             // Drop stale claims from earlier runs so a space keeps one entry.
@@ -483,7 +483,13 @@ pub fn set_title_totals(
     labels: &Labels,
     icons: IconSet,
 ) {
-    let title = title_totals(spaces, labels, icons, config.battery_reading());
+    let title = title_totals(
+        spaces,
+        labels,
+        icons,
+        config.ram_display,
+        config.battery_reading(),
+    );
     let _ = client.window_title_set(&title);
 }
 
@@ -496,6 +502,7 @@ fn title_totals(
     spaces: &[Space],
     labels: &Labels,
     icons: IconSet,
+    ram_display: RamDisplay,
     battery: Option<Battery>,
 ) -> String {
     let mut cpu = 0.0;
@@ -506,7 +513,7 @@ fn title_totals(
     }
     format!(
         "spaces · {}",
-        render::totals_row(cpu, ram_mb, labels, icons, battery),
+        render::totals_row(cpu, ram_mb, labels, icons, ram_display, battery),
     )
 }
 
@@ -824,8 +831,8 @@ fn status_ttl_ms(interval_seconds: u64) -> u64 {
 /// No battery: it is one reading for the whole machine, so a copy of it on every
 /// space's row would read as if the space had its own. [`title_totals`] and the
 /// terminal report's total line are where it belongs — see [`render::usage_row`].
-fn status_line(sp: &Space, labels: &Labels, icons: IconSet) -> String {
-    render::usage_row(sp.cpu, sp.ram_mb, labels, icons)
+fn status_line(sp: &Space, labels: &Labels, icons: IconSet, ram_display: RamDisplay) -> String {
+    render::usage_row(sp.cpu, sp.ram_mb, labels, icons, ram_display)
 }
 
 /// Best-effort release of our pseudo-agent on `pane_id` (a closed pane errors and
@@ -920,14 +927,26 @@ mod tests {
         // The RAM cell depends on the host's MemTotal (percent when readable,
         // compact absolute when not), so assert the CPU rounding + label layout,
         // which are total-independent. `render::ram_cell_of` pins both branches.
-        let line = status_line(&space(5.6, 0.0), &labels, IconSet::Text);
+        let line = status_line(
+            &space(5.6, 0.0),
+            &labels,
+            IconSet::Text,
+            RamDisplay::Percent,
+        );
         assert!(line.starts_with("CPU 6% · MEM "), "got: {line}");
     }
 
     #[test]
     fn status_line_rounds_cpu_half_away_from_zero() {
         let labels = Labels::default();
-        let line = |cpu| status_line(&space(cpu, 0.0), &labels, IconSet::Text);
+        let line = |cpu| {
+            status_line(
+                &space(cpu, 0.0),
+                &labels,
+                IconSet::Text,
+                RamDisplay::Percent,
+            )
+        };
         assert!(line(2.5).starts_with("cpu 3%"));
         assert!(line(2.4).starts_with("cpu 2%"));
     }
@@ -944,12 +963,13 @@ mod tests {
         // whether this box has a pack does not change either side.
         let labels = Labels::default();
         let sp = space(26.0, 0.0);
-        let row = status_line(&sp, &labels, IconSet::Unicode);
+        let row = status_line(&sp, &labels, IconSet::Unicode, RamDisplay::Percent);
         let machine = render::totals_row(
             sp.cpu,
             sp.ram_mb,
             &labels,
             IconSet::Unicode,
+            RamDisplay::Percent,
             Some(bat(74.0, State::Discharging)),
         );
 
@@ -970,7 +990,7 @@ mod tests {
             (IconSet::Emoji, "💻26%"),
         ];
         for (icons, cpu) in expected {
-            let line = status_line(&sp, &labels, icons);
+            let line = status_line(&sp, &labels, icons, RamDisplay::Percent);
             assert!(line.starts_with(&format!("{cpu} · ")), "{icons:?}: {line}");
             // Each tier names the battery its own way, so check all three marks
             // against every row — a glyph tier smuggling one back in would slip
@@ -993,6 +1013,7 @@ mod tests {
                 &[space(26.0, 0.0)],
                 &labels,
                 IconSet::Unicode,
+                RamDisplay::Percent,
                 Some(bat(74.0, state)),
             )
         };
@@ -1010,9 +1031,10 @@ mod tests {
             &spaces,
             &labels,
             IconSet::Text,
+            RamDisplay::Percent,
             Some(bat(74.0, State::Full)),
         );
-        let without = title_totals(&spaces, &labels, IconSet::Text, None);
+        let without = title_totals(&spaces, &labels, IconSet::Text, RamDisplay::Percent, None);
 
         // 10.0 + 16.4 = 26.4, rounded once over the total rather than per space.
         assert!(with.starts_with("spaces · cpu 26% · ram "), "got: {with}");

@@ -17,7 +17,7 @@ use serde_json::Number;
 
 use crate::battery::{Battery, State};
 use crate::collect;
-use crate::config::{Config, Labels, DEFAULT_RAM_LABEL};
+use crate::config::{Config, Labels, RamDisplay, DEFAULT_RAM_LABEL};
 use crate::herdr::Herdr;
 use crate::icons::IconSet;
 use crate::model::Space;
@@ -114,16 +114,19 @@ fn compact_ram(mb: f64) -> String {
 const CELL_SEPARATOR: &str = " · ";
 
 /// The narrow RAM cell — the tier's rendering of RAM as a percent of the
-/// machine's total (`ram ░8%`).
+/// machine's total (`ram ░8%`), or the compact absolute when `ram_display`
+/// says so.
 ///
 /// RAM is the one metric that is not simply a percentage. With MemTotal
 /// unreadable there is nothing to be a percentage *of*, so the cell falls back
-/// to the compact absolute (`ram 1.5G`) the sidebar has always shown there. The
-/// tier deliberately contributes nothing in that branch: a gauge glyph measures
-/// a level, and drawing one beside an absolute figure would be inventing a
+/// to the compact absolute (`ram 1.5G`) the sidebar has always shown there —
+/// and `ram_display = "gb"` picks that same form on purpose, for readers who
+/// want the figure rather than its share of this machine. The tier deliberately
+/// contributes nothing in either absolute branch: a gauge glyph measures a
+/// level, and drawing one beside an absolute figure would be inventing a
 /// reading we do not have.
-fn ram_cell(icons: IconSet, label: Option<&str>, mb: f64) -> String {
-    ram_cell_of(icons, label, mb, proc::mem_total_mb())
+fn ram_cell(icons: IconSet, label: Option<&str>, mb: f64, display: RamDisplay) -> String {
+    ram_cell_of(icons, label, mb, display, proc::mem_total_mb())
 }
 
 /// [`ram_cell`] with the machine total injected.
@@ -131,16 +134,31 @@ fn ram_cell(icons: IconSet, label: Option<&str>, mb: f64) -> String {
 /// The seam exists for the tests: the real total is read once and cached for the
 /// process, so a test host with a readable `/proc/meminfo` could never reach the
 /// fallback branch (and one without it could never reach the percent branch).
-fn ram_cell_of(icons: IconSet, label: Option<&str>, mb: f64, mem_total_mb: f64) -> String {
-    if mem_total_mb > 0.0 {
+fn ram_cell_of(
+    icons: IconSet,
+    label: Option<&str>,
+    mb: f64,
+    display: RamDisplay,
+    mem_total_mb: f64,
+) -> String {
+    if display == RamDisplay::Percent && mem_total_mb > 0.0 {
         // Same arithmetic and rounding as `proc::ram_pct`, so the Text tier
         // reproduces the pre-icons sidebar byte for byte.
         icons.ram(label, 100.0 * mb / mem_total_mb)
     } else {
-        // No total to be a percent OF, so the tier contributes nothing: a gauge
-        // glyph measures a level, and drawing one beside an absolute figure
-        // would invent a reading we do not have.
-        format!("{} {}", label.unwrap_or(DEFAULT_RAM_LABEL), compact_ram(mb))
+        absolute_ram_cell(label, mb)
+    }
+}
+
+/// The absolute RAM cell — `ram 1.5G`, with the same label rules as
+/// [`IconSet`]'s rendering: an unset label gets the default word (the tier
+/// contributes nothing beside an absolute figure), and an empty one is the
+/// deliberate "name nothing" — just the figure, no stray leading space.
+fn absolute_ram_cell(label: Option<&str>, mb: f64) -> String {
+    match label {
+        Some("") => compact_ram(mb),
+        Some(label) => format!("{label} {}", compact_ram(mb)),
+        None => format!("{DEFAULT_RAM_LABEL} {}", compact_ram(mb)),
     }
 }
 
@@ -168,10 +186,16 @@ pub fn metric_row(cpu: String, ram: String, battery: Option<String>) -> String {
 
 /// The two per-space cells both narrow rows start with, built once so the row
 /// that carries a battery and the row that cannot still agree on the first two.
-fn usage_cells(cpu: f64, ram_mb: f64, labels: &Labels, icons: IconSet) -> (String, String) {
+fn usage_cells(
+    cpu: f64,
+    ram_mb: f64,
+    labels: &Labels,
+    icons: IconSet,
+    ram_display: RamDisplay,
+) -> (String, String) {
     (
         icons.cpu(labels.cpu(), cpu),
-        ram_cell(icons, labels.ram(), ram_mb),
+        ram_cell(icons, labels.ram(), ram_mb, ram_display),
     )
 }
 
@@ -184,8 +208,14 @@ fn usage_cells(cpu: f64, ram_mb: f64, labels: &Labels, icons: IconSet) -> (Strin
 /// the terminal report on its total line, and (on a patched build) herdr's own
 /// sidebar header. Keeping the parameter off the signature is what stops a
 /// future caller from putting it back by accident.
-pub fn usage_row(cpu: f64, ram_mb: f64, labels: &Labels, icons: IconSet) -> String {
-    let (cpu_cell, ram) = usage_cells(cpu, ram_mb, labels, icons);
+pub fn usage_row(
+    cpu: f64,
+    ram_mb: f64,
+    labels: &Labels,
+    icons: IconSet,
+    ram_display: RamDisplay,
+) -> String {
+    let (cpu_cell, ram) = usage_cells(cpu, ram_mb, labels, icons, ram_display);
     metric_row(cpu_cell, ram, None)
 }
 
@@ -199,9 +229,10 @@ pub fn totals_row(
     ram_mb: f64,
     labels: &Labels,
     icons: IconSet,
+    ram_display: RamDisplay,
     battery: Option<Battery>,
 ) -> String {
-    let (cpu_cell, ram) = usage_cells(cpu, ram_mb, labels, icons);
+    let (cpu_cell, ram) = usage_cells(cpu, ram_mb, labels, icons, ram_display);
     metric_row(cpu_cell, ram, battery_cell(icons, labels, battery))
 }
 
@@ -583,12 +614,18 @@ mod tests {
     fn ram_cell_rounds_exactly_as_ram_pct_does() {
         // The pre-icons sidebar showed `proc::ram_pct`, so the Text tier has to
         // reproduce it byte for byte — these are that function's own cases.
-        assert_eq!(ram_cell_of(IconSet::Text, None, 1024.0, 16384.0), "ram 6%");
+        assert_eq!(
+            ram_cell_of(IconSet::Text, None, 1024.0, RamDisplay::Percent, 16384.0),
+            "ram 6%"
+        );
         // 100 * 250 / 10000 = 2.5 -> 3 (half away from zero).
-        assert_eq!(ram_cell_of(IconSet::Text, None, 250.0, 10000.0), "ram 3%");
+        assert_eq!(
+            ram_cell_of(IconSet::Text, None, 250.0, RamDisplay::Percent, 10000.0),
+            "ram 3%"
+        );
         // The tier decorates that same number, it does not change it.
         assert_eq!(
-            ram_cell_of(IconSet::Unicode, None, 1024.0, 16384.0),
+            ram_cell_of(IconSet::Unicode, None, 1024.0, RamDisplay::Percent, 16384.0),
             "ram ░6%",
         );
     }
@@ -598,10 +635,63 @@ mod tests {
         // No MemTotal means no scale to be a percentage of. The absolute is
         // shown with the label and *no* gauge: a gauge glyph claims a level, and
         // in this branch we have none to claim.
-        assert_eq!(ram_cell_of(IconSet::Unicode, None, 1536.0, 0.0), "ram 1.5G");
-        assert_eq!(ram_cell_of(IconSet::Text, None, 512.0, 0.0), "ram 512M");
+        assert_eq!(
+            ram_cell_of(IconSet::Unicode, None, 1536.0, RamDisplay::Percent, 0.0),
+            "ram 1.5G"
+        );
+        assert_eq!(
+            ram_cell_of(IconSet::Text, None, 512.0, RamDisplay::Percent, 0.0),
+            "ram 512M"
+        );
         // Same for a nonsensical total, which would otherwise divide by zero.
-        assert_eq!(ram_cell_of(IconSet::Emoji, None, 0.0, -1.0), "ram 0M");
+        assert_eq!(
+            ram_cell_of(IconSet::Emoji, None, 0.0, RamDisplay::Percent, -1.0),
+            "ram 0M"
+        );
+    }
+
+    #[test]
+    fn ram_display_absolute_ignores_a_readable_total() {
+        // `ram_display = "gb"` asks for the figure itself, so a perfectly
+        // readable MemTotal must not turn it back into a percent. Same absolute
+        // form as the no-total fallback, and gauge-free for the same reason.
+        let cell = |icons| ram_cell_of(icons, None, 1536.0, RamDisplay::Absolute, 16384.0);
+        assert_eq!(cell(IconSet::Text), "ram 1.5G");
+        assert_eq!(cell(IconSet::Unicode), "ram 1.5G");
+        assert_eq!(
+            ram_cell_of(IconSet::Text, None, 512.0, RamDisplay::Absolute, 16384.0),
+            "ram 512M"
+        );
+    }
+
+    #[test]
+    fn an_empty_ram_label_leaves_just_the_figure_in_the_absolute_cell() {
+        // The plugin config's "name nothing": no word and no stray leading
+        // space, whether the absolute was chosen or fallen back to.
+        assert_eq!(
+            ram_cell_of(
+                IconSet::Text,
+                Some(""),
+                1536.0,
+                RamDisplay::Absolute,
+                16384.0
+            ),
+            "1.5G"
+        );
+        assert_eq!(
+            ram_cell_of(IconSet::Text, Some(""), 1536.0, RamDisplay::Percent, 0.0),
+            "1.5G"
+        );
+    }
+
+    #[test]
+    fn a_row_with_empty_labels_and_absolute_ram_is_just_the_figures() {
+        // cpu_label = "" / ram_label = "" / ram_display = "gb" in the plugin
+        // config: bare numbers, still separated — the compact row this feature
+        // exists for.
+        let labels = Labels::new(Some(""), Some(""), None);
+        let row = usage_row(26.0, 1536.0, &labels, IconSet::Text, RamDisplay::Absolute);
+        assert_eq!(row, "26% · 1.5G");
     }
 
     #[test]
@@ -623,7 +713,13 @@ mod tests {
         // of 16384 MB is 8%) — the row builders read that total from the host.
         let row = metric_row(
             IconSet::Unicode.cpu(None, 26.0),
-            ram_cell_of(IconSet::Unicode, None, 1310.72, 16384.0),
+            ram_cell_of(
+                IconSet::Unicode,
+                None,
+                1310.72,
+                RamDisplay::Percent,
+                16384.0,
+            ),
             battery_cell(
                 IconSet::Unicode,
                 &Labels::default(),
