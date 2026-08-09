@@ -93,15 +93,24 @@ pub struct Config {
     ///
     /// Names the battery wherever the plugin draws it: the window title, the
     /// report's total line, and the `--icons` preview.
+    ///
+    /// Unlike the herdr-side keys, an EMPTY value here is not read as unset —
+    /// see [`parse_config`].
     pub battery_label: Option<String>,
     /// Per-key overrides for herdr's `[ui] cpu_label` / `ram_label`.
     ///
     /// Unset (the default) keeps herdr's config the single source of truth for
     /// these two, which is what keeps a patched build's system-usage header and
-    /// these rows agreeing. Setting one here is for stock builds, where herdr
-    /// has no header and does not know the keys — putting them in herdr's
-    /// `[ui]` earns the same `unknown config key` noise on every reload that
-    /// moved `battery_label` into this file. The trade is explicit: a plugin
+    /// these rows agreeing. That default is the one to leave alone unless you
+    /// want the two surfaces to disagree.
+    ///
+    /// Setting one here is for the case herdr's config cannot express: naming
+    /// what THIS plugin draws without touching a key herdr also reads. On a
+    /// stock build herdr accepts `ui.cpu_label` / `ui.ram_label` but draws no
+    /// system-usage header of its own, so those keys reach nothing but this
+    /// plugin anyway — and some users would rather keep every plugin-only
+    /// setting in the plugin's own file, next to `icons` and `battery_label`,
+    /// than spread them across two configs. The trade is explicit: a plugin
     /// override names only what this plugin draws, so a header (if you later
     /// run a patched build) will not follow it.
     ///
@@ -415,8 +424,9 @@ pub(crate) fn herdr_config_path() -> PathBuf {
 /// (numeric `>= 1`), `window_title_totals` and `battery` (`false` only when
 /// they equal the literal `false`, any other value is truthy), `icons`
 /// (a tier name kept verbatim for [`crate::icons::resolve`]), `ram_display`
-/// (`percent` | `gb` | `absolute`), and the three label overrides. Unknown
-/// keys are ignored.
+/// (`percent` | `gb` | `absolute`, case-insensitive), and the three label
+/// overrides — `cpu_label`, `ram_label`, `battery_label` — where an empty value
+/// means "name nothing" rather than unset. Unknown keys are ignored.
 fn parse_config(text: &str) -> Config {
     let mut cfg = Config::default();
     for line in text.split('\n') {
@@ -444,19 +454,25 @@ fn parse_config(text: &str) -> Config {
             "window_title_totals" => cfg.window_title_totals = value != "false",
             // `gb` is the name users reach for ("show it in GB"); `absolute` is
             // what the setting actually does, since the cell stays in MB below
-            // a gigabyte. Both spellings land on the same behaviour.
-            "ram_display" if value == "gb" || value == "absolute" => {
-                cfg.ram_display = RamDisplay::Absolute
-            }
-            "ram_display" if value == "percent" => cfg.ram_display = RamDisplay::Percent,
-            "battery_label" => cfg.battery_label = non_empty(value),
-            // Unlike the herdr-side labels, EMPTY is not read as unset here.
-            // The herdr rule exists because herdr ships those keys as blank
-            // commented templates, so a blank there is usually an accident.
-            // Nothing ships these two keys at all — writing `cpu_label = ""`
-            // in the plugin's own file can only be the deliberate "name
-            // nothing" that [`crate::icons::IconSet`] renders as the bare
-            // number.
+            // a gigabyte. Both spellings land on the same behaviour, and case is
+            // folded because `icons` in this same file already forgives it —
+            // one file that accepts `Emoji` but not `GB` is a trap, not a rule.
+            "ram_display" => match value.trim().to_ascii_lowercase().as_str() {
+                "gb" | "absolute" => cfg.ram_display = RamDisplay::Absolute,
+                "percent" => cfg.ram_display = RamDisplay::Percent,
+                // Unknown spelling: keep the default rather than fail, matching
+                // how `mode` and `icons` treat a value they do not recognise.
+                _ => {}
+            },
+            // EMPTY is a deliberate "name nothing" for all three, NOT unset.
+            //
+            // This is the opposite of the herdr-side rule, and the difference is
+            // in what ships: herdr ships these keys as blank commented templates,
+            // so a blank there is usually someone uncommenting a line they have
+            // not filled in yet. Nothing ships them in the plugin's own file, so
+            // a blank here can only be the deliberate bare number that
+            // [`crate::icons::labelled`] renders.
+            "battery_label" => cfg.battery_label = Some(value.to_string()),
             "cpu_label" => cfg.cpu_label = Some(value.to_string()),
             "ram_label" => cfg.ram_label = Some(value.to_string()),
             "battery" => cfg.battery = value != "false",
@@ -792,6 +808,27 @@ mod tests {
         // Surfaces that always spell a word still get one — a wide report
         // column headed by nothing would be a bare figure floating in a table.
         assert_eq!(labels.cpu_word(), "cpu");
+
+        // Both words, not just cpu: the report has a RAM column with exactly the
+        // same blank-heading failure.
+        let ram = Labels::default().with_overrides(&parse_config("ram_label = \"\"\n"));
+        assert_eq!(ram.ram(), Some(""));
+        assert_eq!(ram.ram_word(), "ram");
+    }
+
+    #[test]
+    fn every_plugin_label_reads_an_empty_value_the_same_way() {
+        // One file, one rule. `battery_label` used to read a blank as unset
+        // while the other two read it as "name nothing", which made the same
+        // three characters mean opposite things three lines apart.
+        let cfg = parse_config("cpu_label = \"\"\nram_label = \"\"\nbattery_label = \"\"\n");
+        assert_eq!(cfg.cpu_label.as_deref(), Some(""));
+        assert_eq!(cfg.ram_label.as_deref(), Some(""));
+        assert_eq!(cfg.battery_label.as_deref(), Some(""));
+
+        // An absent key is still unset — that is the difference that matters.
+        let bare = parse_config("");
+        assert_eq!(bare.battery_label, None);
     }
 
     #[test]
@@ -799,6 +836,28 @@ mod tests {
         assert_eq!(parse_config("").ram_display, RamDisplay::Percent);
         assert_eq!(
             parse_config("ram_display = \"both\"").ram_display,
+            RamDisplay::Percent
+        );
+    }
+
+    #[test]
+    fn ram_display_forgives_case_and_quoting_the_way_icons_does() {
+        // `icons` in this same file folds case, so a file that took `Emoji` but
+        // silently ignored `GB` would be a trap rather than a rule.
+        for text in [
+            "ram_display = \"GB\"",
+            "ram_display = \"Gb\"",
+            "ram_display = \"ABSOLUTE\"",
+            "ram_display = gb", // unquoted is legal in this parser
+        ] {
+            assert_eq!(
+                parse_config(text).ram_display,
+                RamDisplay::Absolute,
+                "{text}"
+            );
+        }
+        assert_eq!(
+            parse_config("ram_display = \"PERCENT\"").ram_display,
             RamDisplay::Percent
         );
     }

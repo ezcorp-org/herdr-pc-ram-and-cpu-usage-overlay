@@ -937,6 +937,23 @@ mod tests {
     }
 
     #[test]
+    fn status_line_draws_the_absolute_ram_the_config_asked_for() {
+        // The sidebar row is where `ram_display` is actually read, and it is the
+        // one surface no other test reaches with `Absolute` — the row builders
+        // are pinned directly, but nothing proved the daemon hands the setting
+        // down. 1536 MB is `1.5G` whatever this host's MemTotal happens to be,
+        // which is exactly the point of the setting.
+        let labels = Labels::default();
+        let line = status_line(
+            &space(26.0, 1536.0),
+            &labels,
+            IconSet::Text,
+            RamDisplay::Absolute,
+        );
+        assert_eq!(line, "cpu 26% · ram 1.5G");
+    }
+
+    #[test]
     fn status_line_rounds_cpu_half_away_from_zero() {
         let labels = Labels::default();
         let line = |cpu| {

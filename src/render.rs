@@ -17,7 +17,7 @@ use serde_json::Number;
 
 use crate::battery::{Battery, State};
 use crate::collect;
-use crate::config::{Config, Labels, RamDisplay, DEFAULT_RAM_LABEL};
+use crate::config::{Config, Labels, RamDisplay};
 use crate::herdr::Herdr;
 use crate::icons::IconSet;
 use crate::model::Space;
@@ -121,10 +121,11 @@ const CELL_SEPARATOR: &str = " · ";
 /// unreadable there is nothing to be a percentage *of*, so the cell falls back
 /// to the compact absolute (`ram 1.5G`) the sidebar has always shown there —
 /// and `ram_display = "gb"` picks that same form on purpose, for readers who
-/// want the figure rather than its share of this machine. The tier deliberately
-/// contributes nothing in either absolute branch: a gauge glyph measures a
-/// level, and drawing one beside an absolute figure would be inventing a
-/// reading we do not have.
+/// want the figure rather than its share of this machine. In both absolute
+/// branches the tier still names the metric but draws no gauge: a gauge measures
+/// a level, and drawing one beside an absolute figure would invent a reading we
+/// do not have. Naming and gauging are separate jobs — see
+/// [`IconSet::ram_absolute`].
 fn ram_cell(icons: IconSet, label: Option<&str>, mb: f64, display: RamDisplay) -> String {
     ram_cell_of(icons, label, mb, display, proc::mem_total_mb())
 }
@@ -134,7 +135,7 @@ fn ram_cell(icons: IconSet, label: Option<&str>, mb: f64, display: RamDisplay) -
 /// The seam exists for the tests: the real total is read once and cached for the
 /// process, so a test host with a readable `/proc/meminfo` could never reach the
 /// fallback branch (and one without it could never reach the percent branch).
-fn ram_cell_of(
+pub(crate) fn ram_cell_of(
     icons: IconSet,
     label: Option<&str>,
     mb: f64,
@@ -146,19 +147,9 @@ fn ram_cell_of(
         // reproduces the pre-icons sidebar byte for byte.
         icons.ram(label, 100.0 * mb / mem_total_mb)
     } else {
-        absolute_ram_cell(label, mb)
-    }
-}
-
-/// The absolute RAM cell — `ram 1.5G`, with the same label rules as
-/// [`IconSet`]'s rendering: an unset label gets the default word (the tier
-/// contributes nothing beside an absolute figure), and an empty one is the
-/// deliberate "name nothing" — just the figure, no stray leading space.
-fn absolute_ram_cell(label: Option<&str>, mb: f64) -> String {
-    match label {
-        Some("") => compact_ram(mb),
-        Some(label) => format!("{label} {}", compact_ram(mb)),
-        None => format!("{DEFAULT_RAM_LABEL} {}", compact_ram(mb)),
+        // The tier still names the metric; what it withholds is the gauge. See
+        // [`IconSet::ram_absolute`] for why those are two different jobs.
+        icons.ram_absolute(label, &compact_ram(mb))
     }
 }
 
@@ -633,8 +624,8 @@ mod tests {
     #[test]
     fn ram_cell_falls_back_to_the_compact_absolute_without_a_total() {
         // No MemTotal means no scale to be a percentage of. The absolute is
-        // shown with the label and *no* gauge: a gauge glyph claims a level, and
-        // in this branch we have none to claim.
+        // shown with *no* gauge: a gauge claims a level, and in this branch we
+        // have none to claim.
         assert_eq!(
             ram_cell_of(IconSet::Unicode, None, 1536.0, RamDisplay::Percent, 0.0),
             "ram 1.5G"
@@ -644,17 +635,17 @@ mod tests {
             "ram 512M"
         );
         // Same for a nonsensical total, which would otherwise divide by zero.
+        // The glyph here is the metric's NAME, not a gauge, so it stays.
         assert_eq!(
             ram_cell_of(IconSet::Emoji, None, 0.0, RamDisplay::Percent, -1.0),
-            "ram 0M"
+            "🧠0M"
         );
     }
 
     #[test]
     fn ram_display_absolute_ignores_a_readable_total() {
         // `ram_display = "gb"` asks for the figure itself, so a perfectly
-        // readable MemTotal must not turn it back into a percent. Same absolute
-        // form as the no-total fallback, and gauge-free for the same reason.
+        // readable MemTotal must not turn it back into a percent.
         let cell = |icons| ram_cell_of(icons, None, 1536.0, RamDisplay::Absolute, 16384.0);
         assert_eq!(cell(IconSet::Text), "ram 1.5G");
         assert_eq!(cell(IconSet::Unicode), "ram 1.5G");
@@ -662,6 +653,30 @@ mod tests {
             ram_cell_of(IconSet::Text, None, 512.0, RamDisplay::Absolute, 16384.0),
             "ram 512M"
         );
+    }
+
+    #[test]
+    fn the_absolute_cell_keeps_each_tier_naming_but_drops_the_gauge() {
+        // The bug this pins: an absolute cell that named itself `ram` in EVERY
+        // tier put the word `ram` next to a glyph `cpu` cell in the same row —
+        // precisely the drift the tiers exist to prevent. Naming and gauging are
+        // separate jobs, and only the gauge needs a level to measure.
+        let cell = |icons| ram_cell_of(icons, None, 1536.0, RamDisplay::Absolute, 16384.0);
+        assert_eq!(cell(IconSet::Text), "ram 1.5G");
+        // Unicode names with the word and drops ONLY its gauge glyph.
+        assert_eq!(cell(IconSet::Unicode), "ram 1.5G");
+        assert_eq!(cell(IconSet::NerdFont), "\u{efc5} 1.5G");
+        assert_eq!(cell(IconSet::Emoji), "🧠1.5G");
+
+        // The row that showed the bug: both cells now speak the same language.
+        let labels = Labels::default();
+        for icons in [IconSet::NerdFont, IconSet::Emoji] {
+            let row = metric_row(icons.cpu(labels.cpu(), 26.0), cell(icons), None);
+            assert!(
+                !row.contains("ram "),
+                "{icons:?} still spells the word `ram` beside a glyph: {row}"
+            );
+        }
     }
 
     #[test]
@@ -682,6 +697,20 @@ mod tests {
             ram_cell_of(IconSet::Text, Some(""), 1536.0, RamDisplay::Percent, 0.0),
             "1.5G"
         );
+        // "Name nothing" beats the tier's naming in every tier, glyph ones
+        // included — otherwise the emoji would sneak back in as the name.
+        for icons in [
+            IconSet::Text,
+            IconSet::Unicode,
+            IconSet::NerdFont,
+            IconSet::Emoji,
+        ] {
+            assert_eq!(
+                ram_cell_of(icons, Some(""), 1536.0, RamDisplay::Absolute, 16384.0),
+                "1.5G",
+                "{icons:?}"
+            );
+        }
     }
 
     #[test]

@@ -72,6 +72,14 @@ const ICON_TIERS: [(&str, icons::IconSet); 4] = [
 const SAMPLE_CPU: f64 = 26.0;
 /// Sample RAM share.
 const SAMPLE_RAM: f64 = 8.0;
+/// Sample RAM figure, and the machine total it is a share of.
+///
+/// The pair is chosen so `SAMPLE_RAM_MB` is exactly [`SAMPLE_RAM`] percent of
+/// `SAMPLE_MEM_TOTAL_MB` (1536 of 19200). That is what lets the preview draw the
+/// real cell for whichever `ram_display` is configured — `8%` or `1.5G` — and
+/// have both be the same reading rather than two unrelated samples.
+const SAMPLE_RAM_MB: f64 = 1536.0;
+const SAMPLE_MEM_TOTAL_MB: f64 = SAMPLE_RAM_MB * 100.0 / SAMPLE_RAM;
 /// Sample battery: mid-ramp, so the tiers that vary their glyph by charge show
 /// a middle one, and charging, so the `+` mark appears.
 const SAMPLE_BATTERY: battery::Battery = battery::Battery {
@@ -140,21 +148,38 @@ fn run() -> Result<()> {
 /// visible only to the person looking at the screen. So the preview shows the
 /// rows and lets them judge — a tier that comes out as boxes is one to avoid.
 ///
-/// The rows use the user's own herdr `[ui]` labels and go through the same
-/// [`render::metric_row`] every surface does, so what they see is what they get.
-/// All three metrics are drawn — a space's row is the first two cells, and the
-/// battery joins them on the window title and the report's total line.
+/// The rows use the user's own labels, the configured `ram_display`, and the
+/// same [`render::metric_row`] every surface does, so what they see is what they
+/// get. All three metrics are drawn — a space's row is the first two cells, and
+/// the battery joins them on the window title and the report's total line.
 fn print_icon_preview(config: &config::Config, labels: &config::Labels) {
     let current = config.icon_set();
     println!(
-        "\n  Icon tiers — {SAMPLE_CPU:.0}% cpu, {SAMPLE_RAM:.0}% ram, \
+        "\n  Icon tiers — {SAMPLE_CPU:.0}% cpu, {} ram, \
          {:.0}% battery charging, drawn by each tier:\n",
+        // Named the way the configured `ram_display` will name it in the rows.
+        render::ram_cell_of(
+            icons::IconSet::Text,
+            Some(""),
+            SAMPLE_RAM_MB,
+            config.ram_display,
+            SAMPLE_MEM_TOTAL_MB,
+        ),
         SAMPLE_BATTERY.percent,
     );
     for (name, set) in ICON_TIERS {
         let row = render::metric_row(
             set.cpu(labels.cpu(), SAMPLE_CPU),
-            set.ram(labels.ram(), SAMPLE_RAM),
+            // The real cell, not `set.ram`: `ram_display = "gb"` changes what a
+            // RAM cell looks like, and a preview that showed a percent the rows
+            // will never draw would be worse than no preview.
+            render::ram_cell_of(
+                set,
+                labels.ram(),
+                SAMPLE_RAM_MB,
+                config.ram_display,
+                SAMPLE_MEM_TOTAL_MB,
+            ),
             Some(set.battery(labels.battery(), SAMPLE_BATTERY)),
         );
         let marker = if set == current { "   <- current" } else { "" };
@@ -168,7 +193,7 @@ fn print_icon_preview(config: &config::Config, labels: &config::Labels) {
          default, `auto`, uses a Nerd Font when it finds one installed and plain\n  \
          text otherwise.\n"
     );
-    print_one_setting_hint(current);
+    print_one_setting_hint(current, config);
 }
 
 /// Explain — and print — the single edit that keeps herdr's own sidebar header
@@ -179,17 +204,37 @@ fn print_icon_preview(config: &config::Config, labels: &config::Labels) {
 /// header renders from herdr's `cpu_label` / `ram_label`, so setting only the
 /// plugin's `icons` leaves that header spelling `cpu` in words directly above a
 /// row of glyphs. Those two keys are the one place that changes both.
-fn print_one_setting_hint(current: icons::IconSet) {
+fn print_one_setting_hint(current: icons::IconSet, config: &config::Config) {
     let snippet = icons::herdr_ui_snippet(current);
     let indented: String = snippet
         .lines()
         .map(|line| format!("      {line}\n"))
         .collect();
+    // A plugin-side label silently wins over the block we are about to print, so
+    // saying nothing would send the user to edit a file that cannot take effect.
+    let overridden = [
+        ("cpu_label", config.cpu_label.is_some()),
+        ("ram_label", config.ram_label.is_some()),
+    ]
+    .iter()
+    .filter(|(_, set)| *set)
+    .map(|(key, _)| *key)
+    .collect::<Vec<_>>();
+    let note = if overridden.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "  NOTE: {} already set in the plugin's config.toml, which wins over\n  \
+             herdr's. Remove it there for the block below to reach these rows.\n\n",
+            overridden.join(" and "),
+        )
+    };
     println!(
         "  One setting for both: herdr's own sidebar system-usage header reads\n  \
          `cpu_label` / `ram_label` from ITS config, and this plugin honours the\n  \
          same keys — an explicit label replaces the tier's glyph rather than\n  \
-         stacking with it. Set them once and the header and these rows agree.\n\n  \
+         stacking with it. Set them once and the header and these rows agree.\n\n\
+         {note}  \
          For the tier above, put this in herdr's config.toml\n  \
          (alongside `icons = \"text\"` here, since the labels now do the naming):\n\n\
          {indented}"

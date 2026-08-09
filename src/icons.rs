@@ -189,6 +189,21 @@ impl IconSet {
         )
     }
 
+    /// Render RAM as a figure that is not a percentage — `ram 1.5G` in the
+    /// [`IconSet::Text`] tier, ` 1.5G` in [`IconSet::NerdFont`].
+    ///
+    /// Used where the cell shows an absolute rather than a share: no readable
+    /// `MemTotal` to be a percentage of, or `ram_display = "gb"` asking for the
+    /// figure itself. The tier still supplies its *name* — what it cannot supply
+    /// is a **gauge**, because a gauge measures a level and this cell is not
+    /// showing one. Those are two different jobs, and only the second one
+    /// depends on having a percentage: dropping the naming as well would put a
+    /// glyph CPU cell next to the word `ram` in the same row, which is exactly
+    /// the drift the tiers exist to prevent.
+    pub fn ram_absolute(self, label: Option<&str>, value: &str) -> String {
+        labelled(label, || self.naming(Metric::Ram, None), value)
+    }
+
     /// This tier's naming as herdr `[ui]` label values: `(cpu, ram, battery)`.
     ///
     /// Exists so [`herdr_ui_snippet`] can hand the user a block that pins the
@@ -220,44 +235,59 @@ impl IconSet {
     ) -> String {
         let mark = mark.map(String::from).unwrap_or_default();
         let number = format!("{}%{mark}", round_percent(percent));
+        labelled(label, || self.naming(metric, Some(percent)), &number)
+    }
 
-        // An explicit herdr `[ui]` label REPLACES the tier's naming — it does not
-        // stack on top of it.
-        //
-        // This is what makes those labels a genuine single source of truth. On a
-        // patched build the sidebar's system-usage header renders from the same
-        // two keys, so a user who sets `cpu_label` once gets the header and these
-        // rows agreeing no matter which tier is active. Prefixing the label to
-        // the tier's glyph instead would draw the icon twice for exactly the
-        // user who took the trouble to configure it.
-        //
-        // An empty label is a deliberate "name nothing": no word, no glyph, no
-        // stray leading space.
-        if let Some(label) = label {
-            return if label.is_empty() {
-                number
-            } else {
-                format!("{label} {number}")
-            };
-        }
-
-        // No explicit label, so the tier decides how the metric is named.
-        let naming = match self {
+    /// How this tier names `metric` when the user has chosen no label.
+    ///
+    /// `percent` is the reading the naming is *about*, and `None` means there is
+    /// no reading — the caller is drawing an absolute figure. Only the two parts
+    /// that measure a level care: the [`IconSet::Unicode`] gauge and the Nerd
+    /// Font battery ramp. Everything else is a name and is drawn either way.
+    fn naming(self, metric: Metric, percent: Option<f64>) -> String {
+        match self {
             IconSet::Text => format!("{} ", metric.default_word()),
             // The word still carries the meaning; the gauge runs straight into
-            // the number it measures.
-            IconSet::Unicode => format!(
-                "{} {}",
-                metric.default_word(),
-                ramp_pick(&GAUGE_RAMP, percent)
-            ),
+            // the number it measures. With no reading there is no level to
+            // gauge, so the word stands alone rather than inventing one.
+            IconSet::Unicode => match percent {
+                Some(percent) => format!(
+                    "{} {}",
+                    metric.default_word(),
+                    ramp_pick(&GAUGE_RAMP, percent)
+                ),
+                None => format!("{} ", metric.default_word()),
+            },
             // Nerd Font glyphs are drawn edge-to-edge in their cell; without the
-            // space the digits touch them.
-            IconSet::NerdFont => format!("{} ", metric.nerd_glyph(percent)),
+            // space the digits touch them. Only the battery family ramps, and it
+            // is never drawn without a reading, so the full-battery glyph is an
+            // unreachable stand-in rather than a claim about the charge.
+            IconSet::NerdFont => format!("{} ", metric.nerd_glyph(percent.unwrap_or(100.0))),
             // Emoji already occupy two columns — a space on top reads as a gap.
             IconSet::Emoji => metric.emoji().to_string(),
-        };
-        format!("{naming}{number}")
+        }
+    }
+}
+
+/// `[label ]<body>` — the one place the label rules live, for every tier, metric
+/// and cell shape.
+///
+/// An explicit label REPLACES the tier's naming rather than stacking on top of
+/// it. This is what makes those labels a genuine single source of truth: on a
+/// patched build the sidebar's system-usage header renders from the same
+/// `cpu_label` / `ram_label`, so a user who sets one once gets the header and
+/// these rows agreeing no matter which tier is active. Prefixing the label to
+/// the tier's glyph instead would draw the icon twice for exactly the user who
+/// took the trouble to configure it.
+///
+/// An empty label is a deliberate "name nothing": no word, no glyph, no stray
+/// leading space. `naming` is lazy because it is only consulted when no label
+/// was chosen — and it is the only part that differs between cell shapes.
+fn labelled(label: Option<&str>, naming: impl FnOnce() -> String, body: &str) -> String {
+    match label {
+        Some("") => body.to_string(),
+        Some(label) => format!("{label} {body}"),
+        None => format!("{}{body}", naming()),
     }
 }
 
@@ -830,6 +860,44 @@ mod tests {
             IconSet::Unicode.battery(None, bat(100.0, State::Full)),
             "bat █100%=",
         );
+    }
+
+    // ---- a figure that is not a percentage ---------------------------------------
+
+    #[test]
+    fn ram_absolute_names_the_metric_in_every_tier_but_gauges_in_none() {
+        // Two different jobs. Every tier still NAMES ram, because a row whose
+        // cpu cell is a glyph and whose ram cell is the word `ram` is the drift
+        // the tiers exist to prevent. No tier GAUGES it, because there is no
+        // level here to measure — the figure is an absolute.
+        assert_eq!(IconSet::Text.ram_absolute(None, "1.5G"), "ram 1.5G");
+        assert_eq!(IconSet::Unicode.ram_absolute(None, "1.5G"), "ram 1.5G");
+        assert_eq!(
+            IconSet::NerdFont.ram_absolute(None, "1.5G"),
+            format!("{NERD_RAM} 1.5G")
+        );
+        assert_eq!(
+            IconSet::Emoji.ram_absolute(None, "1.5G"),
+            format!("{EMOJI_RAM}1.5G")
+        );
+
+        // No gauge glyph anywhere, in any tier.
+        for set in ALL_TIERS {
+            let cell = set.ram_absolute(None, "1.5G");
+            for (_, glyph) in GAUGE_RAMP {
+                assert!(!cell.contains(glyph), "{set:?} gauged an absolute: {cell}");
+            }
+        }
+    }
+
+    #[test]
+    fn ram_absolute_honours_the_same_label_rules_as_a_percentage_cell() {
+        for set in ALL_TIERS {
+            // An explicit label replaces the naming...
+            assert_eq!(set.ram_absolute(Some("MEM"), "1.5G"), "MEM 1.5G", "{set:?}");
+            // ...and an empty one names nothing, with no stray leading space.
+            assert_eq!(set.ram_absolute(Some(""), "1.5G"), "1.5G", "{set:?}");
+        }
     }
 
     // ---- herdr label overrides --------------------------------------------------
