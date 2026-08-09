@@ -113,6 +113,47 @@ fn compact_ram(mb: f64) -> String {
 /// Separator between the cells of a narrow metric row.
 const CELL_SEPARATOR: &str = " · ";
 
+/// Everything that decides how a narrow row looks: the naming, the glyph
+/// vocabulary, and the form the RAM figure takes.
+///
+/// Grouped for the same reason [`crate::daemon`]'s `Settings` is — these are one
+/// decision, not three, and a caller that refreshed the labels while keeping a
+/// stale tier would render a mixture. Passing them as parallel arguments also
+/// meant every new presentation knob had to be threaded through five signatures
+/// and every test call site; `ram_display` was the one that made that plain.
+///
+/// Narrow rows only, which is why it carries `ram_display`: the wide terminal
+/// report always prints the absolute AND the percent, so it has nothing to
+/// switch, and handing it a setting it ignores would invite a future caller to
+/// believe it did something.
+#[derive(Debug, Clone, Copy)]
+pub struct RowStyle<'a> {
+    labels: &'a Labels,
+    icons: IconSet,
+    ram_display: RamDisplay,
+}
+
+impl<'a> RowStyle<'a> {
+    /// Build a style from its parts.
+    ///
+    /// `icons` is taken rather than re-derived because resolving the tier is a
+    /// once-per-refresh decision for the whole machine — see
+    /// [`crate::config::Config::icon_set`].
+    pub fn new(labels: &'a Labels, icons: IconSet, ram_display: RamDisplay) -> Self {
+        Self {
+            labels,
+            icons,
+            ram_display,
+        }
+    }
+
+    /// The style this plugin's own config asks for, with the tier already
+    /// resolved by the caller.
+    pub fn from_config(labels: &'a Labels, icons: IconSet, config: &Config) -> Self {
+        Self::new(labels, icons, config.ram_display)
+    }
+}
+
 /// The narrow RAM cell — the tier's rendering of RAM as a percent of the
 /// machine's total (`ram ░8%`), or the compact absolute when `ram_display`
 /// says so.
@@ -181,16 +222,10 @@ pub fn metric_row(cpu: String, ram: String, battery: Option<String>) -> String {
 
 /// The two per-space cells both narrow rows start with, built once so the row
 /// that carries a battery and the row that cannot still agree on the first two.
-fn usage_cells(
-    cpu: f64,
-    ram_mb: f64,
-    labels: &Labels,
-    icons: IconSet,
-    ram_display: RamDisplay,
-) -> (String, String) {
+fn usage_cells(cpu: f64, ram_mb: f64, style: RowStyle) -> (String, String) {
     (
-        icons.cpu(labels.cpu(), cpu),
-        ram_cell(icons, labels.ram(), ram_mb, ram_display),
+        style.icons.cpu(style.labels.cpu(), cpu),
+        ram_cell(style.icons, style.labels.ram(), ram_mb, style.ram_display),
     )
 }
 
@@ -203,14 +238,8 @@ fn usage_cells(
 /// the terminal report on its total line, and (on a patched build) herdr's own
 /// sidebar header. Keeping the parameter off the signature is what stops a
 /// future caller from putting it back by accident.
-pub fn usage_row(
-    cpu: f64,
-    ram_mb: f64,
-    labels: &Labels,
-    icons: IconSet,
-    ram_display: RamDisplay,
-) -> String {
-    let (cpu_cell, ram) = usage_cells(cpu, ram_mb, labels, icons, ram_display);
+pub fn usage_row(cpu: f64, ram_mb: f64, style: RowStyle) -> String {
+    let (cpu_cell, ram) = usage_cells(cpu, ram_mb, style);
     metric_row(cpu_cell, ram, None)
 }
 
@@ -219,16 +248,13 @@ pub fn usage_row(
 ///
 /// `battery` is the reading taken once per refresh cycle by
 /// [`Config::battery_reading`] and passed down, never re-read here.
-pub fn totals_row(
-    cpu: f64,
-    ram_mb: f64,
-    labels: &Labels,
-    icons: IconSet,
-    ram_display: RamDisplay,
-    battery: Option<Battery>,
-) -> String {
-    let (cpu_cell, ram) = usage_cells(cpu, ram_mb, labels, icons, ram_display);
-    metric_row(cpu_cell, ram, battery_cell(icons, labels, battery))
+pub fn totals_row(cpu: f64, ram_mb: f64, style: RowStyle, battery: Option<Battery>) -> String {
+    let (cpu_cell, ram) = usage_cells(cpu, ram_mb, style);
+    metric_row(
+        cpu_cell,
+        ram,
+        battery_cell(style.icons, style.labels, battery),
+    )
 }
 
 // ---- human render -----------------------------------------------------------
@@ -676,13 +702,12 @@ mod tests {
         // language. Asserted whole rather than as "no `ram` anywhere", because
         // the row is what the user reads and a substring check would pass on a
         // row that had gone wrong some other way.
+        let labels = Labels::default();
         let row = |icons| {
             usage_row(
                 26.0,
                 1536.0,
-                &Labels::default(),
-                icons,
-                RamDisplay::Absolute,
+                RowStyle::new(&labels, icons, RamDisplay::Absolute),
             )
         };
         assert_eq!(row(IconSet::NerdFont), "\u{f4bc} 26% · \u{efc5} 1.5G");
@@ -730,8 +755,36 @@ mod tests {
         // config: bare numbers, still separated — the compact row this feature
         // exists for.
         let labels = Labels::new(Some(""), Some(""), None);
-        let row = usage_row(26.0, 1536.0, &labels, IconSet::Text, RamDisplay::Absolute);
+        let row = usage_row(
+            26.0,
+            1536.0,
+            RowStyle::new(&labels, IconSet::Text, RamDisplay::Absolute),
+        );
         assert_eq!(row, "26% · 1.5G");
+    }
+
+    #[test]
+    fn a_style_built_from_config_carries_that_configs_ram_form() {
+        // The wiring, not the rendering. Every other test hands the row builders
+        // a `RamDisplay` literal, so a `from_config` that read the wrong field —
+        // or quietly hardcoded the default — would still pass all of them and
+        // leave `ram_display = "gb"` doing nothing on a real machine.
+        //
+        // Asserted on the fields rather than on rendered output because the
+        // percent branch needs a readable MemTotal, and a host without one would
+        // render both forms identically and pass either way.
+        let labels = Labels::default();
+        for ram_display in [RamDisplay::Percent, RamDisplay::Absolute] {
+            let config = Config {
+                ram_display,
+                ..Config::default()
+            };
+            let style = RowStyle::from_config(&labels, IconSet::NerdFont, &config);
+            assert_eq!(style.ram_display, ram_display);
+            // The tier is the caller's, resolved once per refresh, not re-derived
+            // from the config here.
+            assert_eq!(style.icons, IconSet::NerdFont);
+        }
     }
 
     #[test]
