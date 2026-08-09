@@ -132,9 +132,13 @@ fn ram_cell(icons: IconSet, label: Option<&str>, mb: f64, display: RamDisplay) -
 
 /// [`ram_cell`] with the machine total injected.
 ///
-/// The seam exists for the tests: the real total is read once and cached for the
-/// process, so a test host with a readable `/proc/meminfo` could never reach the
-/// fallback branch (and one without it could never reach the percent branch).
+/// Two callers need that seam. The tests, because the real total is read once
+/// and cached for the process, so a test host with a readable `/proc/meminfo`
+/// could never reach the fallback branch (and one without it could never reach
+/// the percent branch). And the `--icons` preview, which draws a fixed sample
+/// reading rather than this machine's — a preview built from the host's real
+/// total would show a different row on every machine, and could not show the
+/// percent form at all on a host whose total is unreadable.
 pub(crate) fn ram_cell_of(
     icons: IconSet,
     label: Option<&str>,
@@ -668,15 +672,22 @@ mod tests {
         assert_eq!(cell(IconSet::NerdFont), "\u{efc5} 1.5G");
         assert_eq!(cell(IconSet::Emoji), "🧠1.5G");
 
-        // The row that showed the bug: both cells now speak the same language.
-        let labels = Labels::default();
-        for icons in [IconSet::NerdFont, IconSet::Emoji] {
-            let row = metric_row(icons.cpu(labels.cpu(), 26.0), cell(icons), None);
-            assert!(
-                !row.contains("ram "),
-                "{icons:?} still spells the word `ram` beside a glyph: {row}"
-            );
-        }
+        // The row that showed the bug, spelled out: both cells speak the same
+        // language. Asserted whole rather than as "no `ram` anywhere", because
+        // the row is what the user reads and a substring check would pass on a
+        // row that had gone wrong some other way.
+        let row = |icons| {
+            usage_row(
+                26.0,
+                1536.0,
+                &Labels::default(),
+                icons,
+                RamDisplay::Absolute,
+            )
+        };
+        assert_eq!(row(IconSet::NerdFont), "\u{f4bc} 26% · \u{efc5} 1.5G");
+        assert_eq!(row(IconSet::Emoji), "💻26% · 🧠1.5G");
+        assert_eq!(row(IconSet::Text), "cpu 26% · ram 1.5G");
     }
 
     #[test]

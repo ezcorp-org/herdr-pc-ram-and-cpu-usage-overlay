@@ -3,12 +3,17 @@
 //! The sidebar row is only a few characters wide, so every glyph has to earn its
 //! column. Four tiers ladder up by how much they assume about the user's font:
 //!
-//! | tier | cpu | ram | battery | needs |
-//! |---|---|---|---|---|
-//! | [`IconSet::Text`] | `cpu 26%` | `ram 8%` | `bat 74%` | nothing |
-//! | [`IconSet::Unicode`] | `cpu ░26%` | `ram ░8%` | `bat ▓74%` | nothing |
-//! | [`IconSet::NerdFont`] | ` 26%` | ` 8%` | ` 74%` | a Nerd Font |
-//! | [`IconSet::Emoji`] | `💻26%` | `🧠8%` | `🔋74%` | a colour emoji font |
+//! | tier | cpu | ram | ram (absolute) | battery | needs |
+//! |---|---|---|---|---|---|
+//! | [`IconSet::Text`] | `cpu 26%` | `ram 8%` | `ram 1.5G` | `bat 74%` | nothing |
+//! | [`IconSet::Unicode`] | `cpu ░26%` | `ram ░8%` | `ram 1.5G` | `bat ▓74%` | nothing |
+//! | [`IconSet::NerdFont`] | ` 26%` | ` 8%` | ` 1.5G` | ` 74%` | a Nerd Font |
+//! | [`IconSet::Emoji`] | `💻26%` | `🧠8%` | `🧠1.5G` | `🔋74%` | a colour emoji font |
+//!
+//! The absolute column ([`IconSet::ram_absolute`]) is the same naming minus the
+//! gauge: a gauge measures a level, and that cell is not showing one. Only the
+//! [`IconSet::Unicode`] tier visibly loses anything, because its gauge was the
+//! only part doing the measuring.
 //!
 //! Only the first two are safe unprompted, and that claim is measured rather
 //! than assumed: every glyph they emit was checked with `fc-list :charset=<cp>`

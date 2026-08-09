@@ -394,8 +394,10 @@ this plugin anyway. On a **patched** build it does matter — the header follows
 only the herdr-side keys, so setting them here deliberately lets the two
 surfaces name things differently. Leave a key out to keep herdr's value.
 
-**Empty means "name nothing" in this file.** All three plugin-side labels read a
-blank as the deliberate bare number — no word, no glyph, no stray space:
+### Empty means "name nothing" in this file
+
+All three plugin-side labels read a blank as the deliberate bare number — no
+word, no glyph, no stray space:
 
 ```toml
 cpu_label = ""
