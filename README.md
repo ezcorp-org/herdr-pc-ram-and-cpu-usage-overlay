@@ -170,12 +170,40 @@ interval_seconds = 5        # 1..28800; statuses get a TTL of three intervals
 window_title_totals = true
 battery = true              # machine-wide cell on the title/report, not the rows
 icons = "auto"              # auto | text | unicode | nerdfont | emoji
+ram_display = "percent"     # or "gb" / "absolute" — see RAM as a figure
 ```
 
 - **sidebar** (default): renders usage inside each spaces card, under the branch
   name. Needs no patched build — see below.
 - **agents-panel**: each space gets its own entry in the sidebar agents panel via
   a `usage` pseudo-agent on a spare shell pane, carrying the usage token.
+
+### RAM as a figure, not a share
+
+`ram_display` decides what the **narrow** RAM cell shows — the sidebar rows and
+the window title:
+
+| value | cell | reads as |
+|---|---|---|
+| `percent` (default) | `ram 8%` | how much of this machine |
+| `gb` or `absolute` | `ram 1.5G` | the figure itself |
+
+Both spellings do the same thing, and case is ignored (`GB` works). The name
+`absolute` is the accurate one — the cell stays in MB below a gigabyte (`513M`)
+— while `gb` is what most people reach for.
+
+The percent answers "how much of this machine", which is usually the question.
+But on a box with memory to spare, a space using 1.5G reads as `2%`, which says
+almost nothing; the absolute is there for that.
+
+It changes only those narrow cells. The terminal report and the live dashboard
+already show both figures side by side (`1.5G (8%)`), and `--json` reports raw
+numbers, so neither has anything to switch.
+
+An absolute cell carries **no gauge** in the `unicode` tier: a gauge measures a
+level and this cell is not showing one. It keeps the tier's *name* though — the
+`nerdfont` and `emoji` glyphs still appear, because a glyph CPU cell beside the
+word `ram` is exactly the mismatch the tiers exist to prevent.
 
 Switching modes cleans up after the other mode automatically. The first run
 writes its `$usage` row into whichever table the mode renders from
@@ -321,29 +349,66 @@ Those two keys are the single point that changes both, because this plugin
 honours them too — and **an explicit label replaces the tier's glyph rather than
 stacking with it**, so you never get the icon drawn twice:
 
+The quotes below are where the tier's glyph goes — `space-usage --icons` prints
+the block already filled in for whichever tier you are previewing, so you can
+copy it straight across rather than hunting for the code points.
+
 ```toml
 # in herdr's own config.toml — drives BOTH the header and these rows
 [ui]
-cpu_label = ""
-ram_label = ""
+cpu_label = "<glyph>"
+ram_label = "<glyph>"
 ```
 
 ```toml
 # in the plugin's config.toml — battery only (title, report, JSON)
-battery_label = ""
+battery_label = "<glyph>"
 icons = "text"          # the labels are doing the naming now
 ```
 
-`space-usage --icons` prints the `[ui]` block for whichever tier you are
-previewing, so you can copy it straight across.
+Left genuinely empty, those two herdr-side keys read as *unset* (the tier names
+itself), while an empty `battery_label` here reads as "name nothing" — see
+[Empty means "name nothing"](#empty-means-name-nothing-in-this-file) below.
 
 **Why battery is in the other file:** herdr has no battery of its own to label,
 so `battery_label` is not a key it knows. Putting it in herdr's `[ui]` makes
 every `herdr server reload-config` report
 `unknown config key ui.battery_label; ignoring key`. Nothing outside this plugin
 renders a battery, so there is no second surface to keep in step. `cpu_label`
-and `ram_label` live in herdr's config precisely because the header does share
-them.
+and `ram_label` are herdr's own keys — it accepts both — and leaving them there
+is what keeps a patched build's header and these rows in step.
+
+**Naming only these rows.** If you would rather keep every plugin-only setting
+in the plugin's own file — next to `icons` and `battery_label` — its
+`config.toml` accepts `cpu_label` and `ram_label` too, each overriding the
+herdr-side value only when set:
+
+```toml
+cpu_label = "C"
+ram_label = ""          # empty = name nothing: just the figure
+```
+
+On a stock build that changes nothing about what herdr draws: there is no
+system-usage header, so herdr's own `cpu_label` / `ram_label` reach nothing but
+this plugin anyway. On a **patched** build it does matter — the header follows
+only the herdr-side keys, so setting them here deliberately lets the two
+surfaces name things differently. Leave a key out to keep herdr's value.
+
+### Empty means "name nothing" in this file
+
+All three plugin-side labels read a blank as the deliberate bare number — no
+word, no glyph, no stray space:
+
+```toml
+cpu_label = ""
+ram_label = ""
+ram_display = "gb"      # a row of just the figures: `26% · 1.5G`
+```
+
+That is the opposite of herdr's file, where a blank reads as *unset* (see
+below), and the difference is in what ships: herdr ships those keys as blank
+commented templates, so a blank there is usually a line someone uncommented
+without filling in. Nothing ships them here.
 
 **Applying a change.** The updater re-reads both files every refresh, so the
 rows follow within one interval — no `status-toggle` needed. herdr's header
