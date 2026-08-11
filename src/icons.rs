@@ -3,12 +3,12 @@
 //! The sidebar row is only a few characters wide, so every glyph has to earn its
 //! column. Four tiers ladder up by how much they assume about the user's font:
 //!
-//! | tier | cpu | ram | ram (absolute) | battery | needs |
-//! |---|---|---|---|---|---|
-//! | [`IconSet::Text`] | `cpu 26%` | `ram 8%` | `ram 1.5G` | `bat 74%` | nothing |
-//! | [`IconSet::Unicode`] | `cpu ░26%` | `ram ░8%` | `ram 1.5G` | `bat ▓74%` | nothing |
-//! | [`IconSet::NerdFont`] | ` 26%` | ` 8%` | ` 1.5G` | ` 74%` | a Nerd Font |
-//! | [`IconSet::Emoji`] | `💻26%` | `🧠8%` | `🧠1.5G` | `🔋74%` | a colour emoji font |
+//! | tier | cpu | ram | ram (absolute) | battery | disk | needs |
+//! |---|---|---|---|---|---|---|
+//! | [`IconSet::Text`] | `cpu 26%` | `ram 8%` | `ram 1.5G` | `bat 74%` | `disk 53% 240G` | nothing |
+//! | [`IconSet::Unicode`] | `cpu ░26%` | `ram ░8%` | `ram 1.5G` | `bat ▓74%` | `disk ▒53% 240G` | nothing |
+//! | [`IconSet::NerdFont`] | ` 26%` | ` 8%` | ` 1.5G` | ` 74%` | ` 53% 240G` | a Nerd Font |
+//! | [`IconSet::Emoji`] | `💻26%` | `🧠8%` | `🧠1.5G` | `🔋74%` | `💾53% 240G` | a colour emoji font |
 //!
 //! The absolute column ([`IconSet::ram_absolute`]) is the same naming minus the
 //! gauge: a gauge measures a level, and that cell is not showing one. Only the
@@ -40,7 +40,9 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 use crate::battery::{Battery, State};
-use crate::config::{non_empty_env, DEFAULT_BATTERY_LABEL, DEFAULT_CPU_LABEL, DEFAULT_RAM_LABEL};
+use crate::config::{
+    non_empty_env, DEFAULT_BATTERY_LABEL, DEFAULT_CPU_LABEL, DEFAULT_DISK_LABEL, DEFAULT_RAM_LABEL,
+};
 
 /// Which glyph vocabulary to render metrics with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +85,8 @@ const NERD_BATTERY_RAMP: [(f64, char); 5] = [
 const NERD_CPU: char = '\u{f4bc}';
 /// U+EFC5 `nf-md-memory`.
 const NERD_RAM: char = '\u{efc5}';
+/// U+F0A0 `nf-fa-hdd_o`.
+const NERD_DISK: char = '\u{f0a0}';
 
 /// U+1F4BB personal computer.
 const EMOJI_CPU: char = '💻';
@@ -90,6 +94,8 @@ const EMOJI_CPU: char = '💻';
 const EMOJI_RAM: char = '🧠';
 /// U+1F50B battery.
 const EMOJI_BATTERY: char = '🔋';
+/// U+1F4BE floppy disk — the storage pictogram every emoji font actually has.
+const EMOJI_DISK: char = '💾';
 
 /// Charge is climbing.
 const MARK_CHARGING: char = '+';
@@ -133,6 +139,7 @@ enum Metric {
     Cpu,
     Ram,
     Battery,
+    Disk,
 }
 
 impl Metric {
@@ -148,6 +155,7 @@ impl Metric {
             Metric::Cpu => DEFAULT_CPU_LABEL,
             Metric::Ram => DEFAULT_RAM_LABEL,
             Metric::Battery => DEFAULT_BATTERY_LABEL,
+            Metric::Disk => DEFAULT_DISK_LABEL,
         }
     }
 
@@ -158,6 +166,7 @@ impl Metric {
             Metric::Cpu => NERD_CPU,
             Metric::Ram => NERD_RAM,
             Metric::Battery => ramp_pick(&NERD_BATTERY_RAMP, percent),
+            Metric::Disk => NERD_DISK,
         }
     }
 
@@ -166,6 +175,7 @@ impl Metric {
             Metric::Cpu => EMOJI_CPU,
             Metric::Ram => EMOJI_RAM,
             Metric::Battery => EMOJI_BATTERY,
+            Metric::Disk => EMOJI_DISK,
         }
     }
 }
@@ -206,10 +216,34 @@ impl IconSet {
     /// glyph CPU cell next to the word `ram` in the same row, which is exactly
     /// the drift the tiers exist to prevent.
     pub fn ram_absolute(self, label: Option<&str>, value: &str) -> String {
-        labelled(label, || self.naming(Metric::Ram, None), value)
+        labelled(label, || self.naming(Metric::Ram, None, None), value)
     }
 
-    /// This tier's naming as herdr `[ui]` label values: `(cpu, ram, battery)`.
+    /// Render disk usage — `disk ▓79% 240G` in the [`IconSet::Unicode`] tier,
+    /// or `disk /data ▓79% 240G` when `mount` names which drive.
+    ///
+    /// The percentage is what is USED, like the cpu and ram cells beside it, so
+    /// the whole row reads one way and a nearly full disk looks nearly full. The
+    /// size is what is LEFT, because that is the figure you act on — and it
+    /// cannot be mistaken for the percentage, since it carries a unit. The size
+    /// arrives pre-formatted from [`crate::render`], which owns how a size is
+    /// spelled; this decides only how it is dressed.
+    pub fn disk(
+        self,
+        label: Option<&str>,
+        mount: Option<&str>,
+        used_percent: f64,
+        free_size: &str,
+    ) -> String {
+        let body = format!("{}% {free_size}", round_percent(used_percent));
+        labelled(
+            label,
+            || self.naming(Metric::Disk, Some(used_percent), mount),
+            &body,
+        )
+    }
+
+    /// This tier's naming as label values: `(cpu, ram, battery, disk)`.
     ///
     /// Exists so [`herdr_ui_snippet`] can hand the user a block that pins the
     /// same naming into herdr's own config. That matters on a patched build,
@@ -220,13 +254,18 @@ impl IconSet {
     ///
     /// The battery ramp needs a percentage to pick a glyph, and a static config
     /// value cannot ramp, so the full-battery glyph stands in for the family.
-    fn label_values(self) -> (String, String, String) {
+    fn label_values(self) -> (String, String, String, String) {
         let of = |metric: Metric| match self {
             IconSet::Text | IconSet::Unicode => metric.default_word().to_string(),
             IconSet::NerdFont => metric.nerd_glyph(100.0).to_string(),
             IconSet::Emoji => metric.emoji().to_string(),
         };
-        (of(Metric::Cpu), of(Metric::Ram), of(Metric::Battery))
+        (
+            of(Metric::Cpu),
+            of(Metric::Ram),
+            of(Metric::Battery),
+            of(Metric::Disk),
+        )
     }
 
     /// `[word ][glyph]<n>%[mark]` — the one assembly every tier and metric goes
@@ -240,7 +279,7 @@ impl IconSet {
     ) -> String {
         let mark = mark.map(String::from).unwrap_or_default();
         let number = format!("{}%{mark}", round_percent(percent));
-        labelled(label, || self.naming(metric, Some(percent)), &number)
+        labelled(label, || self.naming(metric, Some(percent), None), &number)
     }
 
     /// How this tier names `metric` when the user has chosen no label.
@@ -249,27 +288,38 @@ impl IconSet {
     /// no reading — the caller is drawing an absolute figure. Only the two parts
     /// that measure a level care: the [`IconSet::Unicode`] gauge and the Nerd
     /// Font battery ramp. Everything else is a name and is drawn either way.
-    fn naming(self, metric: Metric, percent: Option<f64>) -> String {
+    ///
+    /// `qualifier` says *which one*, for a metric that can have more than one
+    /// reading to report — the mount point of a disk. It qualifies the name, so
+    /// it sits with the name, which is what keeps the Unicode gauge hard against
+    /// the number it measures instead of floating off before the mount.
+    fn naming(self, metric: Metric, percent: Option<f64>, qualifier: Option<&str>) -> String {
+        let qualifier = qualifier.map(|q| format!("{q} ")).unwrap_or_default();
         match self {
-            IconSet::Text => format!("{} ", metric.default_word()),
+            IconSet::Text => format!("{} {qualifier}", metric.default_word()),
             // The word still carries the meaning; the gauge runs straight into
             // the number it measures. With no reading there is no level to
             // gauge, so the word stands alone rather than inventing one.
             IconSet::Unicode => match percent {
                 Some(percent) => format!(
-                    "{} {}",
+                    "{} {qualifier}{}",
                     metric.default_word(),
                     ramp_pick(&GAUGE_RAMP, percent)
                 ),
-                None => format!("{} ", metric.default_word()),
+                None => format!("{} {qualifier}", metric.default_word()),
             },
             // Nerd Font glyphs are drawn edge-to-edge in their cell; without the
             // space the digits touch them. Only the battery family ramps, and it
             // is never drawn without a reading, so the full-battery glyph is an
             // unreachable stand-in rather than a claim about the charge.
-            IconSet::NerdFont => format!("{} ", metric.nerd_glyph(percent.unwrap_or(100.0))),
+            IconSet::NerdFont => {
+                format!(
+                    "{} {qualifier}",
+                    metric.nerd_glyph(percent.unwrap_or(100.0))
+                )
+            }
             // Emoji already occupy two columns — a space on top reads as a gap.
-            IconSet::Emoji => metric.emoji().to_string(),
+            IconSet::Emoji => format!("{}{qualifier}", metric.emoji()),
         }
     }
 }
@@ -402,7 +452,7 @@ fn auto_detect(env: impl Fn(&str) -> Option<String>, has_nerd_font: impl Fn() ->
 
 // ---- one-setting config snippet -------------------------------------------------
 
-/// A paste-ready herdr `[ui]` block pinning `tier`'s naming.
+/// A paste-ready **herdr** `[ui]` block pinning `tier`'s naming.
 ///
 /// There are two places a metric gets named on a patched build: these per-space
 /// rows, and the sidebar's whole-machine system-usage header. The header is
@@ -412,13 +462,28 @@ fn auto_detect(env: impl Fn(&str) -> Option<String>, has_nerd_font: impl Fn() ->
 /// words under a row of glyphs.
 ///
 /// Emitting the block rather than describing it keeps the two in step without
-/// the user reverse-engineering which codepoints a tier uses. Pairing it with
-/// `icons = "text"` is deliberate: with an explicit label present the tier adds
-/// no glyph of its own (see [`IconSet::render`]), so `text` is simply the
-/// honest way to say "the labels are doing the naming now".
+/// the user reverse-engineering which codepoints a tier uses.
+///
+/// **Only the keys herdr actually knows.** A stock herdr draws no battery and no
+/// disk, so it has no key for either, and a `battery_label` pasted into its
+/// `[ui]` makes every `herdr server reload-config` log
+/// `unknown config key ui.battery_label; ignoring key`. Handing someone a block
+/// that does that is handing them a warning to wonder about; those two live in
+/// the plugin's own config instead ([`plugin_config_snippet`]).
 pub fn herdr_ui_snippet(tier: IconSet) -> String {
-    let (cpu, ram, battery) = tier.label_values();
-    format!("[ui]\ncpu_label = \"{cpu}\"\nram_label = \"{ram}\"\nbattery_label = \"{battery}\"")
+    let (cpu, ram, _battery, _disk) = tier.label_values();
+    format!("[ui]\ncpu_label = \"{cpu}\"\nram_label = \"{ram}\"")
+}
+
+/// A paste-ready block for the **plugin's** config, naming the two metrics herdr
+/// does not draw and switching the tier off.
+///
+/// Pairing the labels with `icons = "text"` is deliberate: with an explicit
+/// label present the tier adds no glyph of its own (see [`labelled`]), so `text`
+/// is simply the honest way to say "the labels are doing the naming now".
+pub fn plugin_config_snippet(tier: IconSet) -> String {
+    let (_cpu, _ram, battery, disk) = tier.label_values();
+    format!("battery_label = \"{battery}\"\ndisk_label = \"{disk}\"\nicons = \"text\"")
 }
 
 // ---- Nerd Font probe ------------------------------------------------------------
@@ -788,6 +853,10 @@ mod tests {
         assert_eq!(IconSet::Text.cpu(None, 26.0), "cpu 26%");
         assert_eq!(IconSet::Text.ram(None, 8.0), "ram 8%");
         assert_eq!(
+            IconSet::Text.disk(None, None, 53.0, "240G"),
+            "disk 53% 240G"
+        );
+        assert_eq!(
             IconSet::Text.battery(None, bat(74.0, State::Discharging)),
             "bat 74%",
         );
@@ -797,6 +866,10 @@ mod tests {
     fn unicode_tier_keeps_the_word_and_adds_a_gauge() {
         assert_eq!(IconSet::Unicode.cpu(None, 26.0), "cpu ░26%");
         assert_eq!(IconSet::Unicode.ram(None, 8.0), "ram ░8%");
+        assert_eq!(
+            IconSet::Unicode.disk(None, None, 53.0, "240G"),
+            "disk ▒53% 240G",
+        );
         assert_eq!(
             IconSet::Unicode.battery(None, bat(74.0, State::Discharging)),
             "bat ▓74%",
@@ -808,6 +881,10 @@ mod tests {
         assert_eq!(IconSet::NerdFont.cpu(None, 26.0), "\u{f4bc} 26%");
         assert_eq!(IconSet::NerdFont.ram(None, 8.0), "\u{efc5} 8%");
         assert_eq!(
+            IconSet::NerdFont.disk(None, None, 53.0, "240G"),
+            "\u{f0a0} 53% 240G",
+        );
+        assert_eq!(
             IconSet::NerdFont.battery(None, bat(74.0, State::Discharging)),
             "\u{f241} 74%",
         );
@@ -817,6 +894,7 @@ mod tests {
     fn emoji_tier_sits_flush_against_the_number() {
         assert_eq!(IconSet::Emoji.cpu(None, 26.0), "💻26%");
         assert_eq!(IconSet::Emoji.ram(None, 8.0), "🧠8%");
+        assert_eq!(IconSet::Emoji.disk(None, None, 53.0, "240G"), "💾53% 240G");
         assert_eq!(
             IconSet::Emoji.battery(None, bat(74.0, State::Discharging)),
             "🔋74%",
@@ -833,6 +911,48 @@ mod tests {
         assert_eq!(IconSet::Unicode.cpu(None, 150.0), "cpu █150%");
         assert_eq!(IconSet::Text.cpu(None, f64::NAN), "cpu 0%");
         assert_eq!(IconSet::Text.cpu(None, 1e30), "cpu 9223372036854775807%");
+    }
+
+    // ---- the disk cell ---------------------------------------------------------
+
+    #[test]
+    fn a_disk_cell_names_its_drive_when_asked_to() {
+        // The mount qualifies the NAME, so it lands between the naming and the
+        // reading — which keeps the Unicode gauge hard against the number it
+        // measures instead of floating off before the mount.
+        assert_eq!(
+            IconSet::Text.disk(None, Some("/data"), 71.0, "600G"),
+            "disk /data 71% 600G",
+        );
+        assert_eq!(
+            IconSet::Unicode.disk(None, Some("/"), 53.0, "240G"),
+            "disk / ▒53% 240G",
+        );
+        assert_eq!(
+            IconSet::Emoji.disk(None, Some("C:"), 92.0, "40G"),
+            "💾C: 92% 40G",
+        );
+    }
+
+    #[test]
+    fn the_disk_gauge_measures_how_full_the_drive_is() {
+        // Rising with use, like the cpu and ram gauges beside it: a nearly full
+        // disk shows a full block, not an empty one.
+        let gauge = |used| IconSet::Unicode.disk(None, None, used, "size");
+        assert_eq!(gauge(2.0), "disk ░2% size"); // nearly empty drive
+        assert_eq!(gauge(50.0), "disk ▒50% size");
+        assert_eq!(gauge(95.0), "disk █95% size"); // nearly full drive
+    }
+
+    #[test]
+    fn a_disk_percent_rounds_like_every_other_percent() {
+        assert_eq!(
+            IconSet::Text.disk(None, None, 53.125, "240G"),
+            "disk 53% 240G",
+        );
+        assert_eq!(IconSet::Text.disk(None, None, 0.4, "2G"), "disk 0% 2G");
+        // Impossible readings never panic — the same guarantee the ramps carry.
+        assert_eq!(IconSet::Text.disk(None, None, f64::NAN, "?"), "disk 0% ?");
     }
 
     // ---- charge state ----------------------------------------------------------
@@ -920,6 +1040,11 @@ mod tests {
             assert_eq!(set.cpu(Some("CPU"), 26.0), "CPU 26%", "{set:?}");
             assert_eq!(set.ram(Some("MEM"), 8.0), "MEM 8%", "{set:?}");
             assert_eq!(
+                set.disk(Some("FREE"), None, 53.0, "240G"),
+                "FREE 53% 240G",
+                "{set:?}",
+            );
+            assert_eq!(
                 set.battery(Some("PWR"), bat(74.0, State::Discharging)),
                 "PWR 74%",
                 "{set:?}",
@@ -944,6 +1069,12 @@ mod tests {
         for set in ALL_TIERS {
             let rendered = set.cpu(Some(""), 26.0);
             assert_eq!(rendered, "26%", "{set:?}");
+            // Same for a disk, whose cell carries more than the one number.
+            assert_eq!(
+                set.disk(Some(""), None, 53.0, "240G"),
+                "53% 240G",
+                "{set:?}"
+            );
         }
     }
 
@@ -953,11 +1084,15 @@ mod tests {
         // tells the user to paste must render as exactly that naming, once, in
         // every tier — including the tier it was generated from.
         for source in ALL_TIERS {
-            let (cpu_label, ram_label, battery_label) = source.label_values();
+            let (cpu_label, ram_label, battery_label, disk_label) = source.label_values();
             for target in ALL_TIERS {
                 let cpu = target.cpu(Some(&cpu_label), 26.0);
                 assert_eq!(cpu, format!("{cpu_label} 26%"), "{source:?} -> {target:?}");
                 assert_eq!(target.ram(Some(&ram_label), 8.0), format!("{ram_label} 8%"));
+                assert_eq!(
+                    target.disk(Some(&disk_label), None, 53.0, "240G"),
+                    format!("{disk_label} 53% 240G"),
+                );
                 assert_eq!(
                     target.battery(Some(&battery_label), bat(74.0, State::Discharging)),
                     format!("{battery_label} 74%"),
@@ -967,19 +1102,68 @@ mod tests {
     }
 
     #[test]
-    fn the_snippet_is_valid_toml_naming_all_three_keys() {
+    fn the_herdr_snippet_names_only_the_keys_herdr_knows() {
+        // The bug this pins: herdr draws no battery and no disk, so it has no
+        // key for either, and a `battery_label` inside `[ui]` makes every
+        // `herdr server reload-config` log `unknown config key`. The snippet is
+        // pasted verbatim by definition, so it may not contain one.
         for set in ALL_TIERS {
             let snippet = herdr_ui_snippet(set);
             assert!(snippet.starts_with("[ui]\n"), "{set:?}: {snippet}");
-            for key in ["cpu_label", "ram_label", "battery_label"] {
+            for key in ["cpu_label", "ram_label"] {
                 assert!(snippet.contains(&format!("{key} = \"")), "{set:?}: {key}");
             }
+            for key in ["battery_label", "disk_label"] {
+                assert!(
+                    !snippet.contains(key),
+                    "{set:?}: herdr does not know {key}: {snippet}",
+                );
+            }
             // One line per key plus the table header — nothing stray.
-            assert_eq!(snippet.lines().count(), 4, "{set:?}: {snippet}");
+            assert_eq!(snippet.lines().count(), 3, "{set:?}: {snippet}");
         }
         // The text tier reproduces the documented defaults exactly.
         assert!(herdr_ui_snippet(IconSet::Text).contains("cpu_label = \"cpu\""));
-        assert!(herdr_ui_snippet(IconSet::Text).contains("battery_label = \"bat\""));
+        assert!(herdr_ui_snippet(IconSet::Text).contains("ram_label = \"ram\""));
+    }
+
+    #[test]
+    fn both_snippets_parse_back_into_the_config_they_belong_to() {
+        // End to end on "paste this there": the herdr block has to come back out
+        // of herdr's label parser, and the plugin block out of the plugin's — a
+        // snippet that only looks like TOML is a snippet that silently does
+        // nothing.
+        for set in ALL_TIERS {
+            let (cpu, ram, battery, disk) = set.label_values();
+
+            let labels = crate::config::parse_herdr_labels_for_test(&herdr_ui_snippet(set));
+            assert_eq!(labels.cpu(), Some(cpu.as_str()), "{set:?}");
+            assert_eq!(labels.ram(), Some(ram.as_str()), "{set:?}");
+
+            let config = crate::config::parse_config_for_test(&plugin_config_snippet(set));
+            assert_eq!(config.battery_label.as_deref(), Some(battery.as_str()));
+            assert_eq!(config.disk_label.as_deref(), Some(disk.as_str()));
+            assert_eq!(config.icon_set(), IconSet::Text, "{set:?}");
+        }
+    }
+
+    #[test]
+    fn the_plugin_snippet_names_the_metrics_herdr_does_not_draw() {
+        for set in ALL_TIERS {
+            let snippet = plugin_config_snippet(set);
+            // No table header: the plugin's config is flat `key = value` lines,
+            // so a `[ui]` pasted into it would be a line the parser ignores.
+            assert!(!snippet.contains('['), "{set:?}: {snippet}");
+            for key in ["battery_label", "disk_label"] {
+                assert!(snippet.contains(&format!("{key} = \"")), "{set:?}: {key}");
+            }
+            // With explicit labels the tier adds no glyph of its own, so `text`
+            // is the honest setting to ship alongside them.
+            assert!(snippet.contains("icons = \"text\""), "{set:?}: {snippet}");
+            assert_eq!(snippet.lines().count(), 3, "{set:?}: {snippet}");
+        }
+        assert!(plugin_config_snippet(IconSet::Text).contains("battery_label = \"bat\""));
+        assert!(plugin_config_snippet(IconSet::Text).contains("disk_label = \"disk\""));
     }
 
     #[test]
@@ -1018,6 +1202,11 @@ mod tests {
             // rather than ours.
             out.push(set.cpu(None, percent));
             out.push(set.ram(None, percent));
+            // Both disk shapes: the mount and the size are the user's own ASCII
+            // (a path they typed, a figure we formatted), so what is under test
+            // here is still only what the tier adds around them.
+            out.push(set.disk(None, None, percent, "240G"));
+            out.push(set.disk(None, Some("/data"), percent, "1.2T"));
             for state in ALL_STATES {
                 out.push(set.battery(None, bat(percent, state)));
             }
@@ -1100,7 +1289,7 @@ mod tests {
     fn opt_in_tiers_are_out_of_the_safe_range_by_construction() {
         // Documents *why* these two tiers are opt-in rather than auto-detected:
         // by definition their glyphs cannot be there without a font install.
-        for glyph in [NERD_CPU, NERD_RAM]
+        for glyph in [NERD_CPU, NERD_RAM, NERD_DISK]
             .into_iter()
             .chain(NERD_BATTERY_RAMP.iter().map(|&(_, glyph)| glyph))
         {
@@ -1111,7 +1300,7 @@ mod tests {
                 glyph as u32,
             );
         }
-        for glyph in [EMOJI_CPU, EMOJI_RAM, EMOJI_BATTERY] {
+        for glyph in [EMOJI_CPU, EMOJI_RAM, EMOJI_BATTERY, EMOJI_DISK] {
             assert!(
                 (glyph as u32) > 0xFFFF,
                 "emoji U+{:04X} is inside the BMP",

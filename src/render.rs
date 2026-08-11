@@ -18,6 +18,7 @@ use serde_json::Number;
 use crate::battery::{Battery, State};
 use crate::collect;
 use crate::config::{Config, Labels, RamDisplay};
+use crate::disk::Disk;
 use crate::herdr::Herdr;
 use crate::icons::IconSet;
 use crate::model::Space;
@@ -95,14 +96,29 @@ fn fmt_ram(mb: f64) -> String {
     }
 }
 
-/// Compact absolute RAM: `"<x.x>G"` at/above 1024 MB, else `"<n>M"`
-/// — the narrow form the sidebar falls back to.
-fn compact_ram(mb: f64) -> String {
-    if mb >= 1024.0 {
-        format!("{:.1}G", mb / 1024.0)
-    } else {
-        format!("{}M", mb.round() as i64)
+/// Compact absolute size for the narrow cells: `512M`, `1.5G`, `231G`, `1.2T`.
+///
+/// One decimal below 10 and none at or above it, which is the difference between
+/// a RAM figure that needs the precision (`1.5G` says something `2G` does not)
+/// and a disk figure that does not (`231G` is the number people quote; `231.0G`
+/// is two characters of noise in a cell measured in columns).
+///
+/// One formatter for both metrics rather than two: they are the same job, and a
+/// second copy is where the two would start disagreeing about what a gigabyte
+/// looks like.
+fn compact_size(mb: f64) -> String {
+    const STEPS: [(f64, &str); 2] = [(1024.0 * 1024.0, "T"), (1024.0, "G")];
+    for (scale, unit) in STEPS {
+        if mb >= scale {
+            let value = mb / scale;
+            return if value >= 10.0 {
+                format!("{}{unit}", value.round() as i64)
+            } else {
+                format!("{value:.1}{unit}")
+            };
+        }
     }
+    format!("{}M", mb.round() as i64)
 }
 
 // ---- narrow metric cells ----------------------------------------------------
@@ -194,7 +210,7 @@ pub(crate) fn ram_cell_of(
     } else {
         // The tier still names the metric; what it withholds is the gauge. See
         // [`IconSet::ram_absolute`] for why those are two different jobs.
-        icons.ram_absolute(label, &compact_ram(mb))
+        icons.ram_absolute(label, &compact_size(mb))
     }
 }
 
@@ -208,15 +224,59 @@ fn battery_cell(icons: IconSet, labels: &Labels, reading: Option<Battery>) -> Op
     reading.map(|reading| icons.battery(labels.battery(), reading))
 }
 
-/// Join the cells of one narrow row: `cpu ░26% · ram ░8% · bat ▓74%`.
+/// One drive's cell — `disk 79% 240G`, or `disk /data 79% 240G` when `mount`
+/// names it: the percentage USED, then the size still free.
+///
+/// The size is formatted here rather than in [`crate::icons`] because how a size
+/// is spelled is this module's job and the tier's job is the glyph in front of
+/// it. Public so the `--icons` preview draws the same cell every other surface
+/// does.
+pub fn disk_cell(
+    icons: IconSet,
+    label: Option<&str>,
+    mount: Option<&str>,
+    reading: &Disk,
+) -> String {
+    icons.disk(
+        label,
+        mount,
+        reading.used_percent(),
+        &compact_size(reading.free_mb),
+    )
+}
+
+/// A cell per drive, in the order the user listed them.
+///
+/// The mount is named only when there is more than one: with a single drive
+/// there is nothing to disambiguate, and these rows are measured in columns. Two
+/// or more and every cell has to say which drive it is talking about, or the
+/// title reads as one number contradicting another.
+fn disk_cells(style: RowStyle, disks: &[Disk]) -> Vec<String> {
+    let named = disks.len() > 1;
+    disks
+        .iter()
+        .map(|reading| {
+            disk_cell(
+                style.icons,
+                style.labels.disk(),
+                named.then_some(reading.name.as_str()),
+                reading,
+            )
+        })
+        .collect()
+}
+
+/// Join the cells of one narrow row:
+/// `cpu ░26% · ram ░8% · bat ▓74% · disk ▒79% 240G`.
 ///
 /// Split from [`usage_row`] so the `--icons` preview can feed it fixed sample
 /// percentages — a preview built out of the host's real RAM total would show a
 /// different row on every machine — while still going through the one function
 /// that decides cell order and separator.
-pub fn metric_row(cpu: String, ram: String, battery: Option<String>) -> String {
+pub fn metric_row(cpu: String, ram: String, battery: Option<String>, disks: Vec<String>) -> String {
     let mut cells = vec![cpu, ram];
     cells.extend(battery); // absent battery: no cell, no trailing separator
+    cells.extend(disks); // ..and likewise a drive that could not be read
     cells.join(CELL_SEPARATOR)
 }
 
@@ -231,29 +291,37 @@ fn usage_cells(cpu: f64, ram_mb: f64, style: RowStyle) -> (String, String) {
 
 /// One space's narrow row — what the sidebar card and the agents panel show.
 ///
-/// Takes no battery, and that is the point rather than an omission: the battery
-/// is one reading for the whole machine, so repeating it on every space's row
-/// says the same number N times and reads as if each space had its own pack. The
-/// machine-wide surfaces draw it instead — the window title via [`totals_row`],
-/// the terminal report on its total line, and (on a patched build) herdr's own
+/// Takes no battery and no disk, and that is the point rather than an omission:
+/// both are single readings for the whole machine, so repeating either on every
+/// space's row says the same number N times and reads as if each space had its
+/// own pack — or its own drive. The machine-wide surfaces draw them instead —
+/// the window title via [`totals_row`], the terminal report on its total line, and (on a patched build) herdr's own
 /// sidebar header. Keeping the parameter off the signature is what stops a
 /// future caller from putting it back by accident.
 pub fn usage_row(cpu: f64, ram_mb: f64, style: RowStyle) -> String {
     let (cpu_cell, ram) = usage_cells(cpu, ram_mb, style);
-    metric_row(cpu_cell, ram, None)
+    metric_row(cpu_cell, ram, None, Vec::new())
 }
 
 /// The all-space totals as a narrow row — [`usage_row`] plus the machine's one
 /// battery cell. This is the window title.
 ///
-/// `battery` is the reading taken once per refresh cycle by
-/// [`Config::battery_reading`] and passed down, never re-read here.
-pub fn totals_row(cpu: f64, ram_mb: f64, style: RowStyle, battery: Option<Battery>) -> String {
+/// `battery` and `disks` are the readings taken once per refresh cycle by
+/// [`Config::battery_reading`] and [`Config::disk_readings`] and passed down,
+/// never re-read here.
+pub fn totals_row(
+    cpu: f64,
+    ram_mb: f64,
+    style: RowStyle,
+    battery: Option<Battery>,
+    disks: &[Disk],
+) -> String {
     let (cpu_cell, ram) = usage_cells(cpu, ram_mb, style);
     metric_row(
         cpu_cell,
         ram,
         battery_cell(style.icons, style.labels, battery),
+        disk_cells(style, disks),
     )
 }
 
@@ -261,16 +329,18 @@ pub fn totals_row(cpu: f64, ram_mb: f64, style: RowStyle, battery: Option<Batter
 
 /// Format the per-space CPU/RAM report as a coloured, multi-line string.
 ///
-/// `battery` lands on the total line and nowhere else. It is one number for the
-/// whole machine, so stamping the same figure onto every space's row would be
-/// noise in a report this wide — and worse, would read as if it were per-space.
+/// `battery` and `disks` land on the total line and nowhere else. Each is one
+/// figure for the whole machine, so stamping them onto every space's row would
+/// be noise in a report this wide — and worse, would read as if they were
+/// per-space.
 pub fn render(
     spaces: &[Space],
     labels: &Labels,
     icons: IconSet,
     battery: Option<Battery>,
+    disks: &[Disk],
 ) -> String {
-    render_styled(spaces, labels, icons, battery, &Style::detect())
+    render_styled(spaces, labels, icons, battery, disks, &Style::detect())
 }
 
 /// Colour-parametrised body of [`render`] (split out so tests can force a
@@ -280,6 +350,7 @@ fn render_styled(
     labels: &Labels,
     icons: IconSet,
     battery: Option<Battery>,
+    disks: &[Disk],
     style: &Style,
 ) -> String {
     let mut lines: Vec<String> = vec![style.bold("  CPU / RAM per space"), String::new()];
@@ -348,10 +419,16 @@ fn render_styled(
         format!(" ({total_pct})")
     };
     // Three spaces is the gap between the total line's other cells, so the
-    // battery joins the row rather than looking bolted on.
-    let total_battery_str = battery_cell(icons, labels, battery)
+    // machine-wide cells join the row rather than looking bolted on. The report
+    // is wide, so they use the percent form of the RAM cell's style regardless.
+    let machine_cells: String = battery_cell(icons, labels, battery)
+        .into_iter()
+        .chain(disk_cells(
+            RowStyle::new(labels, icons, RamDisplay::Percent),
+            disks,
+        ))
         .map(|cell| format!("   {cell}"))
-        .unwrap_or_default();
+        .collect();
     lines.push(style.dim(&format!(
         "  ── total   {} {:.1}%   {} {}{}{}",
         labels.cpu_word(),
@@ -359,7 +436,7 @@ fn render_styled(
         labels.ram_word(),
         fmt_ram(total_ram),
         total_pct_str,
-        total_battery_str,
+        machine_cells,
     )));
 
     lines.join("\n")
@@ -398,6 +475,27 @@ struct JsonSpace {
     /// Charge state as a lowercase string (`charging`, `discharging`, `full`,
     /// `not_charging`, `unknown`), or `null` alongside a `null` percentage.
     battery_state: Option<String>,
+    /// Space on each selected drive, machine-wide and so repeated on every row
+    /// for the reason [`Self::battery_percent`] gives. `[]` when the user turned
+    /// the metric off, and likewise when no selected drive could be read — an
+    /// array that is always present is one a consumer can read unconditionally.
+    disks: Vec<JsonDisk>,
+}
+
+/// One drive inside a [`JsonSpace`].
+///
+/// Every field is named for exactly what it holds, because "disk percent" is
+/// the one figure on this payload a reader can take two ways: `used_percent` is
+/// what `df` prints under `Use%`, and `used_mb + free_mb` is smaller than
+/// `total_mb` on a unix filesystem by the blocks reserved for root — which is
+/// why the percentage is not `100 - free/total`.
+#[derive(Serialize, Clone)]
+struct JsonDisk {
+    name: String,
+    used_percent: Number,
+    free_mb: Number,
+    used_mb: Number,
+    total_mb: Number,
 }
 
 /// The wire spelling of a charge state: lowercase, `snake_case`, and stable.
@@ -428,10 +526,21 @@ fn json_num_1dp(x: f64) -> Number {
 /// Serialize spaces to the `--json` payload (array of per-space objects), 2-space
 /// indented. No trailing newline.
 ///
-/// `battery` is the one reading taken for this snapshot, copied onto every row —
-/// see [`JsonSpace::battery_percent`] for why it rides along per space.
-pub fn render_json(spaces: &[Space], battery: Option<Battery>) -> String {
+/// `battery` and `disks` are the readings taken once for this snapshot, copied
+/// onto every row — see [`JsonSpace::battery_percent`] for why they ride along
+/// per space.
+pub fn render_json(spaces: &[Space], battery: Option<Battery>, disks: &[Disk]) -> String {
     let mem_total = proc::mem_total_mb();
+    let json_disks: Vec<JsonDisk> = disks
+        .iter()
+        .map(|d| JsonDisk {
+            name: d.name.clone(),
+            used_percent: json_num_1dp(d.used_percent()),
+            free_mb: json_num_1dp(d.free_mb),
+            used_mb: json_num_1dp(d.used_mb),
+            total_mb: json_num_1dp(d.total_mb),
+        })
+        .collect();
     let payload: Vec<JsonSpace> = spaces
         .iter()
         .map(|s| JsonSpace {
@@ -447,6 +556,7 @@ pub fn render_json(spaces: &[Space], battery: Option<Battery>) -> String {
             includes_worktrees: s.worktree_labels.clone(),
             battery_percent: battery.map(|b| json_num_1dp(b.percent)),
             battery_state: battery.map(|b| battery_state_key(b.state).to_string()),
+            disks: json_disks.clone(),
         })
         .collect();
     serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_string())
@@ -459,7 +569,13 @@ pub fn run_once(client: &mut Herdr, labels: &Labels, config: &Config) -> crate::
     let spaces = collect::snapshot(client, SNAPSHOT_WINDOW_MS)?;
     println!(
         "{}",
-        render(&spaces, labels, config.icon_set(), config.battery_reading()),
+        render(
+            &spaces,
+            labels,
+            config.icon_set(),
+            config.battery_reading(),
+            &config.disk_readings(),
+        ),
     );
     Ok(())
 }
@@ -467,7 +583,10 @@ pub fn run_once(client: &mut Herdr, labels: &Labels, config: &Config) -> crate::
 /// `--json`: print one JSON snapshot and return.
 pub fn run_json(client: &mut Herdr, config: &Config) -> crate::Result<()> {
     let spaces = collect::snapshot(client, SNAPSHOT_WINDOW_MS)?;
-    println!("{}", render_json(&spaces, config.battery_reading()));
+    println!(
+        "{}",
+        render_json(&spaces, config.battery_reading(), &config.disk_readings()),
+    );
     Ok(())
 }
 
@@ -495,13 +614,14 @@ pub fn run_interval(
     let mut window_ms = FIRST_FRAME_WINDOW_MS;
     loop {
         let battery = config.battery_reading();
+        let disks = config.disk_readings();
         // On success, `snapshot` paces the loop via its internal
         // `thread::sleep(window_ms)` inside `measure`; on the error path it
         // returns before `measure`, so this frame has no delay of its own and
         // must sleep the cadence itself to avoid busy-spinning (mirrors the
         // daemon's error-branch sleep).
         let (body, failed) = match collect::snapshot(client, window_ms) {
-            Ok(spaces) => (render(&spaces, labels, icons, battery), false),
+            Ok(spaces) => (render(&spaces, labels, icons, battery, &disks), false),
             Err(err) => (
                 format!("{} {err}", Style::detect().red("  herdr unavailable:")),
                 true,
@@ -609,6 +729,19 @@ mod tests {
         Battery { percent, state }
     }
 
+    /// Terse [`Disk`] builder: free and total in GB, which is how drives are
+    /// quoted, converted to the MB the type stores. `used` is the rest of the
+    /// disk, so these fixtures have no root reserve and `used% = 100 - free%`
+    /// exactly — the reserve is `disk`'s business and is tested there.
+    fn drive(name: &str, free_gb: f64, total_gb: f64) -> Disk {
+        Disk {
+            name: name.to_string(),
+            free_mb: free_gb * 1024.0,
+            used_mb: (total_gb - free_gb) * 1024.0,
+            total_mb: total_gb * 1024.0,
+        }
+    }
+
     // ---- fmt_ram / compact_ram: MB below 1024, GB at/above -------------------
 
     #[test]
@@ -621,12 +754,25 @@ mod tests {
     }
 
     #[test]
-    fn compact_ram_switches_unit_at_1024() {
-        assert_eq!(compact_ram(0.0), "0M");
-        assert_eq!(compact_ram(512.6), "513M"); // rounds to whole MB
-        assert_eq!(compact_ram(1023.4), "1023M"); // still MB below the gate
-        assert_eq!(compact_ram(1024.0), "1.0G");
-        assert_eq!(compact_ram(1536.0), "1.5G");
+    fn compact_size_switches_unit_at_1024() {
+        assert_eq!(compact_size(0.0), "0M");
+        assert_eq!(compact_size(512.6), "513M"); // rounds to whole MB
+        assert_eq!(compact_size(1023.4), "1023M"); // still MB below the gate
+        assert_eq!(compact_size(1024.0), "1.0G");
+        assert_eq!(compact_size(1536.0), "1.5G");
+    }
+
+    #[test]
+    fn compact_size_drops_the_decimal_once_the_figure_is_big() {
+        // RAM is the reason for the decimal (`1.5G` says what `2G` cannot); a
+        // disk is the reason for dropping it (`231.0G` is two columns of noise
+        // in a cell measured in columns).
+        assert_eq!(compact_size(9.9 * 1024.0), "9.9G");
+        assert_eq!(compact_size(10.0 * 1024.0), "10G");
+        assert_eq!(compact_size(231.4 * 1024.0), "231G");
+        // ..and a drive big enough to leave GB behind.
+        assert_eq!(compact_size(1024.0 * 1024.0), "1.0T");
+        assert_eq!(compact_size(18.0 * 1024.0 * 1024.0), "18T");
     }
 
     // ---- narrow metric cells --------------------------------------------------
@@ -754,7 +900,7 @@ mod tests {
         // cpu_label = "" / ram_label = "" / ram_display = "gb" in the plugin
         // config: bare numbers, still separated — the compact row this feature
         // exists for.
-        let labels = Labels::new(Some(""), Some(""), None);
+        let labels = Labels::new(Some(""), Some(""), None, None);
         let row = usage_row(
             26.0,
             1536.0,
@@ -794,6 +940,7 @@ mod tests {
                 "A".to_string(),
                 "B".to_string(),
                 battery.map(str::to_string),
+                Vec::new(),
             )
         };
         assert_eq!(cells(None), "A · B"); // no dangling separator
@@ -801,9 +948,10 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_row_is_cpu_then_ram_then_battery() {
+    fn a_narrow_row_is_cpu_then_ram_then_battery_then_disks() {
         // The whole row, spelled out with the machine total pinned (1310.72 MB
         // of 16384 MB is 8%) — the row builders read that total from the host.
+        let labels = Labels::default();
         let row = metric_row(
             IconSet::Unicode.cpu(None, 26.0),
             ram_cell_of(
@@ -815,11 +963,189 @@ mod tests {
             ),
             battery_cell(
                 IconSet::Unicode,
-                &Labels::default(),
+                &labels,
                 Some(bat(74.0, State::Discharging)),
             ),
+            disk_cells(
+                RowStyle::new(&labels, IconSet::Unicode, RamDisplay::Percent),
+                &[drive("/", 240.0, 512.0)],
+            ),
         );
-        assert_eq!(row, "cpu ░26% · ram ░8% · bat ▓74%");
+        assert_eq!(row, "cpu ░26% · ram ░8% · bat ▓74% · disk ▒53% 240G");
+    }
+
+    // ---- disk cells ----------------------------------------------------------
+
+    /// The style the narrow surfaces use, with the percent RAM form.
+    fn unicode_style(labels: &Labels) -> RowStyle<'_> {
+        RowStyle::new(labels, IconSet::Unicode, RamDisplay::Percent)
+    }
+
+    #[test]
+    fn a_disk_cell_shows_the_used_percent_then_the_free_size() {
+        // The percentage is USED, like the cpu and ram cells beside it, so the
+        // row reads one way. The size is what is LEFT — the figure you act on,
+        // and unmistakable for a percentage because it carries a unit.
+        let cell = |icons| disk_cell(icons, None, None, &drive("/", 240.0, 512.0));
+        assert_eq!(cell(IconSet::Text), "disk 53% 240G");
+        assert_eq!(cell(IconSet::Unicode), "disk ▒53% 240G");
+        assert_eq!(cell(IconSet::NerdFont), "\u{f0a0} 53% 240G");
+        assert_eq!(cell(IconSet::Emoji), "💾53% 240G");
+    }
+
+    #[test]
+    fn a_nearly_full_drive_reads_alarming() {
+        // The reading the metric exists for: 12 GB left of 512 GB. A full gauge
+        // and a high percentage, exactly as a pegged cpu would read — which is
+        // why the cell shows used rather than free.
+        assert_eq!(
+            disk_cell(IconSet::Unicode, None, None, &drive("/", 12.0, 512.0)),
+            "disk █98% 12G",
+        );
+    }
+
+    #[test]
+    fn one_drive_is_unnamed_and_several_name_themselves() {
+        let labels = Labels::default();
+        let style = RowStyle::new(&labels, IconSet::Text, RamDisplay::Percent);
+        let one = disk_cells(style, &[drive("/", 240.0, 512.0)]);
+        assert_eq!(one, vec!["disk 53% 240G"], "nothing to disambiguate");
+
+        let many = disk_cells(
+            style,
+            &[drive("/", 240.0, 512.0), drive("/data", 600.0, 2048.0)],
+        );
+        assert_eq!(
+            many,
+            vec!["disk / 53% 240G", "disk /data 71% 600G"],
+            "two cells that do not say which drive is which are two numbers \
+             contradicting each other",
+        );
+    }
+
+    #[test]
+    fn disk_cells_of_nothing_is_no_cells() {
+        // `disk = false`, and a host where no selected drive answered, arrive
+        // here the same way — and neither leaves a dangling separator.
+        let labels = Labels::default();
+        assert_eq!(
+            disk_cells(unicode_style(&labels), &[]),
+            Vec::<String>::new(),
+        );
+    }
+
+    #[test]
+    fn a_custom_disk_label_replaces_the_tier_naming() {
+        let labels = Labels::new(None, None, None, Some("free"));
+        let style = RowStyle::new(&labels, IconSet::NerdFont, RamDisplay::Percent);
+        assert_eq!(
+            disk_cells(style, &[drive("/", 240.0, 512.0)]),
+            vec!["free 53% 240G"],
+        );
+        // ..and an empty one names nothing at all, with no stray leading space.
+        let bare = Labels::new(None, None, None, Some(""));
+        let bare_style = RowStyle::new(&bare, IconSet::NerdFont, RamDisplay::Percent);
+        assert_eq!(
+            disk_cells(bare_style, &[drive("/", 240.0, 512.0)]),
+            vec!["53% 240G"],
+        );
+    }
+
+    #[test]
+    fn metric_row_appends_a_cell_per_drive_after_the_battery() {
+        let row = |disks: &[&str]| {
+            metric_row(
+                "A".to_string(),
+                "B".to_string(),
+                Some("C".to_string()),
+                disks.iter().map(|d| d.to_string()).collect(),
+            )
+        };
+        assert_eq!(row(&[]), "A · B · C"); // no drive read: no cell
+        assert_eq!(row(&["D"]), "A · B · C · D");
+        assert_eq!(row(&["D", "E"]), "A · B · C · D · E");
+        // A machine with no battery still gets its drives, with no gap where the
+        // battery would have been.
+        assert_eq!(
+            metric_row(
+                "A".to_string(),
+                "B".to_string(),
+                None,
+                vec!["D".to_string()],
+            ),
+            "A · B · D",
+        );
+    }
+
+    // ---- render: the machine-wide drives live on the total line --------------
+
+    #[test]
+    fn render_puts_every_drive_on_the_total_line_only() {
+        let spaces = [
+            space("a", true, 1.0, 1.0, 1),
+            space("b", false, 2.0, 2.0, 1),
+        ];
+        let out = render_styled(
+            &spaces,
+            &Labels::default(),
+            IconSet::Unicode,
+            None,
+            &[drive("/", 240.0, 512.0), drive("/data", 600.0, 2048.0)],
+            &plain(),
+        );
+        let total = out
+            .split('\n')
+            .next_back()
+            .expect("a total line")
+            .to_string();
+
+        assert!(total.contains("disk / ▒53% 240G"), "total: {total}");
+        assert!(total.contains("disk /data ▓71% 600G"), "total: {total}");
+        // Two spaces, one machine: the drives are named once, on the one line
+        // that is about the whole machine.
+        assert_eq!(out.matches("disk").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn render_orders_the_total_line_battery_then_drives() {
+        let out = render_styled(
+            &[space("a", true, 1.0, 1.0, 1)],
+            &Labels::default(),
+            IconSet::Text,
+            Some(bat(74.0, State::Discharging)),
+            &[drive("/", 240.0, 512.0)],
+            &plain(),
+        );
+        let total = out
+            .split('\n')
+            .next_back()
+            .expect("a total line")
+            .to_string();
+        assert!(
+            total.ends_with("   bat 74%   disk 53% 240G"),
+            "total: {total}",
+        );
+    }
+
+    #[test]
+    fn render_without_a_drive_is_the_report_unchanged() {
+        // Additive, exactly like the battery: a host where nothing could be read
+        // — or a user who set `disk = false` — gets the report as it was.
+        let spaces = [space("a", true, 1.0, 1.0, 1)];
+        let report = |disks: &[Disk]| {
+            render_styled(
+                &spaces,
+                &Labels::default(),
+                IconSet::Unicode,
+                None,
+                disks,
+                &plain(),
+            )
+        };
+        assert_eq!(
+            report(&[drive("/", 240.0, 512.0)]).strip_suffix("   disk ▒53% 240G"),
+            Some(report(&[]).as_str()),
+        );
     }
 
     // ---- Style: gating + CPU thresholds --------------------------------------
@@ -846,7 +1172,14 @@ mod tests {
 
     #[test]
     fn render_empty_spaces() {
-        let out = render_styled(&[], &Labels::default(), IconSet::Unicode, None, &plain());
+        let out = render_styled(
+            &[],
+            &Labels::default(),
+            IconSet::Unicode,
+            None,
+            &[],
+            &plain(),
+        );
         assert_eq!(out, "  CPU / RAM per space\n\n  No spaces open.");
     }
 
@@ -859,6 +1192,7 @@ mod tests {
             &Labels::default(),
             IconSet::Unicode,
             None,
+            &[],
             &plain(),
         );
         let lines: Vec<&str> = out.split('\n').collect();
@@ -881,6 +1215,7 @@ mod tests {
             &Labels::default(),
             IconSet::Unicode,
             None,
+            &[],
             &plain(),
         );
         let lines: Vec<&str> = out.split('\n').collect();
@@ -893,18 +1228,26 @@ mod tests {
     fn render_shows_worktree_note() {
         let mut sp = space("repo", false, 0.0, 0.0, 3);
         sp.worktree_labels = Some(vec!["wt-a".to_string(), "wt-b".to_string()]);
-        let out = render_styled(&[sp], &Labels::default(), IconSet::Unicode, None, &plain());
+        let out = render_styled(
+            &[sp],
+            &Labels::default(),
+            IconSet::Unicode,
+            None,
+            &[],
+            &plain(),
+        );
         assert!(out.contains("· 3 panes · +2 worktrees"), "{out}");
     }
 
     #[test]
     fn render_honours_custom_labels() {
-        let labels = Labels::new(Some("CPU"), Some("MEM"), Some("PWR"));
+        let labels = Labels::new(Some("CPU"), Some("MEM"), Some("PWR"), None);
         let out = render_styled(
             &[space("s", false, 1.0, 1.0, 1)],
             &labels,
             IconSet::Text,
             Some(bat(74.0, State::Discharging)),
+            &[],
             &plain(),
         );
         assert!(out.contains("CPU"));
@@ -925,6 +1268,7 @@ mod tests {
             &Labels::default(),
             IconSet::Unicode,
             Some(bat(74.0, State::Discharging)),
+            &[],
             &plain(),
         );
         let lines: Vec<&str> = out.split('\n').collect();
@@ -946,6 +1290,7 @@ mod tests {
             &Labels::default(),
             IconSet::Unicode,
             Some(bat(74.0, State::Discharging)),
+            &[],
             &plain(),
         );
         let without = render_styled(
@@ -953,6 +1298,7 @@ mod tests {
             &Labels::default(),
             IconSet::Unicode,
             None,
+            &[],
             &plain(),
         );
         assert_eq!(with.strip_suffix("   bat ▓74%"), Some(without.as_str()));
@@ -977,7 +1323,11 @@ mod tests {
         a.worktree_labels = Some(vec!["child".to_string()]);
         let b = space("w2", false, 0.0, 0.0, 1); // no worktrees
 
-        let out = render_json(&[a, b], Some(bat(74.0, State::Discharging)));
+        let out = render_json(
+            &[a, b],
+            Some(bat(74.0, State::Discharging)),
+            &[drive("/", 240.0, 512.0)],
+        );
 
         // Keys appear in the declared order. The battery pair is appended at the
         // END: every key an existing consumer reads keeps the position it had.
@@ -994,6 +1344,7 @@ mod tests {
             "includes_worktrees",
             "battery_percent",
             "battery_state",
+            "disks",
         ];
         let mut last = 0;
         for key in order {
@@ -1025,11 +1376,44 @@ mod tests {
     }
 
     #[test]
+    fn json_carries_every_drive_with_named_figures() {
+        let out = render_json(
+            &[space("w1", true, 1.0, 1.0, 1)],
+            None,
+            &[drive("/", 240.0, 512.0), drive("/data", 600.0, 2048.0)],
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let disks = parsed[0]["disks"].as_array().expect("a disks array");
+
+        assert_eq!(disks.len(), 2, "{out}");
+        assert_eq!(disks[0]["name"], "/");
+        assert_eq!(disks[0]["free_mb"], 245_760.0); // 240 GB
+        assert_eq!(disks[0]["used_mb"], 278_528.0); // 272 GB
+        assert_eq!(disks[0]["total_mb"], 524_288.0); // 512 GB
+                                                     // USED percent, matching the cells — 272 of 512.
+        assert_eq!(disks[0]["used_percent"], 53.1);
+        // Order follows the user's selection, so a consumer can index it.
+        assert_eq!(disks[1]["name"], "/data");
+        assert_eq!(disks[1]["used_percent"], 70.7);
+    }
+
+    #[test]
+    fn json_disks_is_an_empty_array_not_a_missing_key() {
+        // `disk = false`, and a host where nothing could be read, both emit `[]`
+        // — a key a consumer can read unconditionally, the rule the rest of this
+        // payload already follows.
+        let out = render_json(&[space("w1", true, 1.0, 1.0, 1)], None, &[]);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed[0]["disks"], serde_json::json!([]), "{out}");
+        assert!(out.contains("\"disks\": []"), "{out}");
+    }
+
+    #[test]
     fn json_battery_pair_is_null_without_a_reading() {
         // A desktop (and a user who set `battery = false`) emits the keys as
         // `null` rather than dropping them — same rule `ram_percent` follows, so
         // a consumer can read the field unconditionally.
-        let out = render_json(&[space("w1", true, 1.0, 1.0, 1)], None);
+        let out = render_json(&[space("w1", true, 1.0, 1.0, 1)], None, &[]);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(parsed[0]["battery_percent"].is_null(), "{out}");
         assert!(parsed[0]["battery_state"].is_null(), "{out}");
@@ -1048,7 +1432,11 @@ mod tests {
         ];
         for (state, key) in expected {
             assert_eq!(battery_state_key(state), key);
-            let out = render_json(&[space("w1", true, 0.0, 0.0, 1)], Some(bat(5.0, state)));
+            let out = render_json(
+                &[space("w1", true, 0.0, 0.0, 1)],
+                Some(bat(5.0, state)),
+                &[],
+            );
             let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
             assert_eq!(parsed[0]["battery_state"], key, "{out}");
         }
@@ -1059,18 +1447,20 @@ mod tests {
         let out = render_json(
             &[space("w1", true, 0.0, 0.0, 1)],
             Some(bat(63.46, State::Full)),
+            &[],
         );
         // 63.46 -> 63.5, and a whole percentage still collapses to an integer.
         assert!(out.contains("\"battery_percent\": 63.5"), "{out}");
         let whole = render_json(
             &[space("w1", true, 0.0, 0.0, 1)],
             Some(bat(100.0, State::Full)),
+            &[],
         );
         assert!(whole.contains("\"battery_percent\": 100,"), "{whole}");
     }
 
     #[test]
     fn json_empty_payload_is_bare_brackets() {
-        assert_eq!(render_json(&[], None), "[]");
+        assert_eq!(render_json(&[], None, &[]), "[]");
     }
 }

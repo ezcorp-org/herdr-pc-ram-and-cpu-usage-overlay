@@ -31,6 +31,7 @@ use std::time::Duration;
 use crate::battery::Battery;
 use crate::collect::{self, PSEUDO_AGENT};
 use crate::config::{self, Config, Labels, Mode, Wanted};
+use crate::disk::Disk;
 use crate::herdr::{self, Herdr};
 use crate::herdr_config::{self, Change};
 use crate::icons::IconSet;
@@ -230,9 +231,10 @@ pub fn run_daemon() -> crate::Result<()> {
                     let mut guard = tracked.lock().expect("tracked mutex poisoned");
                     push_statuses(&mut client, &spaces, config, style, &mut guard);
                 }
-                // The title is the only surface here that draws a battery, so
-                // the read lives under its gate: a machine-wide reading nobody
-                // renders is a sysfs walk (or a `pmset` fork) for nothing.
+                // The title is the only surface here that draws the machine-wide
+                // metrics, so those reads live under its gate: a battery or a
+                // drive nobody renders is a sysfs walk (or a `pmset` fork, or a
+                // `statvfs` per drive) for nothing.
                 if config.window_title_totals {
                     set_title_totals(&mut client, &spaces, config, style);
                 }
@@ -310,7 +312,8 @@ pub fn disable_updater() -> crate::Result<()> {
     // than deleting the marker: an absent marker now means "fresh install", and
     // deleting it would make every disable undo itself on the next restart.
     set_wanted(&config::enabled_flag(), Wanted::Disabled);
-    // Reversible, as promised: whatever we added to herdr's config comes out.
+    // Reversible, as promised: whatever we added to herdr's config comes out —
+    // and taking it out un-does the first-run setup, so let that setup run again.
     if herdr_config::remove_usage_row().is_ok_and(Change::needs_reload) {
         reload_herdr_config();
     }
@@ -482,22 +485,33 @@ pub fn clear_all(client: &mut Herdr, tracked: &Tracked) {
     }
 }
 
-/// Write the all-space CPU/RAM/battery totals to the client window title.
+/// Write the all-space CPU/RAM/battery/disk totals to the client window title.
 ///
-/// Takes the reading off the cycle's `config` rather than a battery argument:
-/// this is the one surface the daemon draws it on, so nothing else has to carry
-/// the value past a row that will not use it.
+/// Takes the readings off the cycle's `config` rather than as arguments: this is
+/// the one surface the daemon draws them on, so nothing else has to carry the
+/// values past a row that will not use them.
 pub fn set_title_totals(client: &mut Herdr, spaces: &[Space], config: &Config, style: RowStyle) {
-    let title = title_totals(spaces, style, config.battery_reading());
+    let title = title_totals(
+        spaces,
+        style,
+        config.battery_reading(),
+        &config.disk_readings(),
+    );
     let _ = client.window_title_set(&title);
 }
 
 /// The window title text: `"spaces · "` plus the per-space row's cells summed
-/// over every space, and the machine's one battery cell.
+/// over every space, then the machine-wide cells — one battery, one per selected
+/// drive.
 ///
 /// Pure, and split from [`set_title_totals`] so the formatting is testable
 /// without a live herdr connection.
-fn title_totals(spaces: &[Space], style: RowStyle, battery: Option<Battery>) -> String {
+fn title_totals(
+    spaces: &[Space],
+    style: RowStyle,
+    battery: Option<Battery>,
+    disks: &[Disk],
+) -> String {
     let mut cpu = 0.0;
     let mut ram_mb = 0.0;
     for sp in spaces {
@@ -506,7 +520,7 @@ fn title_totals(spaces: &[Space], style: RowStyle, battery: Option<Battery>) -> 
     }
     format!(
         "spaces · {}",
-        render::totals_row(cpu, ram_mb, style, battery),
+        render::totals_row(cpu, ram_mb, style, battery, disks),
     )
 }
 
@@ -860,6 +874,16 @@ mod tests {
         Battery { percent, state }
     }
 
+    /// Terse [`Disk`] builder: free and total in GB, as drives are quoted.
+    fn drive(name: &str, free_gb: f64, total_gb: f64) -> Disk {
+        Disk {
+            name: name.to_string(),
+            free_mb: free_gb * 1024.0,
+            used_mb: (total_gb - free_gb) * 1024.0,
+            total_mb: total_gb * 1024.0,
+        }
+    }
+
     // ---- standing down when the binary underneath us is replaced -------------
 
     #[test]
@@ -922,7 +946,7 @@ mod tests {
 
     #[test]
     fn status_line_uses_labels_and_rounds_cpu() {
-        let labels = Labels::new(Some("CPU"), Some("MEM"), Some("PWR"));
+        let labels = Labels::new(Some("CPU"), Some("MEM"), Some("PWR"), Some("DISK"));
         // The RAM cell depends on the host's MemTotal (percent when readable,
         // compact absolute when not), so assert the CPU rounding + label layout,
         // which are total-independent. `render::ram_cell_of` pins both branches.
@@ -975,15 +999,15 @@ mod tests {
     }
 
     #[test]
-    fn a_space_row_is_the_machine_row_without_the_battery() {
-        // The battery is one reading for the whole machine, so it belongs on the
+    fn a_space_row_is_the_machine_row_without_the_battery_or_the_disks() {
+        // Both are single readings for the whole machine, so they belong on the
         // surfaces that draw the machine once — never copied onto each space,
         // where the same number repeated reads as if it were per-space.
         //
-        // `status_line` cannot even be handed a battery now, so what is worth
+        // `status_line` cannot even be handed either now, so what is worth
         // pinning is the consequence: the row a space gets is exactly the
-        // machine-wide row with the battery cell taken off. Host-independent —
-        // whether this box has a pack does not change either side.
+        // machine-wide row with those cells taken off. Host-independent —
+        // whether this box has a pack or a second drive changes neither side.
         let labels = Labels::default();
         let sp = space(26.0, 0.0);
         let style = RowStyle::new(&labels, IconSet::Unicode, RamDisplay::Percent);
@@ -993,14 +1017,19 @@ mod tests {
             sp.ram_mb,
             style,
             Some(bat(74.0, State::Discharging)),
+            &[drive("/", 240.0, 512.0)],
         );
 
         assert!(!row.contains("bat"), "got: {row}");
-        assert_eq!(machine.strip_suffix(" · bat ▓74%"), Some(row.as_str()));
+        assert!(!row.contains("disk"), "got: {row}");
+        assert_eq!(
+            machine.strip_suffix(" · bat ▓74% · disk ▒53% 240G"),
+            Some(row.as_str()),
+        );
     }
 
     #[test]
-    fn status_line_draws_the_cpu_cell_in_every_tier_and_a_battery_in_none() {
+    fn status_line_draws_the_cpu_cell_in_every_tier_and_no_machine_wide_cell() {
         let labels = Labels::default();
         let sp = space(26.0, 0.0);
         // Head of the row per tier; the RAM cell after it is host-dependent, so
@@ -1014,10 +1043,10 @@ mod tests {
         for (icons, cpu) in expected {
             let line = status_line(&sp, RowStyle::new(&labels, icons, RamDisplay::Percent));
             assert!(line.starts_with(&format!("{cpu} · ")), "{icons:?}: {line}");
-            // Each tier names the battery its own way, so check all three marks
-            // against every row — a glyph tier smuggling one back in would slip
-            // straight past a test that only looked for the word.
-            for mark in ["bat", "\u{f241}", "🔋"] {
+            // Each tier names these its own way, so check every spelling against
+            // every row — a glyph tier smuggling one back in would slip straight
+            // past a test that only looked for the word.
+            for mark in ["bat", "\u{f241}", "🔋", "disk", "\u{f0a0}", "💾"] {
                 assert!(!line.contains(mark), "{icons:?} drew {mark}: {line}");
             }
         }
@@ -1031,7 +1060,7 @@ mod tests {
         // that is filling from one that is draining.
         let labels = Labels::default();
         let style = RowStyle::new(&labels, IconSet::Unicode, RamDisplay::Percent);
-        let line = |state| title_totals(&[space(26.0, 0.0)], style, Some(bat(74.0, state)));
+        let line = |state| title_totals(&[space(26.0, 0.0)], style, Some(bat(74.0, state)), &[]);
         assert!(line(State::Charging).ends_with("bat ▓74%+"));
         assert!(line(State::Discharging).ends_with("bat ▓74%"));
         assert!(line(State::Full).ends_with("bat ▓74%="));
@@ -1043,8 +1072,8 @@ mod tests {
         let labels = Labels::default();
         let spaces = [space(10.0, 0.0), space(16.4, 0.0)];
         let style = text_style(&labels);
-        let with = title_totals(&spaces, style, Some(bat(74.0, State::Full)));
-        let without = title_totals(&spaces, style, None);
+        let with = title_totals(&spaces, style, Some(bat(74.0, State::Full)), &[]);
+        let without = title_totals(&spaces, style, None, &[]);
 
         // 10.0 + 16.4 = 26.4, rounded once over the total rather than per space.
         assert!(with.starts_with("spaces · cpu 26% · ram "), "got: {with}");
@@ -1052,6 +1081,46 @@ mod tests {
         assert!(with.ends_with(" · bat 74%="), "got: {with}");
         assert!(!without.contains("bat"), "got: {without}");
         assert_eq!(with.strip_suffix(" · bat 74%="), Some(without.as_str()));
+    }
+
+    #[test]
+    fn the_title_ends_with_each_selected_drive() {
+        // The ask, in the surface it was asked for: the top bar says how much
+        // room is left, and on which drive when there is more than one.
+        let labels = Labels::default();
+        let spaces = [space(10.0, 0.0), space(16.4, 0.0)];
+        let style = text_style(&labels);
+        let title = |disks: &[Disk]| title_totals(&spaces, style, None, disks);
+
+        let one = title(&[drive("/", 240.0, 512.0)]);
+        assert!(one.ends_with(" · disk 53% 240G"), "got: {one}");
+
+        let two = title(&[drive("/", 240.0, 512.0), drive("/data", 600.0, 2048.0)]);
+        assert!(
+            two.ends_with(" · disk / 53% 240G · disk /data 71% 600G"),
+            "got: {two}",
+        );
+
+        // Nothing readable (or `disk = false`): the title is what it always was,
+        // with no gap where a cell would have been.
+        assert!(!title(&[]).contains("disk"), "got: {}", title(&[]));
+    }
+
+    #[test]
+    fn the_title_puts_the_battery_before_the_drives() {
+        // One machine-wide reading, then the drives — a fixed order, so the
+        // title does not reshuffle when a laptop is plugged in.
+        let labels = Labels::default();
+        let title = title_totals(
+            &[space(26.0, 0.0)],
+            text_style(&labels),
+            Some(bat(74.0, State::Discharging)),
+            &[drive("/", 240.0, 512.0)],
+        );
+        assert!(
+            title.ends_with(" · bat 74% · disk 53% 240G"),
+            "got: {title}"
+        );
     }
 
     // ---- restart recovery ---------------------------------------------------

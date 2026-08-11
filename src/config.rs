@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use crate::battery::{self, Battery};
+use crate::disk::{self, Disk};
 use crate::icons::{self, IconSet};
 
 /// Status-surfacing strategy (plugin `config.toml` `mode`).
@@ -118,6 +119,21 @@ pub struct Config {
     /// see [`parse_config`].
     pub cpu_label: Option<String>,
     pub ram_label: Option<String>,
+    /// Whether to show free disk space at all. On by default, like the battery,
+    /// and hidden the same way when nothing can be read.
+    pub disk: bool,
+    /// Which drives get a cell, in the order they are drawn.
+    ///
+    /// Mount points as a person writes them (`/`, `/home`, `C:`) — the reading
+    /// is taken for whatever filesystem the path lands on, so any directory
+    /// inside a mount names it just as well. Defaults to the root filesystem,
+    /// which is the drive people mean when they say "my disk"; anything else is
+    /// a deliberate choice and so has to be written down.
+    pub disks: Vec<String>,
+    /// Naming for the disk cells, in this file rather than herdr's for the same
+    /// reason as [`Config::battery_label`]: herdr has no disk of its own to
+    /// label, so `disk_label` is not a key it knows.
+    pub disk_label: Option<String>,
 }
 
 impl Default for Config {
@@ -132,7 +148,26 @@ impl Default for Config {
             battery_label: None,
             cpu_label: None,
             ram_label: None,
+            disk: true,
+            disks: default_disks(),
+            disk_label: None,
         }
+    }
+}
+
+/// The drive shown when the user has named none: the root filesystem.
+///
+/// On Windows that is whichever letter this install booted from
+/// (`%SystemDrive%`, normally `C:`) rather than a hardcoded `C:` — a machine
+/// that boots from `D:` would otherwise be told about a drive it may not have.
+fn default_disks() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        vec![non_empty_env("SystemDrive").unwrap_or_else(|| "C:".to_string())]
+    }
+    #[cfg(not(windows))]
+    {
+        vec!["/".to_string()]
     }
 }
 
@@ -163,12 +198,29 @@ impl Config {
     pub fn battery_reading(&self) -> Option<Battery> {
         self.battery.then(battery::read).flatten()
     }
+
+    /// This refresh cycle's free-space readings, one per selected drive that
+    /// answered, or empty when the user turned the metric off.
+    ///
+    /// The `disk = false` gate lives here for the same reason the battery's
+    /// does: an opted-out user pays no syscall at all, and every surface
+    /// downstream sees the same empty list a host with no readable drive
+    /// produces. Call ONCE per refresh and pass the result down — these are
+    /// machine-wide figures, so taking them per space would re-stat every drive
+    /// once per space to be told the same thing.
+    pub fn disk_readings(&self) -> Vec<Disk> {
+        match self.disk {
+            true => disk::read(&self.disks),
+            false => Vec::new(),
+        }
+    }
 }
 
 /// Default naming for each metric when herdr's `[ui]` config sets none.
 pub const DEFAULT_CPU_LABEL: &str = "cpu";
 pub const DEFAULT_RAM_LABEL: &str = "ram";
 pub const DEFAULT_BATTERY_LABEL: &str = "bat";
+pub const DEFAULT_DISK_LABEL: &str = "disk";
 
 /// CPU / RAM / battery label tokens sourced from herdr's `[ui]` config.
 ///
@@ -184,6 +236,17 @@ pub struct Labels {
     cpu: Option<String>,
     ram: Option<String>,
     battery: Option<String>,
+    /// Read from herdr's `[ui]` like cpu and ram, and overridden by the
+    /// plugin's own `disk_label`.
+    ///
+    /// Stock herdr draws no disk and so knows no such key — setting it there is
+    /// harmless but earns an `unknown config key` line per reload. It is read
+    /// anyway because a build whose sidebar header *does* draw free space (the
+    /// patched build this plugin is developed against) names it with exactly
+    /// this key, and then one setting keeps the header and these cells saying
+    /// the same word. That is the same bargain `cpu_label` and `ram_label`
+    /// already make.
+    disk: Option<String>,
 }
 
 impl Labels {
@@ -194,11 +257,17 @@ impl Labels {
     /// here through [`parse_herdr_labels`], and an unused constructor on a
     /// public type is an invitation to construct one some other way.
     #[cfg(test)]
-    pub fn new(cpu: Option<&str>, ram: Option<&str>, battery: Option<&str>) -> Self {
+    pub fn new(
+        cpu: Option<&str>,
+        ram: Option<&str>,
+        battery: Option<&str>,
+        disk: Option<&str>,
+    ) -> Self {
         Self {
             cpu: cpu.map(str::to_string),
             ram: ram.map(str::to_string),
             battery: battery.map(str::to_string),
+            disk: disk.map(str::to_string),
         }
     }
 
@@ -214,6 +283,10 @@ impl Labels {
 
     pub fn battery(&self) -> Option<&str> {
         self.battery.as_deref()
+    }
+
+    pub fn disk(&self) -> Option<&str> {
+        self.disk.as_deref()
     }
 
     /// Apply the plugin config's own label overrides on top of herdr's.
@@ -232,6 +305,9 @@ impl Labels {
         }
         if let Some(label) = &config.battery_label {
             self.battery = Some(label.clone());
+        }
+        if let Some(label) = &config.disk_label {
+            self.disk = Some(label.clone());
         }
         self
     }
@@ -421,12 +497,13 @@ pub(crate) fn herdr_config_path() -> PathBuf {
 /// the documented defaults.
 ///
 /// Recognised keys: `mode` (`agents-panel` | `sidebar`), `interval_seconds`
-/// (numeric `>= 1`), `window_title_totals` and `battery` (`false` only when
-/// they equal the literal `false`, any other value is truthy), `icons`
-/// (a tier name kept verbatim for [`crate::icons::resolve`]), `ram_display`
-/// (`percent` | `gb` | `absolute`, case-insensitive), and the three label
-/// overrides — `cpu_label`, `ram_label`, `battery_label` — where an empty value
-/// means "name nothing" rather than unset. Unknown keys are ignored.
+/// (numeric `>= 1`), `window_title_totals`, `battery` and `disk` (`false` only
+/// when they equal the literal `false`, any other value is truthy), `disks` (a
+/// comma-separated drive list), `icons` (a tier name kept verbatim for
+/// [`crate::icons::resolve`]), `ram_display` (`percent` | `gb` | `absolute`,
+/// case-insensitive), and the four label overrides — `cpu_label`, `ram_label`,
+/// `battery_label`, `disk_label` — where an empty value means "name nothing"
+/// rather than unset. Unknown keys are ignored.
 fn parse_config(text: &str) -> Config {
     let mut cfg = Config::default();
     for line in text.split('\n') {
@@ -476,6 +553,18 @@ fn parse_config(text: &str) -> Config {
             "cpu_label" => cfg.cpu_label = Some(value.to_string()),
             "ram_label" => cfg.ram_label = Some(value.to_string()),
             "battery" => cfg.battery = value != "false",
+            "disk_label" => cfg.disk_label = non_empty(value),
+            "disk" => cfg.disk = value != "false",
+            // A blank list reads as unset — the same rule an empty label
+            // follows. `disks = ""` is the obvious first edit when you are
+            // trying to *change* the drives, and honouring it literally would
+            // silently drop the metric with no clue why; `disk = false` is how
+            // you turn it off.
+            "disks" => {
+                if let Some(drives) = parse_disks(value) {
+                    cfg.disks = drives;
+                }
+            }
             // Stored raw: naming the tiers in two places would let the parser
             // and `icons::resolve` disagree about what `Nerd-Font` means.
             "icons" => cfg.icons = value.to_string(),
@@ -520,15 +609,48 @@ fn parse_herdr_labels(text: &str) -> Labels {
             Some(("cpu_label", value)) => labels.cpu = non_empty(value),
             Some(("ram_label", value)) => labels.ram = non_empty(value),
             Some(("battery_label", value)) => labels.battery = non_empty(value),
+            Some(("disk_label", value)) => labels.disk = non_empty(value),
             _ => {}
         }
     }
     labels
 }
 
+/// [`parse_config`] for tests in other modules — [`crate::icons`] checks that
+/// the config block its `--icons` preview tells people to paste actually parses
+/// back into the settings it claims to set.
+#[cfg(test)]
+pub fn parse_config_for_test(text: &str) -> Config {
+    parse_config(text)
+}
+
+/// [`parse_herdr_labels`] for tests in other modules, for the same reason as
+/// [`parse_config_for_test`].
+#[cfg(test)]
+pub fn parse_herdr_labels_for_test(text: &str) -> Labels {
+    parse_herdr_labels(text)
+}
+
 /// `Some(owned)` for a non-empty string, `None` for an empty one.
 fn non_empty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Split a `disks = "/, /home"` value into drives, or `None` when it names none.
+///
+/// Comma-separated rather than a TOML array because the parser here is a flat
+/// `key = value` reader by design (see [`parse_kv_line`]) — a real array would
+/// mean a TOML dependency for one setting. Blanks are dropped and repeats
+/// collapse, so a trailing comma or a doubled entry costs nothing rather than
+/// drawing the same drive twice.
+fn parse_disks(value: &str) -> Option<Vec<String>> {
+    let mut drives: Vec<String> = Vec::new();
+    for drive in value.split(',').map(str::trim).filter(|d| !d.is_empty()) {
+        if !drives.iter().any(|seen| seen == drive) {
+            drives.push(drive.to_string());
+        }
+    }
+    (!drives.is_empty()).then_some(drives)
 }
 
 /// Section name inside a leading `[...]` table header (the `[^\]]+` up to the
@@ -616,6 +738,24 @@ mod tests {
         assert!(cfg.window_title_totals);
         assert!(cfg.battery, "the battery cell is on unless opted out");
         assert_eq!(cfg.icons, "auto");
+        assert!(cfg.disk, "the disk cell is on unless opted out");
+        // The drive people mean when they say "my disk", and the one every
+        // machine has.
+        assert_eq!(cfg.disks, default_disks());
+        assert_eq!(cfg.disks.len(), 1, "one cell by default: {:?}", cfg.disks);
+        assert_eq!(cfg.disk_label, None);
+    }
+
+    #[test]
+    fn the_default_drive_is_the_root_filesystem() {
+        let disks = default_disks();
+        if cfg!(windows) {
+            // Whatever this install booted from — a machine on `D:` must not be
+            // told about a `C:` it may not have.
+            assert!(disks[0].ends_with(':'), "{disks:?}");
+        } else {
+            assert_eq!(disks, vec!["/".to_string()]);
+        }
     }
 
     #[test]
@@ -698,6 +838,99 @@ mod tests {
         assert!(parse_config("battery = 0").battery);
     }
 
+    // ---- plugin config: the drives -------------------------------------------
+
+    #[test]
+    fn config_disks_is_a_comma_separated_list_in_the_order_given() {
+        assert_eq!(
+            parse_config("disks = \"/, /home, /mnt/data\"").disks,
+            vec!["/", "/home", "/mnt/data"],
+            "the cells are drawn in the order the user listed them",
+        );
+        // Unquoted, a single drive, and Windows letters all work the same way.
+        assert_eq!(parse_config("disks = /home").disks, vec!["/home"]);
+        assert_eq!(parse_config("disks = \"C:, D:\"").disks, vec!["C:", "D:"]);
+    }
+
+    #[test]
+    fn config_disks_drops_blanks_and_repeats() {
+        // A trailing comma is the commonest typo, and a doubled entry would
+        // otherwise draw the same drive twice.
+        assert_eq!(
+            parse_config("disks = \"/, ,/home,\"").disks,
+            vec!["/", "/home"]
+        );
+        assert_eq!(parse_config("disks = \"/, /\"").disks, vec!["/"]);
+    }
+
+    #[test]
+    fn config_disks_blank_reads_as_unset_not_as_none() {
+        // The same rule an empty label follows: `disks = ""` is what you write
+        // while you are *changing* the drives, and honouring it literally would
+        // silently drop the metric. `disk = false` is how you turn it off.
+        let default = default_disks();
+        assert_eq!(parse_config("disks = \"\"").disks, default);
+        assert_eq!(parse_config("disks = \" , \"").disks, default);
+    }
+
+    #[test]
+    fn config_disk_false_only_on_literal_false() {
+        assert!(!parse_config("disk = false").disk);
+        assert!(!parse_config("disk = \"false\"").disk);
+        // Same truthiness rule as `battery` and `window_title_totals`, so the
+        // three booleans cannot drift apart.
+        assert!(parse_config("disk = true").disk);
+        assert!(parse_config("disk = 0").disk);
+    }
+
+    #[test]
+    fn config_disk_false_takes_no_reading_at_all() {
+        // Hardware-independent: with the metric off there is nothing to stat,
+        // and every renderer downstream sees the empty list an unreadable host
+        // produces. `disks` is still parsed, so turning it back on keeps the
+        // selection.
+        let cfg = parse_config("disk = false\ndisks = \"/, /home\"");
+        assert_eq!(cfg.disk_readings(), Vec::new());
+        assert_eq!(cfg.disks, vec!["/", "/home"]);
+    }
+
+    #[test]
+    fn config_disk_readings_answer_for_the_selected_drives() {
+        // The live host, through the config: the root filesystem always exists,
+        // and a path that does not is dropped rather than faked.
+        let root = if cfg!(windows) { "C:" } else { "/" };
+        let cfg = parse_config(&format!("disks = \"{root}, /no-such-mount-point\""));
+        let readings = cfg.disk_readings();
+        assert_eq!(readings.len(), 1, "{readings:?}");
+        assert_eq!(readings[0].name, root);
+        assert!(readings[0].total_mb > 0.0, "{readings:?}");
+    }
+
+    #[test]
+    fn the_disk_label_follows_herdrs_config_and_the_plugin_overrides_it() {
+        // A sidebar header that draws free space names it with `ui.disk_label`,
+        // so honouring the key keeps that header and these cells saying the same
+        // word — the bargain cpu and ram already make.
+        let from_herdr = parse_herdr_labels("[ui]\ndisk_label = \"HERDR\"\n");
+        assert_eq!(from_herdr.disk(), Some("HERDR"));
+        assert_eq!(
+            from_herdr.clone().with_overrides(&Config::default()).disk(),
+            Some("HERDR"),
+            "nothing set plugin-side leaves herdr's word standing",
+        );
+
+        // The plugin's own key wins where both are set, as it does for battery.
+        let cfg = parse_config("disk_label = \"free\"");
+        assert_eq!(cfg.disk_label.as_deref(), Some("free"));
+        assert_eq!(from_herdr.with_overrides(&cfg).disk(), Some("free"));
+
+        // With neither, the icon tier does the naming.
+        assert_eq!(
+            Labels::default().with_overrides(&Config::default()).disk(),
+            None,
+        );
+    }
+
     #[test]
     fn config_battery_false_takes_no_reading_at_all() {
         // The whole point of the gate: opting out costs zero syscalls, and
@@ -754,6 +987,7 @@ mod tests {
         assert_eq!(labels.cpu(), None);
         assert_eq!(labels.ram(), None);
         assert_eq!(labels.battery(), None);
+        assert_eq!(labels.disk(), None);
         // Surfaces that always spell a word still get one.
         assert_eq!(labels.cpu_word(), "cpu");
         assert_eq!(labels.ram_word(), "ram");

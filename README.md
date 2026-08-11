@@ -27,10 +27,12 @@ With a Nerd Font installed it detects that and uses icons instead —
 - **Battery**, with a charge-level gauge, on the surfaces that draw the machine
   once — never repeated per space — and **hidden entirely on a machine that has
   none**, so desktops and servers see no empty cell
+- **Disk usage** in the top bar — `disk 78% 387G`: how full the drive is, then
+  how much room is left. Pick which drives appear with `disks = "/, /home"`
 - **Worktree-aware**: workspaces opened as worktree children are folded into
   their parent space's total
 - All-space totals in your terminal's window title:
-  `spaces · cpu 39% · ram 8% · bat 74%+`
+  `spaces · cpu 39% · ram 8% · bat 74%+ · disk 78% 387G`
 - A live dashboard pane and one-shot report/JSON actions
 - A small static Rust binary (~2–5 MB resident) that talks to herdr over its
   unix socket (a named pipe on Windows) — no per-sample subprocess spawns, no
@@ -50,11 +52,11 @@ remote setups need these on the server box only. `node` is no longer required.
 
 Each platform reads processes its own way, chosen at compile time:
 
-| Platform | Process sampling | Battery |
-|---|---|---|
-| Linux | `/proc` | `/sys/class/power_supply` |
-| macOS | `libproc` (`proc_listallpids`, `proc_pidinfo`) | `pmset -g batt` |
-| Windows | Toolhelp32 + `GetProcessTimes` | `GetSystemPowerStatus` |
+| Platform | Process sampling | Battery | Disk |
+|---|---|---|---|
+| Linux | `/proc` | `/sys/class/power_supply` | `statvfs` |
+| macOS | `libproc` (`proc_listallpids`, `proc_pidinfo`) | `pmset -g batt` | `statvfs` |
+| Windows | Toolhelp32 + `GetProcessTimes` | `GetSystemPowerStatus` | `GetDiskFreeSpaceExW` |
 
 On Windows the sampling uses the Win32 process APIs instead of `/proc`, and the
 herdr socket is reached through its named pipe; both are handled automatically.
@@ -100,8 +102,11 @@ rows = [
 
 **The guarantees.**
 
-- **Once.** First run only. A later `status-enable` will not re-add a row you
-  deleted.
+- **Once.** First run only: a later `status-enable` will not re-add a row *you*
+  deleted. `status-disable` is the one exception — it takes our own row back out,
+  so it also re-arms the setup, and the next `status-enable` restores the row.
+  (Before 1.10.0 it did not, so that documented pair left the sidebar
+  permanently blank.)
 - **Guarded.** If your config already references `$usage` anywhere in that table
   — because you set this up by hand before 1.8.0 — nothing is written at all.
 - **Reversible.** `status-disable` removes the marked block. A `$usage` row *you*
@@ -122,7 +127,8 @@ It is already running. To turn it off (and take the config row back out):
 herdr plugin action invoke status-disable --plugin ez-corp.space-usage
 ```
 
-`status-enable` brings it back; `status-toggle` flips whichever way it is.
+`status-enable` brings it back — the updater and the config row both;
+`status-toggle` flips whichever way it is.
 
 Other entrypoints:
 
@@ -169,6 +175,8 @@ mode = "sidebar"            # default — usage inside each spaces card
 interval_seconds = 5        # 1..28800; statuses get a TTL of three intervals
 window_title_totals = true
 battery = true              # machine-wide cell on the title/report, not the rows
+disk = true                 # likewise — free space, one cell per drive
+disks = "/"                 # which drives; "/, /home" for two, "C:, D:" on Windows
 icons = "auto"              # auto | text | unicode | nerdfont | emoji
 ram_display = "percent"     # or "gb" / "absolute" — see RAM as a figure
 ```
@@ -279,6 +287,89 @@ Two details worth knowing:
   to a remote server and the battery shown is the *server's* — usually none.
   That is consistent with cpu and ram, which are also the server's.
 
+## Disk
+
+How full the drive is, and what is left, in the top bar:
+
+```
+spaces · cpu 39% · ram 8% · disk 78% 387G
+```
+
+The percentage is **used**, like the cpu and ram beside it — a row is read one
+way, and a disk that is 78% full should not look like the idlest thing on the
+machine. The size is what is **free**, because that is the figure you act on,
+and its unit makes it unmistakable for the percentage.
+
+It is `df`'s `Use%` exactly: used divided by used + available, **not** by the
+filesystem size. A unix filesystem reserves blocks only root may fill, and those
+are in neither figure — divide by the size instead and you print 79% where `df`
+prints 78%.
+
+Like the battery, it is a machine-wide reading, so it is drawn on the surfaces
+that show the machine once and nowhere else:
+
+| surface | disk |
+|---|---|
+| window title (`window_title_totals`) | yes — one cell per drive |
+| `--once` / dashboard report | yes, on the total line |
+| `--json` payload | yes, a `disks` array on every row (`used_percent`, `free_mb`, `used_mb`, `total_mb`) |
+| per-space sidebar rows | **no** — one drive shared by every space is not a per-space number |
+
+### Where it does and does not appear
+
+Two different programs draw usage in a herdr sidebar, and only one of them is
+this plugin:
+
+```
+ spaces    27% ·  61% ·  78%     <- herdr itself (patched builds only)
+ ● web-app
+     main
+     cpu 26% · ram 8%               <- this plugin, per space
+```
+
+- **The `· spaces` header** is herdr's own whole-machine readout. Stock herdr
+  does not have it at all; it comes from a local patch. **No plugin can put
+  anything there** — there is no API for it — so if you want a disk cell in that
+  header, it has to be built into your herdr. (The patch this plugin is
+  developed against does exactly that, and reads `ui.disk_label` for the naming,
+  which is why this plugin honours that key too.)
+- **The per-space rows** are this plugin, and they carry **cpu and ram only**.
+  No disk, no battery: both are one figure for the whole machine, and repeating
+  the same number under every space reads as if each space had its own drive.
+- **The disk lands on the surfaces that draw the machine once** — your terminal's
+  window title, `--once`, the dashboard pane, and `--json`. If you cannot see it
+  in the window title, check that your terminal actually displays window titles;
+  `space-usage --once` prints the same figures where you can definitely see them.
+
+### Choosing the drives
+
+```toml
+disks = "/"                 # the default: the root filesystem
+disks = "/, /home"          # two cells, in this order
+disks = "C:, D:"            # Windows, where the default is %SystemDrive%
+```
+
+- Any path inside a mount names it, so `disks = "/home/me"` reports whatever
+  filesystem that lives on.
+- With **one** drive the cell is just `disk 78% 387G`. With **more than one**,
+  every cell names its drive — `disk / 78% 387G · disk /home 40% 1.2T` — because
+  two unlabelled numbers side by side read as one contradicting the other.
+- A drive that cannot be read gets **no cell at all**: an unplugged disk, a
+  network share that has gone away, a path that does not exist. Hiding it beats
+  inventing a number, which is the rule the battery already follows.
+- `disk = false` turns the metric off entirely, and skips the syscalls with it.
+- `disks = ""` reads as *unset*, not as "none" — the same rule the labels follow,
+  so a half-finished edit does not silently blank the metric. Use `disk = false`.
+
+Name the cell with `disk_label` in the **plugin's** config (not herdr's — it has
+no disk of its own to label, so a `disk_label` in its `[ui]` earns an
+`unknown config key` line on every reload):
+
+```toml
+disk_label = "free"         # -> free 78% 387G
+disk_label = ""             # -> 78% 387G
+```
+
 ## Icons and labels
 
 `icons` picks the glyph vocabulary. Run the **Preview icon tiers** action (or
@@ -288,14 +379,14 @@ emoji at one column or two, is something only you can see.
 
 | tier | renders | needs |
 |---|---|---|
-| `text` | `cpu 26% · ram 8% · bat 74%` | nothing |
-| `unicode` | `cpu ░26% · ram ░8% · bat ▓74%` | nothing (opt-in) |
-| `nerdfont` | ` 26% ·  8% ·  74%` | a Nerd Font |
-| `emoji` | `💻26% · 🧠8% · 🔋74%` | a colour emoji font |
+| `text` | `cpu 26% · ram 8% · bat 74% · disk 53% 240G` | nothing |
+| `unicode` | `cpu ░26% · ram ░8% · bat ▓74% · disk ▒53% 240G` | nothing (opt-in) |
+| `nerdfont` | ` 26% ·  8% ·  74% ·  53% 240G` | a Nerd Font |
+| `emoji` | `💻26% · 🧠8% · 🔋74% · 💾53% 240G` | a colour emoji font |
 
-The preview draws all three metrics so you can judge every glyph at once. A
-space's row is the first two cells only — the battery rides the machine-wide
-surfaces ([Battery](#battery)).
+The preview draws all four metrics so you can judge every glyph at once. A
+space's row is the first two cells only — the battery and the disk ride the
+machine-wide surfaces ([Battery](#battery), [Disk](#disk)).
 
 ### What `auto` does
 
@@ -329,9 +420,10 @@ are different properties and only the first can be measured from here, so the
 gauge is opt-in. If you want it: `░` below 34%, `▒` below 67%, `▓` below 90%,
 `█` above.
 
-There is no pictogram for "CPU" or "battery" that renders without installing a
-font: the battery emoji `U+1F50B` is absent from both DejaVu Sans Mono and
-Liberation Mono, and Nerd Font glyphs live in the Private Use Area. Every glyph
+There is no pictogram for "CPU", "battery" or "disk" that renders without
+installing a font: the battery emoji `U+1F50B` is absent from both DejaVu Sans
+Mono and Liberation Mono, and Nerd Font glyphs live in the Private Use Area.
+Every glyph
 the `text` and `unicode` tiers emit was checked with `fc-list :charset=<cp>`
 against both faces and is present in both; a test asserts they stay inside the
 BMP, outside the Private Use Area, and on that measured list, so the "no font
@@ -361,8 +453,9 @@ ram_label = "<glyph>"
 ```
 
 ```toml
-# in the plugin's config.toml — battery only (title, report, JSON)
+# in the plugin's config.toml — battery and disk (title, report, JSON)
 battery_label = "<glyph>"
+disk_label = "<glyph>"
 icons = "text"          # the labels are doing the naming now
 ```
 
@@ -370,13 +463,17 @@ Left genuinely empty, those two herdr-side keys read as *unset* (the tier names
 itself), while an empty `battery_label` here reads as "name nothing" — see
 [Empty means "name nothing"](#empty-means-name-nothing-in-this-file) below.
 
-**Why battery is in the other file:** herdr has no battery of its own to label,
-so `battery_label` is not a key it knows. Putting it in herdr's `[ui]` makes
-every `herdr server reload-config` report
-`unknown config key ui.battery_label; ignoring key`. Nothing outside this plugin
-renders a battery, so there is no second surface to keep in step. `cpu_label`
-and `ram_label` are herdr's own keys — it accepts both — and leaving them there
-is what keeps a patched build's header and these rows in step.
+**Why battery and disk are in the other file:** a stock herdr draws neither, so
+it knows neither key. Putting `battery_label` in its `[ui]` makes every
+`herdr server reload-config` report
+`unknown config key ui.battery_label; ignoring key`. `cpu_label` and `ram_label`
+are herdr's own keys — it accepts both — and leaving them there is what keeps a
+patched build's header and these rows in step.
+
+`disk_label` is read from **both**, plugin first. A build whose header draws disk
+space of its own names it with `ui.disk_label`, and then that one key keeps the
+header and these cells saying the same word — the same bargain cpu and ram make.
+On a stock build nobody sets it there, so nothing changes.
 
 **Naming only these rows.** If you would rather keep every plugin-only setting
 in the plugin's own file — next to `icons` and `battery_label` — its
@@ -396,7 +493,7 @@ surfaces name things differently. Leave a key out to keep herdr's value.
 
 ### Empty means "name nothing" in this file
 
-All three plugin-side labels read a blank as the deliberate bare number — no
+All four plugin-side labels read a blank as the deliberate bare number — no
 word, no glyph, no stray space:
 
 ```toml
@@ -440,7 +537,9 @@ speaks its newline-delimited JSON-RPC. Per refresh: `session.snapshot` returns
 every workspace and pane in a single call → `pane.process_info` yields each
 pane's `shell_pid` → the process walks that PID's process subtree, summing CPU
 and RSS over a sample window. Branch comes from the pane cwd's git checkout, and
-worktree families from `worktree.list`.
+worktree families from `worktree.list`. The machine-wide metrics are read once
+per refresh, not once per space, and only when something is going to draw them:
+one battery probe, and one `statvfs` per selected drive.
 
 Per platform: Linux reads `/proc/<pid>/stat` (utime+stime jiffie deltas,
 `sysconf` clock ticks/page size) and `statm` RSS; Windows snapshots the process

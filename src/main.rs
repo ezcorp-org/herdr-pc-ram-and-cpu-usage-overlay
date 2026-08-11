@@ -24,6 +24,7 @@ mod battery;
 mod collect;
 mod config;
 mod daemon;
+mod disk;
 mod herdr;
 mod herdr_config;
 mod icons;
@@ -86,6 +87,20 @@ const SAMPLE_BATTERY: battery::Battery = battery::Battery {
     percent: 74.0,
     state: battery::State::Charging,
 };
+
+/// Sample drive: 272 GB used and 240 GB free of a 512 GB disk, so the preview
+/// shows both figures a real cell carries — 53% used, `240G` left — at a size
+/// people recognise.
+///
+/// A function rather than a `const` only because the reading names its mount.
+fn sample_disk() -> disk::Disk {
+    disk::Disk {
+        name: "/".to_string(),
+        free_mb: 240.0 * 1024.0,
+        used_mb: 272.0 * 1024.0,
+        total_mb: 512.0 * 1024.0,
+    }
+}
 
 fn main() {
     if let Err(err) = run() {
@@ -150,13 +165,15 @@ fn run() -> Result<()> {
 ///
 /// The rows use the user's own labels, the configured `ram_display`, and the
 /// same [`render::metric_row`] every surface does, so what they see is what they
-/// get. All three metrics are drawn — a space's row is the first two cells, and
-/// the battery joins them on the window title and the report's total line.
+/// get. All four metrics are drawn — a space's row is the first two cells, and
+/// the battery and disk join them on the window title and the report's total
+/// line.
 fn print_icon_preview(config: &config::Config, labels: &config::Labels) {
     let current = config.icon_set();
+    let disk = sample_disk();
     println!(
         "\n  Icon tiers — {SAMPLE_CPU:.0}% cpu, {} ram, \
-         {:.0}% battery charging, drawn by each tier:\n",
+         {:.0}% battery charging, {:.0}% disk used, drawn by each tier:\n",
         // Named the way the configured `ram_display` will name it in the rows.
         render::ram_cell_of(
             icons::IconSet::Text,
@@ -166,6 +183,7 @@ fn print_icon_preview(config: &config::Config, labels: &config::Labels) {
             SAMPLE_MEM_TOTAL_MB,
         ),
         SAMPLE_BATTERY.percent,
+        disk.used_percent(),
     );
     for (name, set) in ICON_TIERS {
         let row = render::metric_row(
@@ -181,6 +199,7 @@ fn print_icon_preview(config: &config::Config, labels: &config::Labels) {
                 SAMPLE_MEM_TOTAL_MB,
             ),
             Some(set.battery(labels.battery(), SAMPLE_BATTERY)),
+            vec![render::disk_cell(set, labels.disk(), None, &disk)],
         );
         let marker = if set == current { "   <- current" } else { "" };
         println!("    {name:<10}{row}{marker}");
@@ -196,22 +215,30 @@ fn print_icon_preview(config: &config::Config, labels: &config::Labels) {
     print_one_setting_hint(current, config);
 }
 
-/// Explain — and print — the single edit that keeps herdr's own sidebar header
-/// in step with these rows.
+/// Explain — and print — the edits that keep herdr's own sidebar header in step
+/// with these rows.
 ///
 /// Worth the extra paragraph because the failure it prevents is invisible until
 /// you look at the sidebar: on a patched build the whole-machine system-usage
 /// header renders from herdr's `cpu_label` / `ram_label`, so setting only the
 /// plugin's `icons` leaves that header spelling `cpu` in words directly above a
 /// row of glyphs. Those two keys are the one place that changes both.
+///
+/// Two blocks, and which file each goes in is the point rather than a detail:
+/// herdr knows `cpu_label` and `ram_label` and nothing else here, so a
+/// `battery_label` or `disk_label` pasted into its `[ui]` earns an
+/// `unknown config key` line in the log on every reload. Those two live in the
+/// plugin's own config, which is the only thing that draws them.
 fn print_one_setting_hint(current: icons::IconSet, config: &config::Config) {
-    let snippet = icons::herdr_ui_snippet(current);
-    let indented: String = snippet
-        .lines()
-        .map(|line| format!("      {line}\n"))
-        .collect();
-    // A plugin-side label silently wins over the block we are about to print, so
-    // saying nothing would send the user to edit a file that cannot take effect.
+    let indent = |snippet: String| -> String {
+        snippet
+            .lines()
+            .map(|line| format!("      {line}\n"))
+            .collect()
+    };
+    // A plugin-side label silently wins over the herdr block we are about to
+    // print, so saying nothing would send the user to edit a file that cannot
+    // take effect.
     let overridden = [
         ("cpu_label", config.cpu_label.is_some()),
         ("ram_label", config.ram_label.is_some()),
@@ -235,9 +262,14 @@ fn print_one_setting_hint(current: icons::IconSet, config: &config::Config) {
          same keys — an explicit label replaces the tier's glyph rather than\n  \
          stacking with it. Set them once and the header and these rows agree.\n\n\
          {note}  \
-         For the tier above, put this in herdr's config.toml\n  \
-         (alongside `icons = \"text\"` here, since the labels now do the naming):\n\n\
-         {indented}"
+         For the tier above, put this in herdr's config.toml:\n\n\
+         {herdr_block}\n  \
+         ..and this in the plugin's config.toml — herdr draws neither a battery\n  \
+         nor a disk, so it has no key for either, and `icons = \"text\"` simply\n  \
+         says the labels are doing the naming now:\n\n\
+         {plugin_block}",
+        herdr_block = indent(icons::herdr_ui_snippet(current)),
+        plugin_block = indent(icons::plugin_config_snippet(current)),
     );
 }
 
