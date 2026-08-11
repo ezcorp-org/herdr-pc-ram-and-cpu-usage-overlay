@@ -171,8 +171,20 @@ What is per session and what is not follows from where herdr keeps things:
 |---|---|---|
 | The updater and its pid file | Per session | It can only push to the socket it is connected to. |
 | `status-enable` / `status-disable` | Every session | herdr gives the plugin ONE state dir per user, and the `$usage` row lives in the ONE config every session renders — so the decision cannot be per session. `status-disable` stands down every session's updater. |
-| `status-toggle` | Reads this session | The sidebar in front of you is the one it flips: a session with no updater turns one on, even while another session has one. |
+| `status-toggle` | Reads this session, off reaches all | The sidebar in front of you decides which way it flips, so a session with no updater turns one on even while another session has one. Toggling **off** still turns every session off — see below. |
 | Plugin config | Every session | One config dir per user, re-read every refresh. |
+
+**There is no session-local "off".** One marker per user records the decision,
+and the restore hook fires on every space switch — so a session trying to keep
+its own updater down would have it back on the next switch. Turning the overlay
+off is therefore one decision for every session, whichever session you run it
+from. Turning it on starts that session's updater; the rest follow on their next
+space switch.
+
+Nothing to configure either way. herdr keeps plugins global to the user on
+purpose — one registry, one state dir, one config dir — which is also why a
+second session runs this plugin's startup hook at all
+([herdr#1174](https://github.com/herdrdev/herdr/issues/1174), v0.7.5).
 
 > **Upgrading from < 1.8.0?** Two defaults changed, both toward "works without
 > being told": the updater now runs unless you have disabled it, and `mode`

@@ -404,6 +404,15 @@ pub fn disable_updater() -> crate::Result<()> {
 /// Reads this session rather than the machine so the action does what the
 /// sidebar in front of you shows: a session with no updater turns one on, even
 /// while another session has one running.
+///
+/// What it reads is per session; what it *does* is whatever the two halves do,
+/// and those are not symmetric. Toggling on starts this session's updater, and
+/// the others follow at their next `--restore`. Toggling off reaches every
+/// session, because there is no such thing as a session-local "off": one marker
+/// per user records the decision, and a session that tried to keep its own
+/// updater down would have `--restore` bring it back on the next space switch.
+/// Say so wherever this is documented — a user with two sessions who toggles one
+/// dark and finds both dark is owed the reason.
 pub fn toggle_updater() -> crate::Result<()> {
     if daemon_pid().is_some() {
         disable_updater()
