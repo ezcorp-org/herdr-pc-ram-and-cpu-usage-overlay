@@ -524,12 +524,28 @@ const OTHER_SESSION_SWEEP: Duration = Duration::from_secs(10);
 /// process moments later, and what it would have cleared is a row the metadata
 /// TTL takes back anyway.
 fn sweep_other_sessions(sockets: Vec<Option<std::path::PathBuf>>) {
+    within(OTHER_SESSION_SWEEP, move || sweep_sessions(sockets));
+}
+
+/// Run `work` on a thread and wait no longer than `deadline` for it.
+///
+/// Returns as soon as the work is done, or when the deadline passes, whichever
+/// comes first; the thread is left to die with the process. A panic in `work`
+/// drops the sender and returns immediately, so a bug in there costs the wait
+/// rather than being hidden by it.
+///
+/// Split out to be tested, which matters more than its four lines suggest. On
+/// Windows this is the ONLY bound on the sweep — a named pipe opened as a
+/// `File` has no timeout to set, so nothing under it can time out on its own —
+/// and CI has no herdr to demonstrate that against. Taking a closure lets the
+/// mechanism be pinned on every platform without one.
+fn within(deadline: Duration, work: impl FnOnce() + Send + 'static) {
     let (done, wait) = std::sync::mpsc::channel();
     thread::spawn(move || {
-        sweep_sessions(sockets);
+        work();
         let _ = done.send(());
     });
-    let _ = wait.recv_timeout(OTHER_SESSION_SWEEP);
+    let _ = wait.recv_timeout(deadline);
 }
 
 /// Everything one session could be carrying from us, as the set to clear.
@@ -1603,6 +1619,54 @@ mod tests {
             .map(|(_, claim)| claim.pid)
             .collect();
         assert_eq!(stopped, vec![4242, 4343]);
+    }
+
+    #[test]
+    fn a_deadline_returns_from_work_that_never_does() {
+        // The one bound the Windows sweep has. A pipe opened as a `File` has no
+        // timeout to set, so if this wait did not come back, `--disable` would
+        // not either — a command the user is watching, hung on a session that
+        // is nothing to do with them. Runs on every platform, which is the
+        // point: CI has no herdr to wedge, and this needs none.
+        let started = std::time::Instant::now();
+        within(Duration::from_millis(50), || {
+            thread::sleep(Duration::from_secs(3600))
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "waited {:?}",
+            started.elapsed(),
+        );
+    }
+
+    #[test]
+    fn work_that_finishes_does_not_serve_out_the_deadline() {
+        // The other half, and the one a too-eager fix would break: the deadline
+        // is a ceiling, not a delay. Every ordinary `--disable` goes through
+        // here, so waiting it out would add ten seconds to the common case.
+        let started = std::time::Instant::now();
+        within(Duration::from_secs(3600), || {});
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "waited {:?}",
+            started.elapsed(),
+        );
+    }
+
+    #[test]
+    fn a_session_that_is_not_there_costs_nothing_to_sweep() {
+        // A recorded claim outlives the session that wrote it, so most sweeps
+        // dial something that has gone. That has to fail immediately rather
+        // than eat the deadline — on unix the connection is refused, on Windows
+        // the pipe is simply not there to open, and this pins both.
+        let dir = scratch("unreachable");
+        let started = std::time::Instant::now();
+        sweep_sessions(vec![Some(dir.join("herdr.sock")), None]);
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "waited {:?}",
+            started.elapsed(),
+        );
     }
 
     #[test]
