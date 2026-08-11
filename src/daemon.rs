@@ -315,6 +315,7 @@ pub fn disable_updater() -> crate::Result<()> {
     // Reversible, as promised: whatever we added to herdr's config comes out —
     // and taking it out un-does the first-run setup, so let that setup run again.
     if herdr_config::remove_usage_row().is_ok_and(Change::needs_reload) {
+        forget_bootstrap();
         reload_herdr_config();
     }
 
@@ -609,6 +610,33 @@ fn bootstrap_sidebar() -> bool {
         return true;
     }
     false
+}
+
+/// Forget that first-run setup ever happened, so the next `--enable` or
+/// `--restore` does it again.
+///
+/// Called from exactly one place: [`disable_updater`], and only when it actually
+/// removed OUR marked block from herdr's config. Without it the documented pair
+/// `status-disable` then `status-enable` left the sidebar permanently blank —
+/// the row was gone, the marker still said "already set up", so the second half
+/// brought the updater back to push a token nothing rendered. That is the exact
+/// "the plugin does nothing" symptom the first-run setup exists to prevent,
+/// reachable through two documented actions.
+///
+/// Deliberately NOT called when the removal was a no-op. A row the *user* wrote
+/// carries no marker and is left in place; a row the user *deleted* by hand
+/// leaves nothing to remove. In both cases the marker stays, so `status-enable`
+/// still never re-adds a row someone took out on purpose — the guarantee the
+/// marker was introduced for.
+fn forget_bootstrap() {
+    forget_bootstrap_at(&config::bootstrapped_flag());
+}
+
+/// [`forget_bootstrap`] against an explicit path, so a test can exercise it
+/// without the state dir the env decides. Best-effort: an unremovable marker
+/// only costs the row, and `status-enable` says so on the toast either way.
+fn forget_bootstrap_at(marker: &std::path::Path) {
+    let _ = std::fs::remove_file(marker);
 }
 
 /// Ask herdr to re-read its config so a row we just wrote renders now rather
@@ -1180,6 +1208,26 @@ mod tests {
         set_wanted(&flag, Wanted::Disabled);
         assert!(flag.exists(), "the off state needs a file of its own");
         assert!(!config::read_wanted(&flag).wants_daemon());
+    }
+
+    #[test]
+    fn removing_our_row_forgets_the_first_run_marker() {
+        // `status-disable` takes our row back out of herdr's config. If the
+        // marker survived that, `status-enable` would skip first-run setup, the
+        // row would stay gone, and the updater would come back to push a token
+        // nothing renders — a blank sidebar reached through two documented
+        // actions. Absent marker == setup runs again, which is the fix.
+        let marker = scratch("forget").join("bootstrapped");
+        set_wanted(&marker, Wanted::Enabled);
+        assert!(marker.exists(), "first-run setup recorded");
+
+        forget_bootstrap_at(&marker);
+        assert!(!marker.exists(), "a later enable must set the row up again");
+
+        // Idempotent: disabling twice, or before anything was ever written, is
+        // not an error — nothing here may fail the action the user asked for.
+        forget_bootstrap_at(&marker);
+        assert!(!marker.exists());
     }
 
     #[test]
