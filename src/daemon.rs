@@ -175,22 +175,48 @@ fn read_pid_file_at(path: &std::path::Path) -> Option<u32> {
 fn read_claim_at(path: &std::path::Path) -> Option<Claim> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
-    // Parsed wide, then bounded, so the accepted set is exactly the pids a pid
-    // can be. The old `i32` parse rejected everything above 2^31 — which no
-    // Linux pid reaches (`pid_max` caps far below it) but a Windows one may,
-    // pids there being a full 32 bits. A daemon whose own pid its own reader
-    // threw out would hold a claim nothing could see, and the single-instance
-    // guard would be off for that process's whole life.
-    let pid: u64 = lines.next()?.trim().parse().ok()?;
+    let pid = claimed_pid(lines.next()?)?;
     let socket = lines
         .next()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(std::path::PathBuf::from);
-    (pid > 0 && pid <= u64::from(u32::MAX)).then_some(Claim {
-        pid: pid as u32,
-        socket,
-    })
+    Some(Claim { pid, socket })
+}
+
+/// The pid a claim's first line names, if it names one a pid can be.
+///
+/// Parsed wide, then bounded, so the accepted set is exactly the pids a pid can
+/// be. The old `i32` parse rejected everything above 2^31 — which no Linux pid
+/// reaches (`pid_max` caps far below it) but a Windows one may, pids there being
+/// a full 32 bits. A daemon whose own pid its own reader threw out would hold a
+/// claim nothing could see, and the single-instance guard would be off for that
+/// process's whole life.
+fn claimed_pid(line: &str) -> Option<u32> {
+    let pid: u64 = line.trim().parse().ok()?;
+    (pid > 0 && pid <= u64::from(u32::MAX)).then_some(pid as u32)
+}
+
+/// Whether this session's claim still names us — `None` when the file could not
+/// be read at all.
+///
+/// The three answers are the point, and the loop acts on only one of them. A
+/// file that is GONE is a definite no: `--disable` unlinks it, and that is what
+/// stands a daemon down. A file naming someone else is a definite no as well.
+/// But a read that FAILS for any other reason — a state dir on a networked home
+/// gone stale, a process out of descriptors — says nothing about who holds the
+/// claim, and answering "not you" there would exit a perfectly healthy solo
+/// updater over a blip.
+///
+/// The same judgement [`build_changed`] makes about a stat it could not take:
+/// where the question is "has something changed underneath me", not being able
+/// to look is not evidence that it has.
+fn claim_still_ours(path: &std::path::Path) -> Option<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(text.lines().next().and_then(claimed_pid) == Some(std::process::id())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
 }
 
 /// Every claim recorded under the state dir, live or not, each with the pid
@@ -351,7 +377,10 @@ pub fn run_daemon() -> crate::Result<()> {
         // daemons converge to one within an interval whichever order they wrote
         // in, and a daemon whose claim was removed by `--disable` exits too,
         // which is how a `--disable` reaches one of these at all.
-        if !claims_pid_file(read_pid_file(), std::process::id())
+        //
+        // Only a definite answer counts — see [`claim_still_ours`]. A file we
+        // could not read is not a file that named someone else.
+        if claim_still_ours(&config::pid_file()) == Some(false)
             && !stopping.swap(true, Ordering::SeqCst)
         {
             stand_down();
@@ -1276,6 +1305,37 @@ mod tests {
         assert!(claims_pid_file(Some(42), 42));
         assert!(!claims_pid_file(Some(43), 42));
         assert!(!claims_pid_file(None, 42));
+    }
+
+    #[test]
+    fn a_claim_that_cannot_be_read_stands_nobody_down() {
+        // Three answers, and the loop acts on one. Gone and taken are both
+        // definite; a read that failed for any other reason is not, and
+        // treating it as "taken" would exit a healthy solo updater over a
+        // networked home going stale for a moment. Same judgement
+        // `build_changed` makes about a stat it could not take.
+        let dir = scratch("claim-readable");
+        let me = std::process::id();
+
+        let mine = claim(&dir, "42c3c964", me);
+        assert_eq!(claim_still_ours(&mine), Some(true), "ours");
+
+        let theirs = claim(&dir, "e60b12c5", me + 1);
+        assert_eq!(claim_still_ours(&theirs), Some(false), "taken");
+
+        let gone = dir.join(config::pid_file_name("deadbeef"));
+        assert_eq!(
+            claim_still_ours(&gone),
+            Some(false),
+            "unlinked by --disable"
+        );
+
+        // A directory where the file should be: readable as an entry, never as
+        // text. Stands in for the read errors a test cannot arrange — the point
+        // is only that a non-NotFound failure answers "cannot tell".
+        let unreadable = dir.join(config::pid_file_name("0badc0de"));
+        std::fs::create_dir(&unreadable).expect("fixture dir");
+        assert_eq!(claim_still_ours(&unreadable), None, "cannot tell");
     }
 
     #[test]
