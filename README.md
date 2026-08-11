@@ -128,7 +128,8 @@ herdr plugin action invoke status-disable --plugin ez-corp.space-usage
 ```
 
 `status-enable` brings it back — the updater and the config row both;
-`status-toggle` flips whichever way it is.
+`status-toggle` flips whichever way it is. With more than one herdr session
+running, all three reach every session — [see below](#more-than-one-herdr-session).
 
 Other entrypoints:
 
@@ -143,7 +144,9 @@ Status **text** carries a TTL and self-clears if the updater dies. In
 agents-panel mode the `usage` pseudo-agent row itself has no TTL (herdr's
 `pane.report_agent` takes none), so a hard-killed updater leaves an empty row
 behind until the next `status-enable`/`status-disable`. Disabling clears
-everything immediately either way.
+everything immediately either way, in every session — it clears each one over
+that session's own socket, which is the only connection its rows can be taken
+back through.
 
 The updater **survives herdr restarts**, and comes up on its own after an
 install. herdr runs the manifest's `[[startup]]` hook (`--restore`) on every
@@ -170,7 +173,8 @@ What is per session and what is not follows from where herdr keeps things:
 | | Scope | Why |
 |---|---|---|
 | The updater and its pid file | Per session | It can only push to the socket it is connected to. |
-| `status-enable` / `status-disable` | Every session | herdr gives the plugin ONE state dir per user, and the `$usage` row lives in the ONE config every session renders — so the decision cannot be per session. `status-disable` stands down every session's updater. |
+| `status-disable` | Every session, at once | herdr gives the plugin ONE state dir per user, and the `$usage` row lives in the ONE config every session renders — so the decision cannot be per session. It stands down every session's updater and clears every session's rows. |
+| `status-enable` | Every session, this one first | Same shared decision, but it can only start a daemon where it runs: this session lights up immediately, the others at their next space switch, when their own restore hook fires. |
 | `status-toggle` | Reads this session, off reaches all | The sidebar in front of you decides which way it flips, so a session with no updater turns one on even while another session has one. Toggling **off** still turns every session off — see below. |
 | Plugin config | Every session | One config dir per user, re-read every refresh. |
 

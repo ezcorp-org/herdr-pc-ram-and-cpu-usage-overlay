@@ -129,6 +129,31 @@ fn daemon_pid_at(path: &std::path::Path) -> Option<u32> {
     is_our_process(pid).then_some(pid)
 }
 
+/// What one updater's pid file says: the process holding the claim, and the
+/// herdr socket it serves.
+///
+/// The socket rides along because a claim is only useful to another session if
+/// it can be acted on, and every action worth taking — clearing a status,
+/// clearing a title — goes over that session's own socket. It is `None` for a
+/// file written before 1.11.1, which recorded the pid alone.
+#[derive(Debug, PartialEq, Eq)]
+struct Claim {
+    pid: u32,
+    socket: Option<std::path::PathBuf>,
+}
+
+/// Record this process's claim on `path`: its pid, and the socket it serves.
+///
+/// Two lines rather than one so the first stays exactly what it always was. The
+/// only reader that could be surprised is an OLDER build parsing the whole file
+/// as a number — a downgrade, which would read the file as unclaimed and start
+/// a second updater in that one session. Both push the same rows, and the next
+/// upgrade settles it.
+fn write_claim(path: &std::path::Path, socket: Option<&std::path::Path>) -> std::io::Result<()> {
+    let socket = socket.map(|s| s.display().to_string()).unwrap_or_default();
+    std::fs::write(path, format!("{}\n{socket}\n", std::process::id()))
+}
+
 /// The pid recorded in this session's pid file, or `None` if the file is
 /// missing, unparseable, or holds a non-positive pid. Says nothing about
 /// whether that process is alive — [`daemon_pid`] adds that.
@@ -138,31 +163,96 @@ fn read_pid_file() -> Option<u32> {
 
 /// [`read_pid_file`] against an explicit path.
 fn read_pid_file_at(path: &std::path::Path) -> Option<u32> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let pid: i32 = text.trim().parse().ok()?;
-    (pid > 0).then_some(pid as u32)
+    Some(read_claim_at(path)?.pid)
 }
 
-/// Every live updater on this machine, each paired with the pid file claiming
-/// it: this session's, every other session's, and the legacy global one.
+/// Parse the claim recorded at `path`.
+///
+/// First line only for the pid, so the socket line below it cannot turn a
+/// perfectly good claim into "no updater here" — that answer starts a second
+/// daemon. An empty or absent second line is a claim we can identify but not
+/// reach, which is what a pre-1.11.1 file is.
+fn read_claim_at(path: &std::path::Path) -> Option<Claim> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    // Parsed wide, then bounded, so the accepted set is exactly the pids a pid
+    // can be. The old `i32` parse rejected everything above 2^31 — which no
+    // Linux pid reaches (`pid_max` caps far below it) but a Windows one may,
+    // pids there being a full 32 bits. A daemon whose own pid its own reader
+    // threw out would hold a claim nothing could see, and the single-instance
+    // guard would be off for that process's whole life.
+    let pid: u64 = lines.next()?.trim().parse().ok()?;
+    let socket = lines
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(std::path::PathBuf::from);
+    (pid > 0 && pid <= u64::from(u32::MAX)).then_some(Claim {
+        pid: pid as u32,
+        socket,
+    })
+}
+
+/// Every claim recorded under the state dir, live or not, each with the pid
+/// file holding it: this session's, every other session's, and the legacy
+/// global one.
 ///
 /// Only `--disable` wants this. Everything else asks about *this* session, via
 /// [`daemon_pid`] — an updater that starts, hands over, or stands down on
 /// another session's account is the bug this pairing exists to keep out.
-fn live_updaters() -> Vec<(std::path::PathBuf, u32)> {
-    live_updaters_among(config::pid_files())
+///
+/// Dead claims come back too, and are worth having: the socket a crashed daemon
+/// recorded is the only way left to take back the rows it pushed, and in
+/// agents-panel mode those rows carry no TTL to fall back on.
+fn recorded_claims() -> Vec<(std::path::PathBuf, Claim)> {
+    recorded_claims_among(config::pid_files())
 }
 
-/// [`live_updaters`] over an explicit list of pid files, so a test can supply
-/// them instead of the state dir the env decides.
-fn live_updaters_among(pid_files: Vec<std::path::PathBuf>) -> Vec<(std::path::PathBuf, u32)> {
+/// [`recorded_claims`] over an explicit list of pid files, so a test can supply
+/// them instead of the state dir the environment decides.
+fn recorded_claims_among(pid_files: Vec<std::path::PathBuf>) -> Vec<(std::path::PathBuf, Claim)> {
     pid_files
         .into_iter()
-        .filter_map(|path| {
-            let pid = read_pid_file_at(&path)?;
-            is_our_process(pid).then_some((path, pid))
-        })
+        .filter_map(|path| Some((path.clone(), read_claim_at(&path)?)))
         .collect()
+}
+
+/// Whether `claim` names an updater that `--disable` should stop.
+///
+/// `is_live` is a parameter because the real one, [`is_our_process`], looks for
+/// a live process running our own image — which no portable test can conjure a
+/// second of.
+///
+/// Our own pid is not an updater, however convincingly a file claims it is.
+/// `--disable` runs the same executable the daemon does, so [`is_our_process`]
+/// cannot tell them apart, and a stale file the kernel has since recycled onto
+/// THIS process would have `--disable` stop itself half way through — after
+/// writing the marker and removing the row, before clearing a single status.
+fn is_stoppable(claim: &Claim, is_live: impl Fn(u32) -> bool) -> bool {
+    claim.pid != std::process::id() && is_live(claim.pid)
+}
+
+/// Unlink every pid file that names no live process of ours.
+///
+/// A daemon releases its own claim on the way out, so these are the ones that
+/// never got the chance: a SIGKILL, a crash, a power cut. Left alone they
+/// accumulate one per session ever run, and each is a lottery ticket in the
+/// recycled-pid draw [`is_our_process`] cannot see through — a pid landing on
+/// the user's own dashboard pane reads as an updater. Reaping them is safe by
+/// definition: the file names nothing.
+fn reap_dead_claims() {
+    reap_dead_claims_among(config::pid_files(), is_our_process);
+}
+
+/// [`reap_dead_claims`] over an explicit list and liveness test — same seam, and
+/// there for the same reason, as [`live_updaters_among`].
+fn reap_dead_claims_among(pid_files: Vec<std::path::PathBuf>, is_live: impl Fn(u32) -> bool) {
+    for path in pid_files {
+        let live = read_claim_at(&path).is_some_and(|claim| is_live(claim.pid));
+        if !live {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// `--daemon`: run the updater loop until signalled, then clear and exit.
@@ -177,7 +267,11 @@ pub fn run_daemon() -> crate::Result<()> {
         return Ok(()); // another updater is already live
     }
     std::fs::create_dir_all(config::state_dir())?;
-    std::fs::write(config::pid_file(), format!("{}\n", std::process::id()))?;
+    // The socket goes in beside the pid so a `--disable` run from another
+    // session can clear what this daemon pushed. Nothing else can: it is
+    // reached over this socket, and on Windows a terminated daemon runs no
+    // shutdown of its own.
+    write_claim(&config::pid_file(), herdr::socket_path().ok().as_deref())?;
     // Taken once, before any work: this is the build we are, and the loop
     // compares it against the file on disk to notice being replaced.
     let launched = current_stamp();
@@ -370,18 +464,50 @@ pub fn disable_updater() -> crate::Result<()> {
     // config every session renders — are machine-wide, so leaving another
     // session's daemon running would have it push a token into a card that no
     // longer draws one, with nothing left to turn it off but a restart.
-    for (pid_file, pid) in live_updaters() {
-        // Unix: SIGTERM, and the daemon clears its own statuses + title on the
-        // way down. Windows: TerminateProcess — abrupt, but the sweep below and
-        // the status TTLs cover the cleanup the daemon can no longer do.
-        proc::stop_process(pid);
-        release_stopped_claim(&pid_file, pid);
+    let mut sessions = vec![herdr::socket_path().ok()];
+    for (pid_file, claim) in recorded_claims() {
+        if is_stoppable(&claim, is_our_process) {
+            // Unix: SIGTERM, and the daemon clears its own statuses + title on
+            // the way down. Windows: TerminateProcess — abrupt, so the sweep
+            // below does that daemon's cleaning for it, over the socket it
+            // recorded.
+            proc::stop_process(claim.pid);
+            release_stopped_claim(&pid_file, claim.pid);
+        }
+        // Swept either way. A claim whose process is already gone — a crash, a
+        // SIGKILL, a session that ended badly — is the case where the rows are
+        // certain to still be there and no daemon is left to take them back.
+        sessions.push(claim.socket);
     }
 
-    // Belt and braces: sweep every current pane in case the daemon died — release
-    // pseudo-agents (no TTL) and clear metadata statuses — then clear the title.
-    // If herdr is unavailable, metadata TTLs expire the statuses anyway.
-    if let Ok(mut client) = herdr::connect() {
+    // Belt and braces: sweep every pane of every session that ever recorded an
+    // updater, plus our own — release pseudo-agents (no TTL) and clear metadata
+    // statuses, then clear each session's title. If herdr is unavailable,
+    // metadata TTLs expire the statuses anyway; the pseudo-agent rows have no
+    // TTL, so this is the only thing that takes them back.
+    sweep_sessions(sessions);
+    reap_dead_claims();
+
+    notify("sidebar usage disabled");
+    Ok(())
+}
+
+/// Clear everything this plugin pushed into each named session, skipping any we
+/// cannot reach and any we have already done.
+///
+/// One session per socket, because a status can only be cleared over the
+/// connection that set it. On unix the daemons clear up after themselves and
+/// this is the belt to that pair of braces; on Windows they are terminated
+/// outright and this is the only cleaning that happens at all.
+fn sweep_sessions(sockets: Vec<Option<std::path::PathBuf>>) {
+    let mut done = HashSet::new();
+    for socket in sockets.into_iter().flatten() {
+        if !done.insert(socket.clone()) {
+            continue;
+        }
+        let Ok(mut client) = herdr::connect_to(socket) else {
+            continue; // session gone, or a pre-1.11.1 claim that recorded none
+        };
         if let Ok(spaces) = collect::collect_spaces(&mut client) {
             let mut sweep = Tracked::default();
             for sp in &spaces {
@@ -394,9 +520,6 @@ pub fn disable_updater() -> crate::Result<()> {
         }
         let _ = client.window_title_clear();
     }
-
-    notify("sidebar usage disabled");
-    Ok(())
 }
 
 /// `--toggle`: disable if THIS session has a live daemon, else enable.
@@ -727,8 +850,8 @@ fn claims_pid_file(recorded: Option<u32>, me: u32) -> bool {
 /// permanently no-op `--enable`.
 ///
 /// Guarded on the file still naming the pid we stopped: a daemon started in the
-/// window between [`live_updaters`] and here owns its own file and must keep it,
-/// or this would silently break its single-instance guard.
+/// window between [`recorded_claims`] and here owns its own file and must keep
+/// it, or this would silently break its single-instance guard.
 #[cfg(windows)]
 fn release_stopped_claim(pid_file: &std::path::Path, pid: u32) {
     if claims_pid_file(read_pid_file_at(pid_file), pid) {
@@ -1328,11 +1451,21 @@ mod tests {
 
     // ---- one updater per session ---------------------------------------------
 
-    /// A pid file in `dir` claiming `pid`, named for `session_key`.
+    /// A pid file in `dir` claiming `pid` for `session_key`, in the two-line
+    /// form a 1.11.1 daemon writes.
     fn claim(dir: &std::path::Path, session_key: &str, pid: u32) -> std::path::PathBuf {
         let path = dir.join(config::pid_file_name(session_key));
-        std::fs::write(&path, format!("{pid}\n")).expect("fixture pid file");
+        std::fs::write(&path, format!("{pid}\n/run/{session_key}.sock\n"))
+            .expect("fixture pid file");
         path
+    }
+
+    /// The claim `claim` writes, for comparing against what was read back.
+    fn claim_of(session_key: &str, pid: u32) -> Claim {
+        Claim {
+            pid,
+            socket: Some(std::path::PathBuf::from(format!("/run/{session_key}.sock"))),
+        }
     }
 
     #[test]
@@ -1357,42 +1490,137 @@ mod tests {
     }
 
     #[test]
-    fn a_claim_survives_being_read_twice_by_the_session_that_holds_it() {
-        // The other half of the same guard: within ONE session the pid file
-        // still means "an updater is already live here", so `--restore` firing
-        // on every space switch does not pile daemons up.
-        let dir = scratch("same-session");
-        let mine = claim(&dir, "42c3c964", std::process::id());
-        assert!(daemon_pid_at(&mine).is_some());
-        assert!(daemon_pid_at(&mine).is_some());
-    }
-
-    #[test]
-    fn a_sweep_stops_every_live_session_and_leaves_the_dead_alone() {
-        // What `--disable` walks. It is one decision for the whole machine — it
-        // writes the shared marker and takes our row out of the one config every
-        // session renders — so a daemon another session started has to be
+    fn disable_stops_the_live_updaters_but_sweeps_every_session_it_can_name() {
+        // What `--disable` acts on. It is one decision for the whole machine —
+        // it writes the shared marker and takes our row out of the one config
+        // every session renders — so a daemon another session started has to be
         // stopped too, or it keeps pushing into a card that no longer draws it.
         //
-        // A stale file is skipped rather than acted on: the state dir outlives
-        // reboots, so its pid may since have been recycled by an unrelated
-        // process, and `--disable` must not go killing that.
+        // Three kinds are never stopped. A stale pid, because the state dir
+        // outlives reboots and the kernel may since have recycled it onto
+        // something else. An unparseable file, because it names nothing. And
+        // our own pid: `--disable` runs the same executable the daemon does, so
+        // a recycled pid landing HERE would have it stop itself half way
+        // through, having written the marker and removed the row but cleared
+        // not one status.
+        //
+        // The stale one is still SWEPT, which is the half that is easy to get
+        // wrong: a daemon that crashed left its rows behind and no longer has a
+        // process to take them back, and in agents-panel mode those rows have
+        // no TTL to fall back on. Its socket is the only way to reach them, and
+        // its pid file is the only place that socket is written down.
         let dir = scratch("sweep");
-        let me = std::process::id();
-        let mine = claim(&dir, "42c3c964", me);
-        let other_session = claim(&dir, "e60b12c5", me);
+        // Everything is live to this liveness test EXCEPT the pid nothing can
+        // be running under, so what the assertions pin is the code's own doing.
+        let is_live = |pid: u32| pid != u32::MAX;
+        let mine = claim(&dir, "42c3c964", 4242);
+        let other_session = claim(&dir, "e60b12c5", 4343);
         let stale = claim(&dir, "deadbeef", u32::MAX);
+        let ourselves = claim(&dir, "0badc0de", std::process::id());
         let unparseable = dir.join(config::pid_file_name("garbage"));
         std::fs::write(&unparseable, "not a pid\n").expect("fixture pid file");
 
+        let claims = recorded_claims_among(vec![
+            mine.clone(),
+            other_session.clone(),
+            stale.clone(),
+            ourselves.clone(),
+            unparseable,
+        ]);
+
+        // Every readable claim, so every session's socket is reachable.
         assert_eq!(
-            live_updaters_among(vec![
-                mine.clone(),
-                other_session.clone(),
-                stale,
-                unparseable,
-            ]),
-            vec![(mine, me), (other_session, me)],
+            claims,
+            vec![
+                (mine, claim_of("42c3c964", 4242)),
+                (other_session, claim_of("e60b12c5", 4343)),
+                (stale, claim_of("deadbeef", u32::MAX)),
+                (ourselves, claim_of("0badc0de", std::process::id())),
+            ],
         );
+        // Of those, only the two live ones that are not us get stopped.
+        let stopped: Vec<u32> = claims
+            .iter()
+            .filter(|(_, claim)| is_stoppable(claim, is_live))
+            .map(|(_, claim)| claim.pid)
+            .collect();
+        assert_eq!(stopped, vec![4242, 4343]);
+    }
+
+    #[test]
+    fn a_claim_carries_the_socket_the_daemon_serves() {
+        // The half that makes a cross-session `--disable` able to clean up at
+        // all: statuses are cleared over the connection that set them, and on
+        // Windows a terminated daemon clears nothing itself. A file from before
+        // 1.11.1 names a pid and no socket — still a claim, just one we can
+        // stop without being able to tidy after.
+        let dir = scratch("claim-format");
+        let path = dir.join("updater-42c3c964.pid");
+
+        write_claim(&path, Some(std::path::Path::new("/run/a.sock"))).unwrap();
+        assert_eq!(
+            read_claim_at(&path),
+            Some(Claim {
+                pid: std::process::id(),
+                socket: Some("/run/a.sock".into()),
+            }),
+        );
+
+        // A second line that is absent or blank reads as "no socket recorded",
+        // never as a broken claim — answering "no updater here" would start a
+        // second one.
+        for legacy in ["4242\n", "4242", "4242\n\n"] {
+            std::fs::write(&path, legacy).unwrap();
+            assert_eq!(
+                read_claim_at(&path),
+                Some(Claim {
+                    pid: 4242,
+                    socket: None
+                }),
+                "got: {legacy:?}",
+            );
+        }
+
+        // The whole pid range, and nothing outside it. Windows pids are a full
+        // 32 bits, so the top of the range is an ordinary pid there, not the
+        // impossible value it looks like on Linux — and a claim thrown out for
+        // being too large is a single-instance guard that never engages.
+        for (text, expected) in [
+            ("4294967295\n", Some(u32::MAX)),
+            ("4294967296\n", None),
+            ("0\n", None),
+            ("-1\n", None),
+            ("\n", None),
+            ("", None),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(
+                read_claim_at(&path).map(|claim| claim.pid),
+                expected,
+                "got: {text:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn reaping_takes_the_claims_that_name_nothing_and_leaves_the_rest() {
+        // Left alone these accumulate one per session ever run, and each is a
+        // ticket in the recycled-pid draw `is_our_process` cannot see through.
+        // Reaping is safe by definition: the file names no live process of ours.
+        let dir = scratch("reap");
+        let is_live = |pid: u32| pid != u32::MAX;
+        let live = claim(&dir, "42c3c964", 4242);
+        let dead = claim(&dir, "deadbeef", u32::MAX);
+        let unparseable = dir.join(config::pid_file_name("garbage"));
+        std::fs::write(&unparseable, "not a pid\n").expect("fixture pid file");
+
+        reap_dead_claims_among(
+            vec![live.clone(), dead.clone(), unparseable.clone()],
+            is_live,
+        );
+
+        assert!(live.exists(), "a live updater keeps its claim");
+        assert!(!dead.exists(), "a crashed one's claim goes");
+        assert!(!unparseable.exists(), "so does a file naming nothing");
     }
 }

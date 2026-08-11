@@ -393,9 +393,19 @@ pub fn config_dir() -> PathBuf {
 /// therefore made the updater one-per-*machine* rather than one-per-session —
 /// the second session's `--restore` found the first session's live daemon,
 /// stood down, and left its sidebar blank, since a daemon can only push to the
-/// one socket it is connected to. See [`crate::herdr::session_key`].
+/// one socket it is connected to. See [`crate::herdr::session_key_of`].
 pub fn pid_file() -> PathBuf {
-    state_dir().join(pid_file_name(&crate::herdr::session_key()))
+    pid_file_in(&state_dir(), &crate::herdr::socket_path_string())
+}
+
+/// [`pid_file`] from an explicit state dir and socket path.
+///
+/// The seam is where it is so a test can hold the whole chain — socket path to
+/// key to file name — rather than restating it. A test that computed the key
+/// the same way this does would pass just as happily against a key that had
+/// stopped depending on the socket at all, which is the bug coming back.
+fn pid_file_in(state_dir: &std::path::Path, socket_path: &str) -> PathBuf {
+    state_dir.join(pid_file_name(&crate::herdr::session_key_of(socket_path)))
 }
 
 /// The pid file name one session key claims.
@@ -1245,20 +1255,51 @@ mod tests {
     }
 
     #[test]
-    fn this_sessions_claim_carries_this_sessions_key() {
-        // The wiring, not just the naming. Every other test here builds a name
-        // from a key by hand, so a `pid_file` that went back to a fixed name —
-        // and so to one updater for the whole machine — would sail past all of
-        // them. Host-independent: whatever socket this run resolves, the file
-        // has to be named after it and not after the pre-1.11.1 scheme.
-        let name = pid_file()
-            .file_name()
-            .expect("a pid file has a name")
-            .to_string_lossy()
-            .into_owned();
-        assert_eq!(name, pid_file_name(&crate::herdr::session_key()));
-        assert!(name.contains(&crate::herdr::session_key()), "got: {name}");
-        assert_ne!(name, LEGACY_PID_FILE);
+    fn two_sessions_get_two_pid_files_and_one_session_gets_one() {
+        // The property, not a restatement of the arithmetic. Every other test
+        // here starts from a key, so they all pass just as happily against a
+        // `pid_file` that had stopped reading the socket — a fixed name, or a
+        // constant key — which is one updater for the whole machine, i.e. the
+        // bug. This one starts from the socket, which is the only input that
+        // tells two sessions apart.
+        let dir = std::path::Path::new("/state");
+        let default = pid_file_in(dir, "/home/u/.config/herdr/herdr.sock");
+        let named = pid_file_in(dir, "/home/u/.config/herdr/sessions/second/herdr.sock");
+
+        assert_ne!(default, named, "two sessions cannot share one claim");
+        assert_eq!(
+            default,
+            pid_file_in(dir, "/home/u/.config/herdr/herdr.sock"),
+            "one session has to find the claim it left last time",
+        );
+        assert_eq!(default.parent(), Some(dir), "it lives in the state dir");
+        assert_ne!(
+            default.file_name().unwrap(),
+            std::ffi::OsStr::new(LEGACY_PID_FILE),
+            "and not under the name every session used to share",
+        );
+    }
+
+    #[test]
+    fn the_pid_file_this_session_uses_is_the_one_its_socket_names() {
+        // The other half, and not redundant with it: the test above proves the
+        // naming depends on the socket, this one proves `pid_file` still asks.
+        // Each catches a mutation the other passes — a key that ignores the
+        // socket path there, a `pid_file` that goes back to a fixed name here.
+        // Both end at one updater for the whole machine, which is the bug.
+        let mine = pid_file();
+        assert_eq!(
+            mine,
+            pid_file_in(&state_dir(), &crate::herdr::socket_path_string()),
+        );
+        assert_ne!(
+            mine,
+            pid_file_in(&state_dir(), "/not/the/socket/this/run/resolved.sock"),
+        );
+        assert_ne!(
+            mine.file_name().unwrap(),
+            std::ffi::OsStr::new(LEGACY_PID_FILE),
+        );
     }
 
     #[test]
@@ -1271,9 +1312,11 @@ mod tests {
             pid_file_name("aaaaaaaa"),
             pid_file_name("bbbbbbbb"),
             LEGACY_PID_FILE.to_string(),
-            // An empty key is still this scheme's shape — a socket path that
-            // could not be resolved. A file we cannot explain is safer swept
-            // than left holding a claim nothing ever releases.
+            // Nothing this plugin writes produces an empty key — an unresolved
+            // socket path hashes like any other string. It is here because a
+            // file of this shape that we cannot explain, hand-written or
+            // truncated, is safer swept than left holding a claim nothing ever
+            // releases.
             "updater-.pid".to_string(),
         ] {
             std::fs::write(dir.join(name), "1\n").expect("fixture pid file");

@@ -131,6 +131,15 @@ pub fn connect() -> crate::Result<Herdr> {
     Herdr::open(socket_path()?)
 }
 
+/// Connect to a named socket rather than this process's own.
+///
+/// One caller: `--disable`, clearing the statuses of a session whose updater it
+/// just stopped. Every other path wants [`connect`] — talking to a session other
+/// than your own is the exception, and one that has to name the socket it means.
+pub fn connect_to(path: PathBuf) -> crate::Result<Herdr> {
+    Herdr::open(path)
+}
+
 impl Herdr {
     /// Connect to `path` and wire up the read/write halves.
     fn open(path: PathBuf) -> crate::Result<Herdr> {
@@ -387,7 +396,17 @@ pub fn socket_path() -> crate::Result<PathBuf> {
     ))
 }
 
-/// A short, filename-safe name for the herdr session this process talks to.
+/// The resolved socket path, as the string [`session_key_of`] is taken over.
+///
+/// The one input that names this session, handed on as a path rather than as a
+/// key so that the chain — socket to key to file name — stays reachable from a
+/// single test instead of each half being pinned against the other half's own
+/// arithmetic. Its only caller is [`crate::config::pid_file`].
+pub fn socket_path_string() -> String {
+    socket_path().unwrap_or_default().to_string_lossy().into()
+}
+
+/// A short, filename-safe name for the herdr session reached over `socket_path`.
 ///
 /// Each herdr session runs its own server on its own socket — the default
 /// session on `<config_home>/herdr/herdr.sock`, `herdr --session <name>` on
@@ -401,18 +420,13 @@ pub fn socket_path() -> crate::Result<PathBuf> {
 /// A hash rather than the path itself because a file name may not hold a path:
 /// it has separators in it, is longer than some filesystems allow a name to be,
 /// and spells differently on Windows.
-pub fn session_key() -> String {
-    session_key_of(&socket_path().unwrap_or_default().to_string_lossy())
-}
-
-/// [`session_key`] for an explicit socket path.
 ///
 /// Hand-rolled FNV-1a rather than `DefaultHasher`, whose output std does not
 /// promise to keep stable between Rust releases. The key has to mean the same
 /// thing to two processes that may have been built by different compilers — a
 /// daemon and the `--restore` that checks up on it — and a key that quietly
 /// changed under a rebuild would let a second updater start alongside the first.
-fn session_key_of(socket_path: &str) -> String {
+pub(crate) fn session_key_of(socket_path: &str) -> String {
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET_BASIS;
