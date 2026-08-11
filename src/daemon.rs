@@ -532,6 +532,31 @@ fn sweep_other_sessions(sockets: Vec<Option<std::path::PathBuf>>) {
     let _ = wait.recv_timeout(OTHER_SESSION_SWEEP);
 }
 
+/// Everything one session could be carrying from us, as the set to clear.
+///
+/// A sweep runs where no record survives of what was actually pushed — another
+/// session's daemon kept that in its own memory and is now gone — so it assumes
+/// the most and clears it all. Clearing a pane we never touched is a no-op;
+/// missing one is a reading that stays on screen.
+///
+/// A pseudo pane goes in BOTH buckets, and that is the whole reason this is a
+/// function of its own. Agents-panel mode puts two things on that one pane —
+/// the pseudo-agent that names the row and the token that fills it (see
+/// [`push_statuses`]) — and listing it only as a pseudo released the row while
+/// leaving the reading behind it, on screen until the token's TTL ran out, in a
+/// session the user had just switched the overlay off in.
+fn everything_we_could_have_pushed(targets: Vec<(String, collect::PaneRoles)>) -> Tracked {
+    let mut sweep = Tracked::default();
+    for (workspace, panes) in targets {
+        sweep.metadata.extend(panes.pseudo_panes.iter().cloned());
+        sweep.pseudo.extend(panes.pseudo_panes);
+        sweep.metadata.extend(panes.agent_panes);
+        sweep.metadata.extend(panes.spare_panes);
+        sweep.workspaces.insert(workspace);
+    }
+    sweep
+}
+
 /// Clear everything this plugin pushed into each named session, skipping any we
 /// cannot reach and any we have already done.
 ///
@@ -549,14 +574,7 @@ fn sweep_sessions(sockets: Vec<Option<std::path::PathBuf>>) {
             continue; // session gone, or a pre-1.11.1 claim that recorded none
         };
         if let Ok(targets) = collect::sweep_targets(&mut client) {
-            let mut sweep = Tracked::default();
-            for (workspace, panes) in targets {
-                sweep.pseudo.extend(panes.pseudo_panes);
-                sweep.metadata.extend(panes.agent_panes);
-                sweep.metadata.extend(panes.spare_panes);
-                sweep.workspaces.insert(workspace);
-            }
-            clear_all(&mut client, &sweep);
+            clear_all(&mut client, &everything_we_could_have_pushed(targets));
         }
         let _ = client.window_title_clear();
     }
@@ -1585,6 +1603,37 @@ mod tests {
             .map(|(_, claim)| claim.pid)
             .collect();
         assert_eq!(stopped, vec![4242, 4343]);
+    }
+
+    #[test]
+    fn a_sweep_takes_back_both_things_a_pseudo_pane_carries() {
+        // Found end-to-end, in agents-panel mode across two sessions: the sweep
+        // released the pseudo-agent row and left the reading sitting inside it,
+        // because the pane went into the pseudo bucket only. It cleared itself
+        // 15 s later when the token's TTL ran out — a stale figure in a session
+        // the user had just switched the overlay off in, and in the one mode
+        // where nothing else was going to clean up after another session's
+        // daemon.
+        let sweep = everything_we_could_have_pushed(vec![(
+            "w1".to_string(),
+            collect::PaneRoles {
+                cwd: None,
+                pseudo_panes: vec!["w1:p1".to_string()],
+                agent_panes: vec!["w1:p2".to_string()],
+                spare_panes: vec!["w1:p3".to_string()],
+            },
+        )]);
+
+        assert!(sweep.pseudo.contains("w1:p1"), "the row is released");
+        assert!(
+            sweep.metadata.contains("w1:p1"),
+            "and the reading inside it is cleared, not left to its TTL",
+        );
+        // The other two carry a token and no pseudo-agent.
+        assert_eq!(sweep.pseudo.len(), 1);
+        assert!(sweep.metadata.contains("w1:p2") && sweep.metadata.contains("w1:p3"));
+        // Sidebar mode reports at the workspace level, so that has to go too.
+        assert!(sweep.workspaces.contains("w1"));
     }
 
     #[test]
