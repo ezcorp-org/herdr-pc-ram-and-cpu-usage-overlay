@@ -158,10 +158,10 @@ fn workspaces_with_roles(
 /// mid-scan errors there and simply contributes no root.
 pub fn collect_spaces(client: &mut Herdr) -> crate::Result<Vec<Space>> {
     let snapshot = client.session_snapshot()?;
-    let by_workspace = workspaces_with_roles(&snapshot);
+    let workspaces = workspaces_with_roles(&snapshot);
 
-    let mut spaces = Vec::with_capacity(by_workspace.len());
-    for (ws, panes, roles) in by_workspace {
+    let mut spaces = Vec::with_capacity(workspaces.len());
+    for (ws, panes, roles) in workspaces {
         // Best-effort shell PIDs; a pane that just closed errors and is skipped.
         let mut roots: Vec<u32> = Vec::with_capacity(panes.len());
         for pane in &panes {
