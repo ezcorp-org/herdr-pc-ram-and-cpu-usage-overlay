@@ -24,15 +24,15 @@ pub const PSEUDO_AGENT: &str = "usage";
 /// Split out of [`collect_spaces`] so the classification rules are unit-testable
 /// without a live herdr.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct PaneRoles {
+pub struct PaneRoles {
     /// cwd of the first pane that reports one — the branch lookup path.
-    cwd: Option<String>,
+    pub cwd: Option<String>,
     /// panes with a real agent.
-    agent_panes: Vec<String>,
+    pub agent_panes: Vec<String>,
     /// plain shell panes.
-    spare_panes: Vec<String>,
+    pub spare_panes: Vec<String>,
     /// panes already carrying our "usage" pseudo-agent.
-    pseudo_panes: Vec<String>,
+    pub pseudo_panes: Vec<String>,
 }
 
 /// Classify one workspace's panes, in the order herdr reported them.
@@ -99,6 +99,32 @@ fn panes_by_workspace(panes: &[PaneInfo]) -> HashMap<&str, Vec<&PaneInfo>> {
             .push(pane);
     }
     by_workspace
+}
+
+/// Every pane and workspace this plugin could have pushed a status onto, from
+/// ONE snapshot call: `(workspace id, its panes by role)`.
+///
+/// What a sweep needs, and deliberately not [`collect_spaces`], which answers a
+/// bigger question at a much higher price — a `pane.process_info` round trip per
+/// pane and a `git` fork per workspace, for numbers a sweep throws away. That
+/// price is paid in the one place it hurts most: `--disable` reaches into
+/// sessions nothing has shown to be healthy, and against one that has stopped
+/// answering, every extra round trip is another full socket timeout the user
+/// waits through — or, on Windows, where a pipe opened as a `File` has no
+/// timeout to reach, another wait with no end.
+pub fn sweep_targets(client: &mut Herdr) -> crate::Result<Vec<(String, PaneRoles)>> {
+    let snapshot = client.session_snapshot()?;
+    let by_workspace = panes_by_workspace(&snapshot.panes);
+    Ok(snapshot
+        .workspaces
+        .iter()
+        .map(|ws| {
+            let panes: &[&PaneInfo] = by_workspace
+                .get(ws.workspace_id.as_str())
+                .map_or(&[], Vec::as_slice);
+            (ws.workspace_id.clone(), classify_panes(panes))
+        })
+        .collect())
 }
 
 /// Enumerate spaces and the root shell PID of each of their panes, classifying

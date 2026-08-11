@@ -464,7 +464,8 @@ pub fn disable_updater() -> crate::Result<()> {
     // config every session renders — are machine-wide, so leaving another
     // session's daemon running would have it push a token into a card that no
     // longer draws one, with nothing left to turn it off but a restart.
-    let mut sessions = vec![herdr::socket_path().ok()];
+    let mine = herdr::socket_path().ok();
+    let mut others = Vec::new();
     for (pid_file, claim) in recorded_claims() {
         if is_stoppable(&claim, is_our_process) {
             // Unix: SIGTERM, and the daemon clears its own statuses + title on
@@ -477,7 +478,9 @@ pub fn disable_updater() -> crate::Result<()> {
         // Swept either way. A claim whose process is already gone — a crash, a
         // SIGKILL, a session that ended badly — is the case where the rows are
         // certain to still be there and no daemon is left to take them back.
-        sessions.push(claim.socket);
+        if claim.socket != mine {
+            others.push(claim.socket);
+        }
     }
 
     // Belt and braces: sweep every pane of every session that ever recorded an
@@ -485,11 +488,48 @@ pub fn disable_updater() -> crate::Result<()> {
     // statuses, then clear each session's title. If herdr is unavailable,
     // metadata TTLs expire the statuses anyway; the pseudo-agent rows have no
     // TTL, so this is the only thing that takes them back.
-    sweep_sessions(sessions);
+    //
+    // Ours first, and the toast right behind it. This is the session the user
+    // is looking at and the only one known to be answering — the action came in
+    // over it — so it is both the sweep that matters and the one that cannot
+    // stall. Reporting after the foreign sweeps would hide a finished job
+    // behind a stranger's wedged socket.
     reap_dead_claims();
-
+    sweep_sessions(vec![mine]);
     notify("sidebar usage disabled");
+    sweep_other_sessions(others);
     Ok(())
+}
+
+/// How long `--disable` will wait on sessions other than its own, all together.
+///
+/// Generous next to the work — a healthy session is one snapshot and a handful
+/// of clears — because the deadline is there for a session that has stopped
+/// answering, not for a slow one.
+const OTHER_SESSION_SWEEP: Duration = Duration::from_secs(10);
+
+/// [`sweep_sessions`] for sessions that are not ours, under one deadline for
+/// the lot of them.
+///
+/// These sockets come out of files, and nothing has shown the servers behind
+/// them are alive. A session that has *gone* costs nothing — the connection is
+/// refused. The case to bound is a session that connects and then says nothing:
+/// unix caps each call at [`crate::herdr`]'s timeout, and Windows caps it at
+/// nothing at all, a pipe opened as a `File` having no timeout to set. Either
+/// way `--disable` is a command someone is waiting on, and it must not be a
+/// command that never returns.
+///
+/// So the work goes on a thread and the deadline is on the wait, not on any one
+/// call. Whatever is unfinished when time is up is abandoned — it dies with the
+/// process moments later, and what it would have cleared is a row the metadata
+/// TTL takes back anyway.
+fn sweep_other_sessions(sockets: Vec<Option<std::path::PathBuf>>) {
+    let (done, wait) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        sweep_sessions(sockets);
+        let _ = done.send(());
+    });
+    let _ = wait.recv_timeout(OTHER_SESSION_SWEEP);
 }
 
 /// Clear everything this plugin pushed into each named session, skipping any we
@@ -508,13 +548,13 @@ fn sweep_sessions(sockets: Vec<Option<std::path::PathBuf>>) {
         let Ok(mut client) = herdr::connect_to(socket) else {
             continue; // session gone, or a pre-1.11.1 claim that recorded none
         };
-        if let Ok(spaces) = collect::collect_spaces(&mut client) {
+        if let Ok(targets) = collect::sweep_targets(&mut client) {
             let mut sweep = Tracked::default();
-            for sp in &spaces {
-                sweep.pseudo.extend(sp.pseudo_panes.iter().cloned());
-                sweep.metadata.extend(sp.agent_panes.iter().cloned());
-                sweep.metadata.extend(sp.spare_panes.iter().cloned());
-                sweep.workspaces.insert(sp.id.clone());
+            for (workspace, panes) in targets {
+                sweep.pseudo.extend(panes.pseudo_panes);
+                sweep.metadata.extend(panes.agent_panes);
+                sweep.metadata.extend(panes.spare_panes);
+                sweep.workspaces.insert(workspace);
             }
             clear_all(&mut client, &sweep);
         }
