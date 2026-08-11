@@ -346,14 +346,35 @@ pub fn run_daemon() -> crate::Result<()> {
         let config = &settings.config;
         let style = settings.row_style();
 
-        // Reinstalled or rebuilt underneath us? Then this process is the old
-        // version and nothing else will ever notice: herdr runs no hook on
-        // install or uninstall, and `--restore` — the one thing that fires
-        // afterwards — leaves any live daemon alone by design. So the daemon
-        // that is being replaced is the only party in a position to act, and it
-        // acts on itself. Doing it here rather than from the outside also keeps
-        // the single-instance claim honest: one process decides, releases, and
+        // Rebuilt underneath us? Then this process is the old version and
+        // nothing else will ever notice: herdr runs no hook on install or
+        // uninstall, and `--restore` — the one thing that fires afterwards —
+        // leaves any live daemon alone by design. So the daemon that is being
+        // replaced is the only party in a position to act, and it acts on
+        // itself. Doing it here rather than from the outside also keeps the
+        // single-instance claim honest: one process decides, releases, and
         // hands over, instead of two short-lived hooks racing to kill and spawn.
+        //
+        // REBUILT, though — not reinstalled. Measured against herdr 0.8.0: a
+        // `herdr plugin install` moves the whole checkout aside into a
+        // `.tmp-install-*/previous-checkout/` and deletes it, so this process's
+        // executable is not replaced at its path but unlinked from under it.
+        // `/proc/self/exe` then reads `<path> (deleted)`, `current_stamp` cannot
+        // stat it, and an unreadable stamp is deliberately not a change (see
+        // `build_changed` — guessing there would retire a healthy updater). A
+        // `cargo build` in the same tree, which is the dev-link workflow, does
+        // rewrite the file in place and IS caught.
+        //
+        // What that costs after a reinstall: this daemon keeps running the old
+        // build until its herdr server goes away. The new build is not blocked
+        // by it — each session's `--restore` claims its own pid file now and
+        // starts its own updater — so the sidebar is served by the new code and
+        // the old process is redundant rather than in the way. Before per-session
+        // claims it was the other way round, and worse: the old daemon held the
+        // one claim there was, so a reinstall did not take effect at all until
+        // the server restarted. Left as it is because the fix is not obviously
+        // safe — standing down on a vanished executable means `spawn_daemon`
+        // has no file to spawn either.
         if let Some(launched) = launched.as_deref() {
             if build_changed(launched, current_stamp().as_deref())
                 && !stopping.swap(true, Ordering::SeqCst)
@@ -1619,6 +1640,32 @@ mod tests {
             .map(|(_, claim)| claim.pid)
             .collect();
         assert_eq!(stopped, vec![4242, 4343]);
+    }
+
+    /// The Windows-only half of stopping another session's updater: there,
+    /// `--disable` terminates the process outright, so nothing inside it ever
+    /// unlinks its claim and this has to. Runs only where the code does — the
+    /// unix build has no such function, its daemons unlinking their own claim
+    /// from the SIGTERM handler.
+    ///
+    /// Worth having even though it is three lines: it was the one branch in
+    /// this change that nothing anywhere executed. CI compiles the Windows arm
+    /// and the tests exercised every other part of the path, which is a
+    /// combination that reads as covered and is not.
+    #[cfg(windows)]
+    #[test]
+    fn a_terminated_windows_daemon_has_its_claim_unlinked_for_it() {
+        let dir = scratch("stopped-claim");
+        let mine = claim(&dir, "42c3c964", 4242);
+        release_stopped_claim(&mine, 4242);
+        assert!(!mine.exists(), "the claim of the pid we stopped goes");
+
+        // A daemon started between listing the claims and stopping them owns
+        // its own file. Taking it would break the newcomer's single-instance
+        // guard and let a third updater start beside it.
+        let newcomer = claim(&dir, "e60b12c5", 4343);
+        release_stopped_claim(&newcomer, 4242);
+        assert!(newcomer.exists(), "a claim naming someone else stays");
     }
 
     #[test]
