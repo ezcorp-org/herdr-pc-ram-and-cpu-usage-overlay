@@ -104,7 +104,13 @@ fn write_config(path: &Path, original: &str, updated: &str) -> crate::Result<()>
     if !original.is_empty() {
         std::fs::write(backup_path(path), original)?;
     }
-    let temp = path.with_extension("toml.space-usage-tmp");
+    // Pid in the temp name because more than one of us can be here at once:
+    // herdr runs this plugin once per session and they share this one config.
+    // A fixed name has both writing to the same scratch file and one renaming
+    // it out from under the other, which fails the loser's write for no reason
+    // — recoverable today only because the two are computing byte-identical
+    // content, which is a property of the callers rather than of this function.
+    let temp = path.with_extension(format!("toml.space-usage-tmp.{}", std::process::id()));
     std::fs::write(&temp, updated)?;
     std::fs::rename(&temp, path)?;
     Ok(())

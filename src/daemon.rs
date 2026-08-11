@@ -335,6 +335,27 @@ pub fn run_daemon() -> crate::Result<()> {
     let mut failures: u32 = 0;
     loop {
         heartbeat.store(started.elapsed().as_secs(), Ordering::SeqCst);
+        // Still the updater this session recognises? The claim above is written
+        // after a check, and two `--restore` hooks firing together can both pass
+        // that check before either writes — herdr fires one on every
+        // `workspace.focused`, so a fast pair of space switches is all it takes.
+        // The second write then overwrote the first daemon's claim, and THAT is
+        // the state worth guarding against: a daemon nothing can see. It appears
+        // in no pid file, so `--disable` never signals it, the reaper never
+        // touches it, and `--restore` never counts it — while it goes on pushing
+        // rows and titles every interval. `--toggle` made it worse, reading the
+        // absent claim as "nothing running" and starting yet another.
+        //
+        // One line of arithmetic settles it: whoever the file names is the
+        // updater, and everyone else stands down at their next cycle. Two
+        // daemons converge to one within an interval whichever order they wrote
+        // in, and a daemon whose claim was removed by `--disable` exits too,
+        // which is how a `--disable` reaches one of these at all.
+        if !claims_pid_file(read_pid_file(), std::process::id())
+            && !stopping.swap(true, Ordering::SeqCst)
+        {
+            stand_down();
+        }
         // Pick up config edits without an updater restart. Two small file reads
         // per refresh, against a cadence measured in seconds — far cheaper than
         // the `/proc` walk that just ran, and it is what keeps the sidebar rows
@@ -472,7 +493,7 @@ pub fn disable_updater() -> crate::Result<()> {
     // next herdr restart or space switch. This writes an explicit "off" rather
     // than deleting the marker: an absent marker now means "fresh install", and
     // deleting it would make every disable undo itself on the next restart.
-    set_wanted(&config::enabled_flag(), Wanted::Disabled);
+    let recorded = set_wanted(&config::enabled_flag(), Wanted::Disabled);
     // Reversible, as promised: whatever we added to herdr's config comes out —
     // and taking it out un-does the first-run setup, so let that setup run again.
     if herdr_config::remove_usage_row().is_ok_and(Change::needs_reload) {
@@ -517,7 +538,7 @@ pub fn disable_updater() -> crate::Result<()> {
     // behind a stranger's wedged socket.
     reap_dead_claims();
     sweep_sessions(vec![mine]);
-    notify("sidebar usage disabled");
+    notify(disabled_message(recorded));
     sweep_other_sessions(others);
     Ok(())
 }
@@ -832,19 +853,22 @@ fn spawn_daemon() -> crate::Result<()> {
 /// "off" would make every `--disable` undo itself at the next restart.
 ///
 /// Best-effort: the marker only drives restart recovery, so a state dir we cannot
-/// write must not fail the enable/disable the user actually asked for.
-fn set_wanted(path: &std::path::Path, wanted: Wanted) {
+/// write must not fail the enable/disable the user actually asked for. It does
+/// report whether it landed, because for `--disable` a marker that did not is
+/// worth saying out loud — see [`disable_updater`].
+fn set_wanted(path: &std::path::Path, wanted: Wanted) -> bool {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(
+    std::fs::write(
         path,
         if wanted == Wanted::Disabled {
             "0\n"
         } else {
             "1\n"
         },
-    );
+    )
+    .is_ok()
 }
 
 /// One-time setup: make herdr's sidebar draw the token this plugin pushes.
@@ -911,6 +935,23 @@ fn forget_bootstrap_at(marker: &std::path::Path) {
 fn reload_herdr_config() {
     if let Ok(mut client) = herdr::connect() {
         let _ = client.server_reload_config();
+    }
+}
+
+/// Toast text for `--disable`, saying so when the decision did not stick.
+///
+/// An unwritable state dir makes this action quietly self-undoing: the row comes
+/// out and the updaters stop, but with no marker to read, the next space switch
+/// sees a fresh install, puts the row back, and starts an updater again. Silence
+/// there would have the overlay reappear minutes after someone turned it off,
+/// with nothing to connect the two.
+fn disabled_message(recorded: bool) -> &'static str {
+    match recorded {
+        true => "sidebar usage disabled",
+        false => {
+            "sidebar usage disabled for now — the plugin's state dir is not \
+                  writable, so it will come back on the next space switch"
+        }
     }
 }
 
@@ -1048,6 +1089,17 @@ fn is_our_process(pid: u32) -> bool {
 fn shutdown(client: Option<&mut Herdr>, tracked: &Mutex<Tracked>) -> ! {
     release(client, tracked);
     std::process::exit(0);
+}
+
+/// Exit, clearing nothing and releasing nothing.
+///
+/// For the daemon that finds another one holding this session's claim. What is
+/// on screen is the claim-holder's work now, so clearing it would blank the
+/// sidebar for a cycle on our way out, and the pid file is not ours to unlink —
+/// [`release_pid_claim`] would decline anyway, which is the same judgement made
+/// twice. Just go.
+fn stand_down() -> ! {
+    std::process::exit(0)
 }
 
 /// Stand down in favour of a replacement built from the binary now on disk.
@@ -1224,6 +1276,46 @@ mod tests {
         assert!(claims_pid_file(Some(42), 42));
         assert!(!claims_pid_file(Some(43), 42));
         assert!(!claims_pid_file(None, 42));
+    }
+
+    #[test]
+    fn only_the_daemon_the_claim_names_keeps_running() {
+        // The rule the loop applies every cycle, and the answer to a daemon
+        // nothing can see. Two `--restore` hooks firing together can both pass
+        // the startup check before either writes, and the second write leaves
+        // the first daemon with no claim: absent from every pid file, so
+        // `--disable` cannot signal it, the reaper cannot find it, and
+        // `--toggle` reads the missing claim as "nothing running" and starts a
+        // third. It pushed rows for as long as its herdr lived.
+        //
+        // Now the file decides. Whoever it names stays; everyone else goes at
+        // their next cycle, in whichever order they wrote.
+        let me = std::process::id();
+        assert!(claims_pid_file(Some(me), me), "the claim holder stays");
+        assert!(
+            !claims_pid_file(Some(me + 1), me),
+            "a daemon whose claim was taken stands down",
+        );
+        // And the case that lets `--disable` reach one at all: it stops the
+        // claim holder, which unlinks the file on its way out, and the daemon
+        // that had no claim then finds nothing naming it either.
+        assert!(
+            !claims_pid_file(None, me),
+            "an unlinked claim stands the rest down too",
+        );
+    }
+
+    #[test]
+    fn a_disable_that_could_not_record_itself_says_so() {
+        // Otherwise the action is quietly self-undoing: the row comes out and
+        // the updaters stop, but with no marker the next space switch reads a
+        // fresh install, puts the row back and starts an updater — the overlay
+        // returning minutes later with nothing to connect it to.
+        let ok = disabled_message(true);
+        let failed = disabled_message(false);
+        assert_eq!(ok, "sidebar usage disabled");
+        assert!(failed.starts_with(ok), "got: {failed}");
+        assert!(failed.contains("come back"), "got: {failed}");
     }
 
     #[test]

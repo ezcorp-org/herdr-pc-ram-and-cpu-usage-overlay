@@ -68,8 +68,36 @@ fn open_stream(path: &Path) -> io::Result<Stream> {
 /// No read/write timeouts: a pipe opened as `File` has no such knobs. That is
 /// the one thing unix gets for free here, so the daemon carries a watchdog
 /// instead — see [`crate::daemon::run_daemon`].
+///
+/// Retries on `ERROR_PIPE_BUSY`, which is a "not this instant" and not a "not
+/// here". herdr's listener keeps exactly ONE free pipe instance and creates the
+/// next only once `accept` has returned, so any connection that lands in that
+/// window is refused outright — herdr's own client rides it out with
+/// `WaitNamedPipeW(FOREVER)`, and a plain `File::open` does not. Treating it as
+/// a dead session is what makes it matter here: `--disable` sweeps sessions that
+/// are busy serving their own UI, and giving up on one leaves its pseudo-agent
+/// rows behind, which carry no TTL to clear them.
 #[cfg(windows)]
 fn open_stream(path: &Path) -> io::Result<Stream> {
+    /// Windows' `ERROR_PIPE_BUSY`: every instance is spoken for, try again.
+    const PIPE_BUSY: i32 = 231;
+    /// Total wait is `TRIES * BUSY_PAUSE`, comfortably inside the sweep's own
+    /// deadline and imperceptible on the connections that never see a retry.
+    const TRIES: u32 = 20;
+    const BUSY_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+
+    for _ in 0..TRIES {
+        match open_pipe_once(path) {
+            Err(err) if err.raw_os_error() == Some(PIPE_BUSY) => std::thread::sleep(BUSY_PAUSE),
+            settled => return settled,
+        }
+    }
+    open_pipe_once(path)
+}
+
+/// One attempt at the pipe — see [`open_stream`] for why there may be several.
+#[cfg(windows)]
+fn open_pipe_once(path: &Path) -> io::Result<Stream> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
 
