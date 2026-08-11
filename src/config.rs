@@ -1245,6 +1245,23 @@ mod tests {
     }
 
     #[test]
+    fn this_sessions_claim_carries_this_sessions_key() {
+        // The wiring, not just the naming. Every other test here builds a name
+        // from a key by hand, so a `pid_file` that went back to a fixed name —
+        // and so to one updater for the whole machine — would sail past all of
+        // them. Host-independent: whatever socket this run resolves, the file
+        // has to be named after it and not after the pre-1.11.1 scheme.
+        let name = pid_file()
+            .file_name()
+            .expect("a pid file has a name")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(name, pid_file_name(&crate::herdr::session_key()));
+        assert!(name.contains(&crate::herdr::session_key()), "got: {name}");
+        assert_ne!(name, LEGACY_PID_FILE);
+    }
+
+    #[test]
     fn a_sweep_finds_every_sessions_claim_and_the_legacy_one() {
         // `--disable` is one decision for the whole machine, so it has to reach
         // updaters this session never started — including the daemon left
