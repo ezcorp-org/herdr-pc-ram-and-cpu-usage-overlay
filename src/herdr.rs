@@ -387,6 +387,42 @@ pub fn socket_path() -> crate::Result<PathBuf> {
     ))
 }
 
+/// A short, filename-safe name for the herdr session this process talks to.
+///
+/// Each herdr session runs its own server on its own socket — the default
+/// session on `<config_home>/herdr/herdr.sock`, `herdr --session <name>` on
+/// `<config_home>/herdr/sessions/<name>/herdr.sock` — and every plugin process a
+/// session spawns inherits that path in `HERDR_SOCKET_PATH`. herdr's plugin state
+/// dir, by contrast, is one per user and per plugin: `HERDR_PLUGIN_STATE_DIR` is
+/// the same string in every session. So the socket path is the only thing that
+/// names the session from inside a plugin, and anything that must be one *per
+/// session* has to carry this in its file name — see [`crate::config::pid_file`].
+///
+/// A hash rather than the path itself because a file name may not hold a path:
+/// it has separators in it, is longer than some filesystems allow a name to be,
+/// and spells differently on Windows.
+pub fn session_key() -> String {
+    session_key_of(&socket_path().unwrap_or_default().to_string_lossy())
+}
+
+/// [`session_key`] for an explicit socket path.
+///
+/// Hand-rolled FNV-1a rather than `DefaultHasher`, whose output std does not
+/// promise to keep stable between Rust releases. The key has to mean the same
+/// thing to two processes that may have been built by different compilers — a
+/// daemon and the `--restore` that checks up on it — and a key that quietly
+/// changed under a rebuild would let a second updater start alongside the first.
+fn session_key_of(socket_path: &str) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in socket_path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
+}
+
 /// The herdr CLI binary (`HERDR_BIN_PATH`, else `herdr`) for the fallback path.
 ///
 /// Deliberately retained but not yet wired: every method currently goes over the
@@ -551,6 +587,47 @@ mod tests {
             socket_path_from(None, config_home),
             PathBuf::from("/home/u/.config/herdr/herdr.sock"),
         );
+    }
+
+    // ---- naming the session -------------------------------------------------
+
+    #[test]
+    fn each_session_socket_gets_its_own_key() {
+        // What the fix turns on: the default session and a named one must not
+        // share a key, or they go back to sharing one updater — and one updater
+        // can only push over the one socket it connected to.
+        let default = session_key_of("/home/u/.config/herdr/herdr.sock");
+        let named = session_key_of("/home/u/.config/herdr/sessions/second/herdr.sock");
+        assert_ne!(default, named);
+        // Same socket, same key: this is what lets `--restore` find the daemon
+        // it started last time instead of starting another one beside it.
+        assert_eq!(default, session_key_of("/home/u/.config/herdr/herdr.sock"));
+    }
+
+    #[test]
+    fn the_session_key_is_a_fixed_width_name_a_filesystem_accepts() {
+        // It becomes part of a file name, so anything a path can hold and a name
+        // cannot — a separator above all — would put the pid file somewhere
+        // nobody looks for it.
+        let key = session_key_of(r"C:\Users\u\AppData\Roaming\herdr\herdr.sock");
+        assert_eq!(key.len(), 16, "got: {key}");
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()), "got: {key}");
+    }
+
+    #[test]
+    fn the_session_key_is_the_same_one_every_build_computes() {
+        // Pinned to a literal on purpose. Two processes have to agree on this —
+        // a daemon and the `--restore` checking up on it — and they may have
+        // been built by different compilers, so a hash that drifted with the
+        // toolchain would quietly let a second updater start alongside the
+        // first. FNV-1a over the path bytes, exactly this.
+        assert_eq!(
+            session_key_of("/home/u/.config/herdr/herdr.sock"),
+            "42c3c9646ad866b0",
+        );
+        // The empty path is the socket we could not resolve — still a key, and
+        // still its own, rather than a panic or a name shared with a real one.
+        assert_eq!(session_key_of(""), "cbf29ce484222325");
     }
 
     #[cfg(windows)]

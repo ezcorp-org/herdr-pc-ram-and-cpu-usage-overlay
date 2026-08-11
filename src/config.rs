@@ -384,9 +384,68 @@ pub fn config_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join(format!("{}-config", plugin_id())))
 }
 
-/// Updater single-instance pid file (`<state_dir>/updater.pid`).
+/// Updater single-instance pid file for the herdr session this process talks to
+/// (`<state_dir>/updater-<session>.pid`).
+///
+/// Keyed by session because the state dir is not: herdr gives each user one
+/// `HERDR_PLUGIN_STATE_DIR` per plugin and every session shares it, while each
+/// session runs its own server on its own socket. A single global pid file
+/// therefore made the updater one-per-*machine* rather than one-per-session —
+/// the second session's `--restore` found the first session's live daemon,
+/// stood down, and left its sidebar blank, since a daemon can only push to the
+/// one socket it is connected to. See [`crate::herdr::session_key`].
 pub fn pid_file() -> PathBuf {
-    state_dir().join("updater.pid")
+    state_dir().join(pid_file_name(&crate::herdr::session_key()))
+}
+
+/// The pid file name one session key claims.
+pub(crate) fn pid_file_name(session_key: &str) -> String {
+    format!("updater-{session_key}.pid")
+}
+
+/// Pid file written by versions before 1.11.1, when the updater was
+/// one-per-machine.
+///
+/// Still swept by `--disable` so an upgrade cannot strand the daemon that was
+/// running at the time. Deliberately NOT honoured as a single-instance claim:
+/// it says nothing about *which* session's daemon holds it, and treating it as
+/// this session's would put every other session back where it started until
+/// that daemon happened to retire.
+const LEGACY_PID_FILE: &str = "updater.pid";
+
+/// Every session's updater pid file under the state dir, the legacy one
+/// included, sorted so callers behave the same run to run.
+///
+/// `--disable` is one decision for the whole machine — it writes the shared
+/// marker and takes our row out of the one config every session renders — so it
+/// has to reach the daemons other sessions started, not just this session's.
+pub fn pid_files() -> Vec<PathBuf> {
+    pid_files_in(&state_dir())
+}
+
+/// [`pid_files`] against an explicit dir, so a test can exercise it without the
+/// state dir the env decides. A dir we cannot read yields none, which is the
+/// same answer a dir with no updater in it gives.
+fn pid_files_in(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| is_pid_file(path))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Whether `path` names an updater pid file — this scheme's or the legacy one.
+fn is_pid_file(path: &std::path::Path) -> bool {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => {
+            name == LEGACY_PID_FILE || (name.starts_with("updater-") && name.ends_with(".pid"))
+        }
+        None => false,
+    }
 }
 
 /// Marker recording what the user has *decided* about the updater
@@ -1172,6 +1231,64 @@ mod tests {
         // `[ ui ]` still counts as the ui table — the name is trimmed.
         let labels = parse_herdr_labels("[ ui ]\ncpu_label = X\n");
         assert_eq!(labels.cpu(), Some("X"));
+    }
+
+    // ---- state paths: one updater per session --------------------------------
+
+    #[test]
+    fn a_pid_file_is_named_for_one_session_only() {
+        // The state dir is shared by every session herdr runs, so the session
+        // key in the name is the only thing keeping two sessions' updaters
+        // apart. Same key, same file; different key, different file.
+        assert_eq!(pid_file_name("42c3c964"), "updater-42c3c964.pid");
+        assert_ne!(pid_file_name("42c3c964"), pid_file_name("e60b12c5"));
+    }
+
+    #[test]
+    fn a_sweep_finds_every_sessions_claim_and_the_legacy_one() {
+        // `--disable` is one decision for the whole machine, so it has to reach
+        // updaters this session never started — including the daemon left
+        // holding the un-keyed pid file an upgrade from before 1.11.1 stranded.
+        let dir = crate::testutil::scratch("pid-files");
+        for name in [
+            pid_file_name("aaaaaaaa"),
+            pid_file_name("bbbbbbbb"),
+            LEGACY_PID_FILE.to_string(),
+            // An empty key is still this scheme's shape — a socket path that
+            // could not be resolved. A file we cannot explain is safer swept
+            // than left holding a claim nothing ever releases.
+            "updater-.pid".to_string(),
+        ] {
+            std::fs::write(dir.join(name), "1\n").expect("fixture pid file");
+        }
+        // The rest of the state dir stays out of it: these record the user's
+        // decisions, not a process to stop.
+        for other in ["enabled", "bootstrapped", "updater.pid.bak"] {
+            std::fs::write(dir.join(other), "1\n").expect("fixture state file");
+        }
+
+        let found: Vec<String> = pid_files_in(&dir)
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // Sorted, so a caller behaves the same run to run.
+        assert_eq!(
+            found,
+            [
+                "updater-.pid",
+                "updater-aaaaaaaa.pid",
+                "updater-bbbbbbbb.pid",
+                LEGACY_PID_FILE,
+            ],
+        );
+    }
+
+    #[test]
+    fn a_state_dir_that_is_not_there_yields_no_claims() {
+        // A fresh install runs `--disable` before anything has written the dir.
+        // Nothing to stop is not an error.
+        let missing = crate::testutil::scratch("pid-files-missing").join("nope");
+        assert!(pid_files_in(&missing).is_empty());
     }
 
     // ---- shared helpers ------------------------------------------------------

@@ -157,6 +157,23 @@ fresh install → run), enabled, and disabled. Only the last keeps it down, so a
 deliberate `status-disable` stays disabled across restarts while a new install
 starts itself. Requires herdr ≥ 0.7.5; verified against 0.7.5 and 0.8.0.
 
+### More than one herdr session
+
+Every session gets its own updater. Each one runs its own server on its own
+socket, and an updater pushes over the one socket it connected to, so a session
+without an updater of its own would show a `$usage` row with nothing in it
+(#5, fixed in 1.11.1 — before it, the first session to start claimed the single
+global pid file and every other session stood down).
+
+What is per session and what is not follows from where herdr keeps things:
+
+| | Scope | Why |
+|---|---|---|
+| The updater and its pid file | Per session | It can only push to the socket it is connected to. |
+| `status-enable` / `status-disable` | Every session | herdr gives the plugin ONE state dir per user, and the `$usage` row lives in the ONE config every session renders — so the decision cannot be per session. `status-disable` stands down every session's updater. |
+| `status-toggle` | Reads this session | The sidebar in front of you is the one it flips: a session with no updater turns one on, even while another session has one. |
+| Plugin config | Every session | One config dir per user, re-read every refresh. |
+
 > **Upgrading from < 1.8.0?** Two defaults changed, both toward "works without
 > being told": the updater now runs unless you have disabled it, and `mode`
 > defaults to `sidebar` rather than `agents-panel`. If you had deliberately left

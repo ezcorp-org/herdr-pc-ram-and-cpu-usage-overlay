@@ -9,6 +9,15 @@
 //! a herdr or machine restart unless the `enabled` marker alongside the pid file
 //! says the user turned it off.
 //!
+//! One instance per *session*, not per machine. A daemon pushes over the one
+//! socket it connected to, so a second herdr session needs a second daemon; the
+//! pid file is therefore keyed by session (see [`config::pid_file`]) while the
+//! state dir it sits in — and so the `enabled` marker, the plugin config, and the
+//! row in herdr's own config — stays shared, because those are one decision for
+//! the whole machine. That split is what `--disable` follows: it stands down
+//! every session's updater, while `--enable` and `--restore` speak only for the
+//! session that ran them.
+//!
 //! That marker is tri-state, and the third state is the whole point: absent means
 //! *nobody has decided*, which is a fresh install, and a fresh install wants the
 //! updater. The old present/absent boolean could not tell that apart from a
@@ -96,27 +105,64 @@ fn reload_settings() -> Settings {
     }
 }
 
-/// PID of a live updater daemon, or `None` (missing pid file / dead process /
-/// a pid that no longer belongs to us).
+/// PID of a live updater daemon **for this herdr session**, or `None` (missing
+/// pid file / dead process / a pid that no longer belongs to us).
 ///
-/// Reads `<state_dir>/updater.pid` and confirms the pid is live AND really one
-/// of our processes ([`is_our_process`] answers both: a vanished pid has no
-/// image name to read). That second check matters: the state dir outlives
+/// Reads `<state_dir>/updater-<session>.pid` and confirms the pid is live AND
+/// really one of our processes ([`is_our_process`] answers both: a vanished pid
+/// has no image name to read). That second check matters: the state dir outlives
 /// reboots, so an unclean shutdown can leave a pid file pointing at a pid the
 /// kernel later recycled for something else — and without it `--enable` would
 /// no-op forever against that impostor, leaving the sidebar permanently blank.
+///
+/// Per session, not per machine: a daemon serves the one socket it connected to,
+/// so another session's live updater is no reason for this one to stand down.
+/// See [`config::pid_file`].
 pub fn daemon_pid() -> Option<u32> {
-    let pid = read_pid_file()?;
+    daemon_pid_at(&config::pid_file())
+}
+
+/// [`daemon_pid`] for an explicit pid file, so a test can put two sessions'
+/// claims side by side.
+fn daemon_pid_at(path: &std::path::Path) -> Option<u32> {
+    let pid = read_pid_file_at(path)?;
     is_our_process(pid).then_some(pid)
 }
 
-/// The pid recorded in `<state_dir>/updater.pid`, or `None` if the file is
+/// The pid recorded in this session's pid file, or `None` if the file is
 /// missing, unparseable, or holds a non-positive pid. Says nothing about
 /// whether that process is alive — [`daemon_pid`] adds that.
 fn read_pid_file() -> Option<u32> {
-    let text = std::fs::read_to_string(config::pid_file()).ok()?;
+    read_pid_file_at(&config::pid_file())
+}
+
+/// [`read_pid_file`] against an explicit path.
+fn read_pid_file_at(path: &std::path::Path) -> Option<u32> {
+    let text = std::fs::read_to_string(path).ok()?;
     let pid: i32 = text.trim().parse().ok()?;
     (pid > 0).then_some(pid as u32)
+}
+
+/// Every live updater on this machine, each paired with the pid file claiming
+/// it: this session's, every other session's, and the legacy global one.
+///
+/// Only `--disable` wants this. Everything else asks about *this* session, via
+/// [`daemon_pid`] — an updater that starts, hands over, or stands down on
+/// another session's account is the bug this pairing exists to keep out.
+fn live_updaters() -> Vec<(std::path::PathBuf, u32)> {
+    live_updaters_among(config::pid_files())
+}
+
+/// [`live_updaters`] over an explicit list of pid files, so a test can supply
+/// them instead of the state dir the env decides.
+fn live_updaters_among(pid_files: Vec<std::path::PathBuf>) -> Vec<(std::path::PathBuf, u32)> {
+    pid_files
+        .into_iter()
+        .filter_map(|path| {
+            let pid = read_pid_file_at(&path)?;
+            is_our_process(pid).then_some((path, pid))
+        })
+        .collect()
 }
 
 /// `--daemon`: run the updater loop until signalled, then clear and exit.
@@ -305,7 +351,7 @@ pub fn restore_updater() -> crate::Result<()> {
 }
 
 /// `--disable`: record that the updater is NOT wanted, take our config row back
-/// out, signal the daemon, and sweep any leftover statuses / title.
+/// out, signal every session's daemon, and sweep any leftover statuses / title.
 pub fn disable_updater() -> crate::Result<()> {
     // Record the intent so the restore hooks do not resurrect the updater on the
     // next herdr restart or space switch. This writes an explicit "off" rather
@@ -319,27 +365,17 @@ pub fn disable_updater() -> crate::Result<()> {
         reload_herdr_config();
     }
 
-    if let Some(pid) = daemon_pid() {
+    // Every session's updater, not just this one's. The two things `--disable`
+    // has just done — the shared marker and the row it took out of the one
+    // config every session renders — are machine-wide, so leaving another
+    // session's daemon running would have it push a token into a card that no
+    // longer draws one, with nothing left to turn it off but a restart.
+    for (pid_file, pid) in live_updaters() {
         // Unix: SIGTERM, and the daemon clears its own statuses + title on the
         // way down. Windows: TerminateProcess — abrupt, but the sweep below and
         // the status TTLs cover the cleanup the daemon can no longer do.
         proc::stop_process(pid);
-        // A terminated process runs no shutdown, so on Windows nothing would
-        // ever unlink the pid file: it outlives the daemon and leaves the
-        // recycled-pid check ([`is_our_process`]) as the only thing standing
-        // between a stale pid and a permanently no-op `--enable`. Deliberately
-        // NOT done on unix — there the daemon unlinks it from its own SIGTERM
-        // handler, and removing it out from under a daemon that is still
-        // shutting down would let an immediate `--enable` start a second one.
-        //
-        // Guarded on the file still naming the pid we just stopped: a daemon
-        // started in the window between `daemon_pid` and here owns its own file
-        // and must keep it, or this would silently break its single-instance
-        // guard.
-        #[cfg(windows)]
-        if claims_pid_file(read_pid_file(), pid) {
-            let _ = std::fs::remove_file(config::pid_file());
-        }
+        release_stopped_claim(&pid_file, pid);
     }
 
     // Belt and braces: sweep every current pane in case the daemon died — release
@@ -363,7 +399,11 @@ pub fn disable_updater() -> crate::Result<()> {
     Ok(())
 }
 
-/// `--toggle`: disable if a daemon is live, else enable.
+/// `--toggle`: disable if THIS session has a live daemon, else enable.
+///
+/// Reads this session rather than the machine so the action does what the
+/// sidebar in front of you shows: a session with no updater turns one on, even
+/// while another session has one running.
 pub fn toggle_updater() -> crate::Result<()> {
     if daemon_pid().is_some() {
         disable_updater()
@@ -670,6 +710,29 @@ fn claims_pid_file(recorded: Option<u32>, me: u32) -> bool {
     recorded == Some(me)
 }
 
+/// Give up the claim of a daemon `--disable` just terminated (Windows).
+///
+/// `TerminateProcess` runs no shutdown handler, so nothing else would ever
+/// unlink the pid file: it outlives the daemon and leaves the recycled-pid check
+/// ([`is_our_process`]) as the only thing standing between a stale pid and a
+/// permanently no-op `--enable`.
+///
+/// Guarded on the file still naming the pid we stopped: a daemon started in the
+/// window between [`live_updaters`] and here owns its own file and must keep it,
+/// or this would silently break its single-instance guard.
+#[cfg(windows)]
+fn release_stopped_claim(pid_file: &std::path::Path, pid: u32) {
+    if claims_pid_file(read_pid_file_at(pid_file), pid) {
+        let _ = std::fs::remove_file(pid_file);
+    }
+}
+
+/// Nothing to do on unix: the daemon unlinks its own pid file from its SIGTERM
+/// handler. Removing it out from under a daemon that is still shutting down
+/// would let an immediate `--enable` start a second one.
+#[cfg(not(windows))]
+fn release_stopped_claim(_pid_file: &std::path::Path, _pid: u32) {}
+
 /// Give up the single-instance claim, but only where it still names us.
 ///
 /// Every exit path this process has goes through here, so none of them can undo
@@ -888,6 +951,7 @@ mod tests {
     use super::*;
     use crate::battery::State;
     use crate::config::{Labels, RamDisplay};
+    use crate::testutil::scratch;
 
     fn space(cpu: f64, ram_mb: f64) -> Space {
         Space {
@@ -1153,19 +1217,6 @@ mod tests {
 
     // ---- restart recovery ---------------------------------------------------
 
-    /// Unique scratch dir under the system tmpdir, keyed by test name + pid so
-    /// parallel test threads never collide.
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "space-usage-test-{name}-{}-{:?}",
-            std::process::id(),
-            thread::current().id(),
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
-    }
-
     #[test]
     fn a_fresh_install_wants_the_daemon_without_anyone_asking() {
         // THE bug. A fresh install has written no marker, and the old present/
@@ -1264,5 +1315,75 @@ mod tests {
         // No image name to read for a dead pid — the stale-pid-file case must
         // read as "not ours" so the caller starts a fresh daemon.
         assert!(!is_our_process(u32::MAX));
+    }
+
+    // ---- one updater per session ---------------------------------------------
+
+    /// A pid file in `dir` claiming `pid`, named for `session_key`.
+    fn claim(dir: &std::path::Path, session_key: &str, pid: u32) -> std::path::PathBuf {
+        let path = dir.join(config::pid_file_name(session_key));
+        std::fs::write(&path, format!("{pid}\n")).expect("fixture pid file");
+        path
+    }
+
+    #[test]
+    fn one_sessions_live_updater_does_not_stand_the_next_session_down() {
+        // THE bug. herdr gives every session the same plugin state dir but its
+        // own socket, and a daemon pushes over the one socket it connected to.
+        // A single global claim therefore had the second session's `--restore`
+        // find the FIRST session's live updater, stand down, and leave its
+        // sidebar showing a `$usage` row with nothing in it — for as long as the
+        // other session stayed up.
+        let dir = scratch("two-sessions");
+        let me = std::process::id();
+        let first = claim(&dir, "42c3c964", me);
+        let second = dir.join(config::pid_file_name("e60b12c5"));
+
+        assert_eq!(daemon_pid_at(&first), Some(me), "the first session's own");
+        assert_eq!(
+            daemon_pid_at(&second),
+            None,
+            "the second session has to start one of its own",
+        );
+    }
+
+    #[test]
+    fn a_claim_survives_being_read_twice_by_the_session_that_holds_it() {
+        // The other half of the same guard: within ONE session the pid file
+        // still means "an updater is already live here", so `--restore` firing
+        // on every space switch does not pile daemons up.
+        let dir = scratch("same-session");
+        let mine = claim(&dir, "42c3c964", std::process::id());
+        assert!(daemon_pid_at(&mine).is_some());
+        assert!(daemon_pid_at(&mine).is_some());
+    }
+
+    #[test]
+    fn a_sweep_stops_every_live_session_and_leaves_the_dead_alone() {
+        // What `--disable` walks. It is one decision for the whole machine — it
+        // writes the shared marker and takes our row out of the one config every
+        // session renders — so a daemon another session started has to be
+        // stopped too, or it keeps pushing into a card that no longer draws it.
+        //
+        // A stale file is skipped rather than acted on: the state dir outlives
+        // reboots, so its pid may since have been recycled by an unrelated
+        // process, and `--disable` must not go killing that.
+        let dir = scratch("sweep");
+        let me = std::process::id();
+        let mine = claim(&dir, "42c3c964", me);
+        let other_session = claim(&dir, "e60b12c5", me);
+        let stale = claim(&dir, "deadbeef", u32::MAX);
+        let unparseable = dir.join(config::pid_file_name("garbage"));
+        std::fs::write(&unparseable, "not a pid\n").expect("fixture pid file");
+
+        assert_eq!(
+            live_updaters_among(vec![
+                mine.clone(),
+                other_session.clone(),
+                stale,
+                unparseable,
+            ]),
+            vec![(mine, me), (other_session, me)],
+        );
     }
 }

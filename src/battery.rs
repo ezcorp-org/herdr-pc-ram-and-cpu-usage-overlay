@@ -456,7 +456,9 @@ mod power_status {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+
+    use crate::testutil::scratch;
 
     // ---- shared: the percentage gate ----------------------------------------
 
@@ -1064,20 +1066,6 @@ mod tests {
             state,
             charge,
         }
-    }
-
-    /// Unique scratch dir under the system tmpdir, keyed by test name + pid +
-    /// thread id so parallel test threads never collide (the same shape as the
-    /// daemon tests' helper).
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "space-usage-battery-test-{name}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id(),
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
     }
 
     /// Write a fixture power-supply directory: `<root>/<name>/<attr>` holding
