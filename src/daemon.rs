@@ -9,6 +9,15 @@
 //! a herdr or machine restart unless the `enabled` marker alongside the pid file
 //! says the user turned it off.
 //!
+//! One instance per *session*, not per machine. A daemon pushes over the one
+//! socket it connected to, so a second herdr session needs a second daemon; the
+//! pid file is therefore keyed by session (see [`config::pid_file`]) while the
+//! state dir it sits in — and so the `enabled` marker, the plugin config, and the
+//! row in herdr's own config — stays shared, because those are one decision for
+//! the whole machine. That split is what `--disable` follows: it stands down
+//! every session's updater, while `--enable` and `--restore` speak only for the
+//! session that ran them.
+//!
 //! That marker is tri-state, and the third state is the whole point: absent means
 //! *nobody has decided*, which is a fresh install, and a fresh install wants the
 //! updater. The old present/absent boolean could not tell that apart from a
@@ -96,27 +105,180 @@ fn reload_settings() -> Settings {
     }
 }
 
-/// PID of a live updater daemon, or `None` (missing pid file / dead process /
-/// a pid that no longer belongs to us).
+/// PID of a live updater daemon **for this herdr session**, or `None` (missing
+/// pid file / dead process / a pid that no longer belongs to us).
 ///
-/// Reads `<state_dir>/updater.pid` and confirms the pid is live AND really one
-/// of our processes ([`is_our_process`] answers both: a vanished pid has no
-/// image name to read). That second check matters: the state dir outlives
+/// Reads `<state_dir>/updater-<session>.pid` and confirms the pid is live AND
+/// really one of our processes ([`is_our_process`] answers both: a vanished pid
+/// has no image name to read). That second check matters: the state dir outlives
 /// reboots, so an unclean shutdown can leave a pid file pointing at a pid the
 /// kernel later recycled for something else — and without it `--enable` would
 /// no-op forever against that impostor, leaving the sidebar permanently blank.
+///
+/// Per session, not per machine: a daemon serves the one socket it connected to,
+/// so another session's live updater is no reason for this one to stand down.
+/// See [`config::pid_file`].
 pub fn daemon_pid() -> Option<u32> {
-    let pid = read_pid_file()?;
+    daemon_pid_at(&config::pid_file())
+}
+
+/// [`daemon_pid`] for an explicit pid file, so a test can put two sessions'
+/// claims side by side.
+fn daemon_pid_at(path: &std::path::Path) -> Option<u32> {
+    let pid = read_pid_file_at(path)?;
     is_our_process(pid).then_some(pid)
 }
 
-/// The pid recorded in `<state_dir>/updater.pid`, or `None` if the file is
+/// What one updater's pid file says: the process holding the claim, and the
+/// herdr socket it serves.
+///
+/// The socket rides along because a claim is only useful to another session if
+/// it can be acted on, and every action worth taking — clearing a status,
+/// clearing a title — goes over that session's own socket. It is `None` for a
+/// file written before 1.11.1, which recorded the pid alone.
+#[derive(Debug, PartialEq, Eq)]
+struct Claim {
+    pid: u32,
+    socket: Option<std::path::PathBuf>,
+}
+
+/// Record this process's claim on `path`: its pid, and the socket it serves.
+///
+/// Two lines rather than one so the first stays exactly what it always was. The
+/// only reader that could be surprised is an OLDER build parsing the whole file
+/// as a number — a downgrade, which would read the file as unclaimed and start
+/// a second updater in that one session. Both push the same rows, and the next
+/// upgrade settles it.
+fn write_claim(path: &std::path::Path, socket: Option<&std::path::Path>) -> std::io::Result<()> {
+    let socket = socket.map(|s| s.display().to_string()).unwrap_or_default();
+    std::fs::write(path, format!("{}\n{socket}\n", std::process::id()))
+}
+
+/// The pid recorded in this session's pid file, or `None` if the file is
 /// missing, unparseable, or holds a non-positive pid. Says nothing about
 /// whether that process is alive — [`daemon_pid`] adds that.
 fn read_pid_file() -> Option<u32> {
-    let text = std::fs::read_to_string(config::pid_file()).ok()?;
-    let pid: i32 = text.trim().parse().ok()?;
-    (pid > 0).then_some(pid as u32)
+    read_pid_file_at(&config::pid_file())
+}
+
+/// [`read_pid_file`] against an explicit path.
+fn read_pid_file_at(path: &std::path::Path) -> Option<u32> {
+    Some(read_claim_at(path)?.pid)
+}
+
+/// Parse the claim recorded at `path`.
+///
+/// First line only for the pid, so the socket line below it cannot turn a
+/// perfectly good claim into "no updater here" — that answer starts a second
+/// daemon. An empty or absent second line is a claim we can identify but not
+/// reach, which is what a pre-1.11.1 file is.
+fn read_claim_at(path: &std::path::Path) -> Option<Claim> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    let pid = claimed_pid(lines.next()?)?;
+    let socket = lines
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(std::path::PathBuf::from);
+    Some(Claim { pid, socket })
+}
+
+/// The pid a claim's first line names, if it names one a pid can be.
+///
+/// Parsed wide, then bounded, so the accepted set is exactly the pids a pid can
+/// be. The old `i32` parse rejected everything above 2^31 — which no Linux pid
+/// reaches (`pid_max` caps far below it) but a Windows one may, pids there being
+/// a full 32 bits. A daemon whose own pid its own reader threw out would hold a
+/// claim nothing could see, and the single-instance guard would be off for that
+/// process's whole life.
+fn claimed_pid(line: &str) -> Option<u32> {
+    let pid: u64 = line.trim().parse().ok()?;
+    (pid > 0 && pid <= u64::from(u32::MAX)).then_some(pid as u32)
+}
+
+/// Whether this session's claim still names us — `None` when the file could not
+/// be read at all.
+///
+/// The three answers are the point, and the loop acts on only one of them. A
+/// file that is GONE is a definite no: `--disable` unlinks it, and that is what
+/// stands a daemon down. A file naming someone else is a definite no as well.
+/// But a read that FAILS for any other reason — a state dir on a networked home
+/// gone stale, a process out of descriptors — says nothing about who holds the
+/// claim, and answering "not you" there would exit a perfectly healthy solo
+/// updater over a blip.
+///
+/// The same judgement [`build_changed`] makes about a stat it could not take:
+/// where the question is "has something changed underneath me", not being able
+/// to look is not evidence that it has.
+fn claim_still_ours(path: &std::path::Path) -> Option<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(text.lines().next().and_then(claimed_pid) == Some(std::process::id())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// Every claim recorded under the state dir, live or not, each with the pid
+/// file holding it: this session's, every other session's, and the legacy
+/// global one.
+///
+/// Only `--disable` wants this. Everything else asks about *this* session, via
+/// [`daemon_pid`] — an updater that starts, hands over, or stands down on
+/// another session's account is the bug this pairing exists to keep out.
+///
+/// Dead claims come back too, and are worth having: the socket a crashed daemon
+/// recorded is the only way left to take back the rows it pushed, and in
+/// agents-panel mode those rows carry no TTL to fall back on.
+fn recorded_claims() -> Vec<(std::path::PathBuf, Claim)> {
+    recorded_claims_among(config::pid_files())
+}
+
+/// [`recorded_claims`] over an explicit list of pid files, so a test can supply
+/// them instead of the state dir the environment decides.
+fn recorded_claims_among(pid_files: Vec<std::path::PathBuf>) -> Vec<(std::path::PathBuf, Claim)> {
+    pid_files
+        .into_iter()
+        .filter_map(|path| Some((path.clone(), read_claim_at(&path)?)))
+        .collect()
+}
+
+/// Whether `claim` names an updater that `--disable` should stop.
+///
+/// `is_live` is a parameter because the real one, [`is_our_process`], looks for
+/// a live process running our own image — which no portable test can conjure a
+/// second of.
+///
+/// Our own pid is not an updater, however convincingly a file claims it is.
+/// `--disable` runs the same executable the daemon does, so [`is_our_process`]
+/// cannot tell them apart, and a stale file the kernel has since recycled onto
+/// THIS process would have `--disable` stop itself half way through — after
+/// writing the marker and removing the row, before clearing a single status.
+fn is_stoppable(claim: &Claim, is_live: impl Fn(u32) -> bool) -> bool {
+    claim.pid != std::process::id() && is_live(claim.pid)
+}
+
+/// Unlink every pid file that names no live process of ours.
+///
+/// A daemon releases its own claim on the way out, so these are the ones that
+/// never got the chance: a SIGKILL, a crash, a power cut. Left alone they
+/// accumulate one per session ever run, and each is a lottery ticket in the
+/// recycled-pid draw [`is_our_process`] cannot see through — a pid landing on
+/// the user's own dashboard pane reads as an updater. Reaping them is safe by
+/// definition: the file names nothing.
+fn reap_dead_claims() {
+    reap_dead_claims_among(config::pid_files(), is_our_process);
+}
+
+/// [`reap_dead_claims`] over an explicit list and liveness test — same seam, and
+/// there for the same reason, as [`live_updaters_among`].
+fn reap_dead_claims_among(pid_files: Vec<std::path::PathBuf>, is_live: impl Fn(u32) -> bool) {
+    for path in pid_files {
+        let live = read_claim_at(&path).is_some_and(|claim| is_live(claim.pid));
+        if !live {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// `--daemon`: run the updater loop until signalled, then clear and exit.
@@ -131,7 +293,11 @@ pub fn run_daemon() -> crate::Result<()> {
         return Ok(()); // another updater is already live
     }
     std::fs::create_dir_all(config::state_dir())?;
-    std::fs::write(config::pid_file(), format!("{}\n", std::process::id()))?;
+    // The socket goes in beside the pid so a `--disable` run from another
+    // session can clear what this daemon pushed. Nothing else can: it is
+    // reached over this socket, and on Windows a terminated daemon runs no
+    // shutdown of its own.
+    write_claim(&config::pid_file(), herdr::socket_path().ok().as_deref())?;
     // Taken once, before any work: this is the build we are, and the loop
     // compares it against the file on disk to notice being replaced.
     let launched = current_stamp();
@@ -195,6 +361,30 @@ pub fn run_daemon() -> crate::Result<()> {
     let mut failures: u32 = 0;
     loop {
         heartbeat.store(started.elapsed().as_secs(), Ordering::SeqCst);
+        // Still the updater this session recognises? The claim above is written
+        // after a check, and two `--restore` hooks firing together can both pass
+        // that check before either writes — herdr fires one on every
+        // `workspace.focused`, so a fast pair of space switches is all it takes.
+        // The second write then overwrote the first daemon's claim, and THAT is
+        // the state worth guarding against: a daemon nothing can see. It appears
+        // in no pid file, so `--disable` never signals it, the reaper never
+        // touches it, and `--restore` never counts it — while it goes on pushing
+        // rows and titles every interval. `--toggle` made it worse, reading the
+        // absent claim as "nothing running" and starting yet another.
+        //
+        // One line of arithmetic settles it: whoever the file names is the
+        // updater, and everyone else stands down at their next cycle. Two
+        // daemons converge to one within an interval whichever order they wrote
+        // in, and a daemon whose claim was removed by `--disable` exits too,
+        // which is how a `--disable` reaches one of these at all.
+        //
+        // Only a definite answer counts — see [`claim_still_ours`]. A file we
+        // could not read is not a file that named someone else.
+        if claim_still_ours(&config::pid_file()) == Some(false)
+            && !stopping.swap(true, Ordering::SeqCst)
+        {
+            stand_down();
+        }
         // Pick up config edits without an updater restart. Two small file reads
         // per refresh, against a cadence measured in seconds — far cheaper than
         // the `/proc` walk that just ran, and it is what keeps the sidebar rows
@@ -206,14 +396,35 @@ pub fn run_daemon() -> crate::Result<()> {
         let config = &settings.config;
         let style = settings.row_style();
 
-        // Reinstalled or rebuilt underneath us? Then this process is the old
-        // version and nothing else will ever notice: herdr runs no hook on
-        // install or uninstall, and `--restore` — the one thing that fires
-        // afterwards — leaves any live daemon alone by design. So the daemon
-        // that is being replaced is the only party in a position to act, and it
-        // acts on itself. Doing it here rather than from the outside also keeps
-        // the single-instance claim honest: one process decides, releases, and
+        // Rebuilt underneath us? Then this process is the old version and
+        // nothing else will ever notice: herdr runs no hook on install or
+        // uninstall, and `--restore` — the one thing that fires afterwards —
+        // leaves any live daemon alone by design. So the daemon that is being
+        // replaced is the only party in a position to act, and it acts on
+        // itself. Doing it here rather than from the outside also keeps the
+        // single-instance claim honest: one process decides, releases, and
         // hands over, instead of two short-lived hooks racing to kill and spawn.
+        //
+        // REBUILT, though — not reinstalled. Measured against herdr 0.8.0: a
+        // `herdr plugin install` moves the whole checkout aside into a
+        // `.tmp-install-*/previous-checkout/` and deletes it, so this process's
+        // executable is not replaced at its path but unlinked from under it.
+        // `/proc/self/exe` then reads `<path> (deleted)`, `current_stamp` cannot
+        // stat it, and an unreadable stamp is deliberately not a change (see
+        // `build_changed` — guessing there would retire a healthy updater). A
+        // `cargo build` in the same tree, which is the dev-link workflow, does
+        // rewrite the file in place and IS caught.
+        //
+        // What that costs after a reinstall: this daemon keeps running the old
+        // build until its herdr server goes away. The new build is not blocked
+        // by it — each session's `--restore` claims its own pid file now and
+        // starts its own updater — so the sidebar is served by the new code and
+        // the old process is redundant rather than in the way. Before per-session
+        // claims it was the other way round, and worse: the old daemon held the
+        // one claim there was, so a reinstall did not take effect at all until
+        // the server restarted. Left as it is because the fix is not obviously
+        // safe — standing down on a vanished executable means `spawn_daemon`
+        // has no file to spawn either.
         if let Some(launched) = launched.as_deref() {
             if build_changed(launched, current_stamp().as_deref())
                 && !stopping.swap(true, Ordering::SeqCst)
@@ -305,13 +516,13 @@ pub fn restore_updater() -> crate::Result<()> {
 }
 
 /// `--disable`: record that the updater is NOT wanted, take our config row back
-/// out, signal the daemon, and sweep any leftover statuses / title.
+/// out, signal every session's daemon, and sweep any leftover statuses / title.
 pub fn disable_updater() -> crate::Result<()> {
     // Record the intent so the restore hooks do not resurrect the updater on the
     // next herdr restart or space switch. This writes an explicit "off" rather
     // than deleting the marker: an absent marker now means "fresh install", and
     // deleting it would make every disable undo itself on the next restart.
-    set_wanted(&config::enabled_flag(), Wanted::Disabled);
+    let recorded = set_wanted(&config::enabled_flag(), Wanted::Disabled);
     // Reversible, as promised: whatever we added to herdr's config comes out —
     // and taking it out un-does the first-run setup, so let that setup run again.
     if herdr_config::remove_usage_row().is_ok_and(Change::needs_reload) {
@@ -319,51 +530,157 @@ pub fn disable_updater() -> crate::Result<()> {
         reload_herdr_config();
     }
 
-    if let Some(pid) = daemon_pid() {
-        // Unix: SIGTERM, and the daemon clears its own statuses + title on the
-        // way down. Windows: TerminateProcess — abrupt, but the sweep below and
-        // the status TTLs cover the cleanup the daemon can no longer do.
-        proc::stop_process(pid);
-        // A terminated process runs no shutdown, so on Windows nothing would
-        // ever unlink the pid file: it outlives the daemon and leaves the
-        // recycled-pid check ([`is_our_process`]) as the only thing standing
-        // between a stale pid and a permanently no-op `--enable`. Deliberately
-        // NOT done on unix — there the daemon unlinks it from its own SIGTERM
-        // handler, and removing it out from under a daemon that is still
-        // shutting down would let an immediate `--enable` start a second one.
-        //
-        // Guarded on the file still naming the pid we just stopped: a daemon
-        // started in the window between `daemon_pid` and here owns its own file
-        // and must keep it, or this would silently break its single-instance
-        // guard.
-        #[cfg(windows)]
-        if claims_pid_file(read_pid_file(), pid) {
-            let _ = std::fs::remove_file(config::pid_file());
+    // Every session's updater, not just this one's. The two things `--disable`
+    // has just done — the shared marker and the row it took out of the one
+    // config every session renders — are machine-wide, so leaving another
+    // session's daemon running would have it push a token into a card that no
+    // longer draws one, with nothing left to turn it off but a restart.
+    let mine = herdr::socket_path().ok();
+    let mut others = Vec::new();
+    for (pid_file, claim) in recorded_claims() {
+        if is_stoppable(&claim, is_our_process) {
+            // Unix: SIGTERM, and the daemon clears its own statuses + title on
+            // the way down. Windows: TerminateProcess — abrupt, so the sweep
+            // below does that daemon's cleaning for it, over the socket it
+            // recorded.
+            proc::stop_process(claim.pid);
+            release_stopped_claim(&pid_file, claim.pid);
+        }
+        // Swept either way. A claim whose process is already gone — a crash, a
+        // SIGKILL, a session that ended badly — is the case where the rows are
+        // certain to still be there and no daemon is left to take them back.
+        if claim.socket != mine {
+            others.push(claim.socket);
         }
     }
 
-    // Belt and braces: sweep every current pane in case the daemon died — release
-    // pseudo-agents (no TTL) and clear metadata statuses — then clear the title.
-    // If herdr is unavailable, metadata TTLs expire the statuses anyway.
-    if let Ok(mut client) = herdr::connect() {
-        if let Ok(spaces) = collect::collect_spaces(&mut client) {
-            let mut sweep = Tracked::default();
-            for sp in &spaces {
-                sweep.pseudo.extend(sp.pseudo_panes.iter().cloned());
-                sweep.metadata.extend(sp.agent_panes.iter().cloned());
-                sweep.metadata.extend(sp.spare_panes.iter().cloned());
-                sweep.workspaces.insert(sp.id.clone());
-            }
-            clear_all(&mut client, &sweep);
-        }
-        let _ = client.window_title_clear();
-    }
-
-    notify("sidebar usage disabled");
+    // Belt and braces: sweep every pane of every session that ever recorded an
+    // updater, plus our own — release pseudo-agents (no TTL) and clear metadata
+    // statuses, then clear each session's title. If herdr is unavailable,
+    // metadata TTLs expire the statuses anyway; the pseudo-agent rows have no
+    // TTL, so this is the only thing that takes them back.
+    //
+    // Ours first, and the toast right behind it. This is the session the user
+    // is looking at and the only one known to be answering — the action came in
+    // over it — so it is both the sweep that matters and the one that cannot
+    // stall. Reporting after the foreign sweeps would hide a finished job
+    // behind a stranger's wedged socket.
+    reap_dead_claims();
+    sweep_sessions(vec![mine]);
+    notify(disabled_message(recorded));
+    sweep_other_sessions(others);
     Ok(())
 }
 
-/// `--toggle`: disable if a daemon is live, else enable.
+/// How long `--disable` will wait on sessions other than its own, all together.
+///
+/// Generous next to the work — a healthy session is one snapshot and a handful
+/// of clears — because the deadline is there for a session that has stopped
+/// answering, not for a slow one.
+const OTHER_SESSION_SWEEP: Duration = Duration::from_secs(10);
+
+/// [`sweep_sessions`] for sessions that are not ours, under one deadline for
+/// the lot of them.
+///
+/// These sockets come out of files, and nothing has shown the servers behind
+/// them are alive. A session that has *gone* costs nothing — the connection is
+/// refused. The case to bound is a session that connects and then says nothing:
+/// unix caps each call at [`crate::herdr`]'s timeout, and Windows caps it at
+/// nothing at all, a pipe opened as a `File` having no timeout to set. Either
+/// way `--disable` is a command someone is waiting on, and it must not be a
+/// command that never returns.
+///
+/// So the work goes on a thread and the deadline is on the wait, not on any one
+/// call. Whatever is unfinished when time is up is abandoned — it dies with the
+/// process moments later, and what it would have cleared is a row the metadata
+/// TTL takes back anyway.
+fn sweep_other_sessions(sockets: Vec<Option<std::path::PathBuf>>) {
+    within(OTHER_SESSION_SWEEP, move || sweep_sessions(sockets));
+}
+
+/// Run `work` on a thread and wait no longer than `deadline` for it.
+///
+/// Returns as soon as the work is done, or when the deadline passes, whichever
+/// comes first; the thread is left to die with the process. A panic in `work`
+/// drops the sender and returns immediately, so a bug in there costs the wait
+/// rather than being hidden by it.
+///
+/// Split out to be tested, which matters more than its four lines suggest. On
+/// Windows this is the ONLY bound on the sweep — a named pipe opened as a
+/// `File` has no timeout to set, so nothing under it can time out on its own —
+/// and CI has no herdr to demonstrate that against. Taking a closure lets the
+/// mechanism be pinned on every platform without one.
+fn within(deadline: Duration, work: impl FnOnce() + Send + 'static) {
+    let (done, wait) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        work();
+        let _ = done.send(());
+    });
+    let _ = wait.recv_timeout(deadline);
+}
+
+/// Everything one session could be carrying from us, as the set to clear.
+///
+/// A sweep runs where no record survives of what was actually pushed — another
+/// session's daemon kept that in its own memory and is now gone — so it assumes
+/// the most and clears it all. Clearing a pane we never touched is a no-op;
+/// missing one is a reading that stays on screen.
+///
+/// A pseudo pane goes in BOTH buckets, and that is the whole reason this is a
+/// function of its own. Agents-panel mode puts two things on that one pane —
+/// the pseudo-agent that names the row and the token that fills it (see
+/// [`push_statuses`]) — and listing it only as a pseudo released the row while
+/// leaving the reading behind it, on screen until the token's TTL ran out, in a
+/// session the user had just switched the overlay off in.
+fn everything_we_could_have_pushed(targets: Vec<(String, collect::PaneRoles)>) -> Tracked {
+    let mut sweep = Tracked::default();
+    for (workspace, panes) in targets {
+        sweep.metadata.extend(panes.pseudo_panes.iter().cloned());
+        sweep.pseudo.extend(panes.pseudo_panes);
+        sweep.metadata.extend(panes.agent_panes);
+        sweep.metadata.extend(panes.spare_panes);
+        sweep.workspaces.insert(workspace);
+    }
+    sweep
+}
+
+/// Clear everything this plugin pushed into each named session, skipping any we
+/// cannot reach and any we have already done.
+///
+/// One session per socket, because a status can only be cleared over the
+/// connection that set it. On unix the daemons clear up after themselves and
+/// this is the belt to that pair of braces; on Windows they are terminated
+/// outright and this is the only cleaning that happens at all.
+fn sweep_sessions(sockets: Vec<Option<std::path::PathBuf>>) {
+    let mut done = HashSet::new();
+    for socket in sockets.into_iter().flatten() {
+        if !done.insert(socket.clone()) {
+            continue;
+        }
+        let Ok(mut client) = herdr::connect_to(socket) else {
+            continue; // session gone, or a pre-1.11.1 claim that recorded none
+        };
+        if let Ok(targets) = collect::sweep_targets(&mut client) {
+            clear_all(&mut client, &everything_we_could_have_pushed(targets));
+        }
+        let _ = client.window_title_clear();
+    }
+}
+
+/// `--toggle`: disable if THIS session has a live daemon, else enable.
+///
+/// Reads this session rather than the machine so the action does what the
+/// sidebar in front of you shows: a session with no updater turns one on, even
+/// while another session has one running.
+///
+/// What it reads is per session; what it *does* is whatever the two halves do,
+/// and those are not symmetric. Toggling on starts this session's updater, and
+/// the others follow at their next `--restore`. Toggling off reaches every
+/// session, because there is no such thing as a session-local "off": one marker
+/// per user records the decision, and a session that tried to keep its own
+/// updater down would have `--restore` bring it back on the next space switch.
+/// Say so wherever this is documented — a user with two sessions who toggles one
+/// dark and finds both dark is owed the reason.
 pub fn toggle_updater() -> crate::Result<()> {
     if daemon_pid().is_some() {
         disable_updater()
@@ -565,19 +882,22 @@ fn spawn_daemon() -> crate::Result<()> {
 /// "off" would make every `--disable` undo itself at the next restart.
 ///
 /// Best-effort: the marker only drives restart recovery, so a state dir we cannot
-/// write must not fail the enable/disable the user actually asked for.
-fn set_wanted(path: &std::path::Path, wanted: Wanted) {
+/// write must not fail the enable/disable the user actually asked for. It does
+/// report whether it landed, because for `--disable` a marker that did not is
+/// worth saying out loud — see [`disable_updater`].
+fn set_wanted(path: &std::path::Path, wanted: Wanted) -> bool {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(
+    std::fs::write(
         path,
         if wanted == Wanted::Disabled {
             "0\n"
         } else {
             "1\n"
         },
-    );
+    )
+    .is_ok()
 }
 
 /// One-time setup: make herdr's sidebar draw the token this plugin pushes.
@@ -647,6 +967,23 @@ fn reload_herdr_config() {
     }
 }
 
+/// Toast text for `--disable`, saying so when the decision did not stick.
+///
+/// An unwritable state dir makes this action quietly self-undoing: the row comes
+/// out and the updaters stop, but with no marker to read, the next space switch
+/// sees a fresh install, puts the row back, and starts an updater again. Silence
+/// there would have the overlay reappear minutes after someone turned it off,
+/// with nothing to connect the two.
+fn disabled_message(recorded: bool) -> &'static str {
+    match recorded {
+        true => "sidebar usage disabled",
+        false => {
+            "sidebar usage disabled for now — the plugin's state dir is not \
+                  writable, so it will come back on the next space switch"
+        }
+    }
+}
+
 /// Toast text for `--enable`, naming the config edit when there was one.
 ///
 /// Silence would be the wrong default here: the plugin has just written to a
@@ -669,6 +1006,29 @@ fn enabled_message(base: &str, added_row: bool) -> String {
 fn claims_pid_file(recorded: Option<u32>, me: u32) -> bool {
     recorded == Some(me)
 }
+
+/// Give up the claim of a daemon `--disable` just terminated (Windows).
+///
+/// `TerminateProcess` runs no shutdown handler, so nothing else would ever
+/// unlink the pid file: it outlives the daemon and leaves the recycled-pid check
+/// ([`is_our_process`]) as the only thing standing between a stale pid and a
+/// permanently no-op `--enable`.
+///
+/// Guarded on the file still naming the pid we stopped: a daemon started in the
+/// window between [`recorded_claims`] and here owns its own file and must keep
+/// it, or this would silently break its single-instance guard.
+#[cfg(windows)]
+fn release_stopped_claim(pid_file: &std::path::Path, pid: u32) {
+    if claims_pid_file(read_pid_file_at(pid_file), pid) {
+        let _ = std::fs::remove_file(pid_file);
+    }
+}
+
+/// Nothing to do on unix: the daemon unlinks its own pid file from its SIGTERM
+/// handler. Removing it out from under a daemon that is still shutting down
+/// would let an immediate `--enable` start a second one.
+#[cfg(not(windows))]
+fn release_stopped_claim(_pid_file: &std::path::Path, _pid: u32) {}
 
 /// Give up the single-instance claim, but only where it still names us.
 ///
@@ -758,6 +1118,17 @@ fn is_our_process(pid: u32) -> bool {
 fn shutdown(client: Option<&mut Herdr>, tracked: &Mutex<Tracked>) -> ! {
     release(client, tracked);
     std::process::exit(0);
+}
+
+/// Exit, clearing nothing and releasing nothing.
+///
+/// For the daemon that finds another one holding this session's claim. What is
+/// on screen is the claim-holder's work now, so clearing it would blank the
+/// sidebar for a cycle on our way out, and the pid file is not ours to unlink —
+/// [`release_pid_claim`] would decline anyway, which is the same judgement made
+/// twice. Just go.
+fn stand_down() -> ! {
+    std::process::exit(0)
 }
 
 /// Stand down in favour of a replacement built from the binary now on disk.
@@ -888,6 +1259,7 @@ mod tests {
     use super::*;
     use crate::battery::State;
     use crate::config::{Labels, RamDisplay};
+    use crate::testutil::scratch;
 
     fn space(cpu: f64, ram_mb: f64) -> Space {
         Space {
@@ -933,6 +1305,77 @@ mod tests {
         assert!(claims_pid_file(Some(42), 42));
         assert!(!claims_pid_file(Some(43), 42));
         assert!(!claims_pid_file(None, 42));
+    }
+
+    #[test]
+    fn a_claim_that_cannot_be_read_stands_nobody_down() {
+        // Three answers, and the loop acts on one. Gone and taken are both
+        // definite; a read that failed for any other reason is not, and
+        // treating it as "taken" would exit a healthy solo updater over a
+        // networked home going stale for a moment. Same judgement
+        // `build_changed` makes about a stat it could not take.
+        let dir = scratch("claim-readable");
+        let me = std::process::id();
+
+        let mine = claim(&dir, "42c3c964", me);
+        assert_eq!(claim_still_ours(&mine), Some(true), "ours");
+
+        let theirs = claim(&dir, "e60b12c5", me + 1);
+        assert_eq!(claim_still_ours(&theirs), Some(false), "taken");
+
+        let gone = dir.join(config::pid_file_name("deadbeef"));
+        assert_eq!(
+            claim_still_ours(&gone),
+            Some(false),
+            "unlinked by --disable"
+        );
+
+        // A directory where the file should be: readable as an entry, never as
+        // text. Stands in for the read errors a test cannot arrange — the point
+        // is only that a non-NotFound failure answers "cannot tell".
+        let unreadable = dir.join(config::pid_file_name("0badc0de"));
+        std::fs::create_dir(&unreadable).expect("fixture dir");
+        assert_eq!(claim_still_ours(&unreadable), None, "cannot tell");
+    }
+
+    #[test]
+    fn only_the_daemon_the_claim_names_keeps_running() {
+        // The rule the loop applies every cycle, and the answer to a daemon
+        // nothing can see. Two `--restore` hooks firing together can both pass
+        // the startup check before either writes, and the second write leaves
+        // the first daemon with no claim: absent from every pid file, so
+        // `--disable` cannot signal it, the reaper cannot find it, and
+        // `--toggle` reads the missing claim as "nothing running" and starts a
+        // third. It pushed rows for as long as its herdr lived.
+        //
+        // Now the file decides. Whoever it names stays; everyone else goes at
+        // their next cycle, in whichever order they wrote.
+        let me = std::process::id();
+        assert!(claims_pid_file(Some(me), me), "the claim holder stays");
+        assert!(
+            !claims_pid_file(Some(me + 1), me),
+            "a daemon whose claim was taken stands down",
+        );
+        // And the case that lets `--disable` reach one at all: it stops the
+        // claim holder, which unlinks the file on its way out, and the daemon
+        // that had no claim then finds nothing naming it either.
+        assert!(
+            !claims_pid_file(None, me),
+            "an unlinked claim stands the rest down too",
+        );
+    }
+
+    #[test]
+    fn a_disable_that_could_not_record_itself_says_so() {
+        // Otherwise the action is quietly self-undoing: the row comes out and
+        // the updaters stop, but with no marker the next space switch reads a
+        // fresh install, puts the row back and starts an updater — the overlay
+        // returning minutes later with nothing to connect it to.
+        let ok = disabled_message(true);
+        let failed = disabled_message(false);
+        assert_eq!(ok, "sidebar usage disabled");
+        assert!(failed.starts_with(ok), "got: {failed}");
+        assert!(failed.contains("come back"), "got: {failed}");
     }
 
     #[test]
@@ -1153,19 +1596,6 @@ mod tests {
 
     // ---- restart recovery ---------------------------------------------------
 
-    /// Unique scratch dir under the system tmpdir, keyed by test name + pid so
-    /// parallel test threads never collide.
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "space-usage-test-{name}-{}-{:?}",
-            std::process::id(),
-            thread::current().id(),
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
-    }
-
     #[test]
     fn a_fresh_install_wants_the_daemon_without_anyone_asking() {
         // THE bug. A fresh install has written no marker, and the old present/
@@ -1264,5 +1694,285 @@ mod tests {
         // No image name to read for a dead pid — the stale-pid-file case must
         // read as "not ours" so the caller starts a fresh daemon.
         assert!(!is_our_process(u32::MAX));
+    }
+
+    // ---- one updater per session ---------------------------------------------
+
+    /// A pid file in `dir` claiming `pid` for `session_key`, in the two-line
+    /// form a 1.11.1 daemon writes.
+    fn claim(dir: &std::path::Path, session_key: &str, pid: u32) -> std::path::PathBuf {
+        let path = dir.join(config::pid_file_name(session_key));
+        std::fs::write(&path, format!("{pid}\n/run/{session_key}.sock\n"))
+            .expect("fixture pid file");
+        path
+    }
+
+    /// The claim `claim` writes, for comparing against what was read back.
+    fn claim_of(session_key: &str, pid: u32) -> Claim {
+        Claim {
+            pid,
+            socket: Some(std::path::PathBuf::from(format!("/run/{session_key}.sock"))),
+        }
+    }
+
+    #[test]
+    fn one_sessions_live_updater_does_not_stand_the_next_session_down() {
+        // THE bug. herdr gives every session the same plugin state dir but its
+        // own socket, and a daemon pushes over the one socket it connected to.
+        // A single global claim therefore had the second session's `--restore`
+        // find the FIRST session's live updater, stand down, and leave its
+        // sidebar showing a `$usage` row with nothing in it — for as long as the
+        // other session stayed up.
+        let dir = scratch("two-sessions");
+        let me = std::process::id();
+        let first = claim(&dir, "42c3c964", me);
+        let second = dir.join(config::pid_file_name("e60b12c5"));
+
+        assert_eq!(daemon_pid_at(&first), Some(me), "the first session's own");
+        assert_eq!(
+            daemon_pid_at(&second),
+            None,
+            "the second session has to start one of its own",
+        );
+    }
+
+    #[test]
+    fn disable_stops_the_live_updaters_but_sweeps_every_session_it_can_name() {
+        // What `--disable` acts on. It is one decision for the whole machine —
+        // it writes the shared marker and takes our row out of the one config
+        // every session renders — so a daemon another session started has to be
+        // stopped too, or it keeps pushing into a card that no longer draws it.
+        //
+        // Three kinds are never stopped. A stale pid, because the state dir
+        // outlives reboots and the kernel may since have recycled it onto
+        // something else. An unparseable file, because it names nothing. And
+        // our own pid: `--disable` runs the same executable the daemon does, so
+        // a recycled pid landing HERE would have it stop itself half way
+        // through, having written the marker and removed the row but cleared
+        // not one status.
+        //
+        // The stale one is still SWEPT, which is the half that is easy to get
+        // wrong: a daemon that crashed left its rows behind and no longer has a
+        // process to take them back, and in agents-panel mode those rows have
+        // no TTL to fall back on. Its socket is the only way to reach them, and
+        // its pid file is the only place that socket is written down.
+        let dir = scratch("sweep");
+        // Everything is live to this liveness test EXCEPT the pid nothing can
+        // be running under, so what the assertions pin is the code's own doing.
+        let is_live = |pid: u32| pid != u32::MAX;
+        let mine = claim(&dir, "42c3c964", 4242);
+        let other_session = claim(&dir, "e60b12c5", 4343);
+        let stale = claim(&dir, "deadbeef", u32::MAX);
+        let ourselves = claim(&dir, "0badc0de", std::process::id());
+        let unparseable = dir.join(config::pid_file_name("garbage"));
+        std::fs::write(&unparseable, "not a pid\n").expect("fixture pid file");
+
+        let claims = recorded_claims_among(vec![
+            mine.clone(),
+            other_session.clone(),
+            stale.clone(),
+            ourselves.clone(),
+            unparseable,
+        ]);
+
+        // Every readable claim, so every session's socket is reachable.
+        assert_eq!(
+            claims,
+            vec![
+                (mine, claim_of("42c3c964", 4242)),
+                (other_session, claim_of("e60b12c5", 4343)),
+                (stale, claim_of("deadbeef", u32::MAX)),
+                (ourselves, claim_of("0badc0de", std::process::id())),
+            ],
+        );
+        // Of those, only the two live ones that are not us get stopped.
+        let stopped: Vec<u32> = claims
+            .iter()
+            .filter(|(_, claim)| is_stoppable(claim, is_live))
+            .map(|(_, claim)| claim.pid)
+            .collect();
+        assert_eq!(stopped, vec![4242, 4343]);
+    }
+
+    /// The Windows-only half of stopping another session's updater: there,
+    /// `--disable` terminates the process outright, so nothing inside it ever
+    /// unlinks its claim and this has to. Runs only where the code does — the
+    /// unix build has no such function, its daemons unlinking their own claim
+    /// from the SIGTERM handler.
+    ///
+    /// Worth having even though it is three lines: it was the one branch in
+    /// this change that nothing anywhere executed. CI compiles the Windows arm
+    /// and the tests exercised every other part of the path, which is a
+    /// combination that reads as covered and is not.
+    #[cfg(windows)]
+    #[test]
+    fn a_terminated_windows_daemon_has_its_claim_unlinked_for_it() {
+        let dir = scratch("stopped-claim");
+        let mine = claim(&dir, "42c3c964", 4242);
+        release_stopped_claim(&mine, 4242);
+        assert!(!mine.exists(), "the claim of the pid we stopped goes");
+
+        // A daemon started between listing the claims and stopping them owns
+        // its own file. Taking it would break the newcomer's single-instance
+        // guard and let a third updater start beside it.
+        let newcomer = claim(&dir, "e60b12c5", 4343);
+        release_stopped_claim(&newcomer, 4242);
+        assert!(newcomer.exists(), "a claim naming someone else stays");
+    }
+
+    #[test]
+    fn a_deadline_returns_from_work_that_never_does() {
+        // The one bound the Windows sweep has. A pipe opened as a `File` has no
+        // timeout to set, so if this wait did not come back, `--disable` would
+        // not either — a command the user is watching, hung on a session that
+        // is nothing to do with them. Runs on every platform, which is the
+        // point: CI has no herdr to wedge, and this needs none.
+        let started = std::time::Instant::now();
+        within(Duration::from_millis(50), || {
+            thread::sleep(Duration::from_secs(3600))
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "waited {:?}",
+            started.elapsed(),
+        );
+    }
+
+    #[test]
+    fn work_that_finishes_does_not_serve_out_the_deadline() {
+        // The other half, and the one a too-eager fix would break: the deadline
+        // is a ceiling, not a delay. Every ordinary `--disable` goes through
+        // here, so waiting it out would add ten seconds to the common case.
+        let started = std::time::Instant::now();
+        within(Duration::from_secs(3600), || {});
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "waited {:?}",
+            started.elapsed(),
+        );
+    }
+
+    #[test]
+    fn a_session_that_is_not_there_costs_nothing_to_sweep() {
+        // A recorded claim outlives the session that wrote it, so most sweeps
+        // dial something that has gone. That has to fail immediately rather
+        // than eat the deadline — on unix the connection is refused, on Windows
+        // the pipe is simply not there to open, and this pins both.
+        let dir = scratch("unreachable");
+        let started = std::time::Instant::now();
+        sweep_sessions(vec![Some(dir.join("herdr.sock")), None]);
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "waited {:?}",
+            started.elapsed(),
+        );
+    }
+
+    #[test]
+    fn a_sweep_takes_back_both_things_a_pseudo_pane_carries() {
+        // Found end-to-end, in agents-panel mode across two sessions: the sweep
+        // released the pseudo-agent row and left the reading sitting inside it,
+        // because the pane went into the pseudo bucket only. It cleared itself
+        // 15 s later when the token's TTL ran out — a stale figure in a session
+        // the user had just switched the overlay off in, and in the one mode
+        // where nothing else was going to clean up after another session's
+        // daemon.
+        let sweep = everything_we_could_have_pushed(vec![(
+            "w1".to_string(),
+            collect::PaneRoles {
+                cwd: None,
+                pseudo_panes: vec!["w1:p1".to_string()],
+                agent_panes: vec!["w1:p2".to_string()],
+                spare_panes: vec!["w1:p3".to_string()],
+            },
+        )]);
+
+        assert!(sweep.pseudo.contains("w1:p1"), "the row is released");
+        assert!(
+            sweep.metadata.contains("w1:p1"),
+            "and the reading inside it is cleared, not left to its TTL",
+        );
+        // The other two carry a token and no pseudo-agent.
+        assert_eq!(sweep.pseudo.len(), 1);
+        assert!(sweep.metadata.contains("w1:p2") && sweep.metadata.contains("w1:p3"));
+        // Sidebar mode reports at the workspace level, so that has to go too.
+        assert!(sweep.workspaces.contains("w1"));
+    }
+
+    #[test]
+    fn a_claim_carries_the_socket_the_daemon_serves() {
+        // The half that makes a cross-session `--disable` able to clean up at
+        // all: statuses are cleared over the connection that set them, and on
+        // Windows a terminated daemon clears nothing itself. A file from before
+        // 1.11.1 names a pid and no socket — still a claim, just one we can
+        // stop without being able to tidy after.
+        let dir = scratch("claim-format");
+        let path = dir.join("updater-42c3c964.pid");
+
+        write_claim(&path, Some(std::path::Path::new("/run/a.sock"))).unwrap();
+        assert_eq!(
+            read_claim_at(&path),
+            Some(Claim {
+                pid: std::process::id(),
+                socket: Some("/run/a.sock".into()),
+            }),
+        );
+
+        // A second line that is absent or blank reads as "no socket recorded",
+        // never as a broken claim — answering "no updater here" would start a
+        // second one.
+        for legacy in ["4242\n", "4242", "4242\n\n"] {
+            std::fs::write(&path, legacy).unwrap();
+            assert_eq!(
+                read_claim_at(&path),
+                Some(Claim {
+                    pid: 4242,
+                    socket: None
+                }),
+                "got: {legacy:?}",
+            );
+        }
+
+        // The whole pid range, and nothing outside it. Windows pids are a full
+        // 32 bits, so the top of the range is an ordinary pid there, not the
+        // impossible value it looks like on Linux — and a claim thrown out for
+        // being too large is a single-instance guard that never engages.
+        for (text, expected) in [
+            ("4294967295\n", Some(u32::MAX)),
+            ("4294967296\n", None),
+            ("0\n", None),
+            ("-1\n", None),
+            ("\n", None),
+            ("", None),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(
+                read_claim_at(&path).map(|claim| claim.pid),
+                expected,
+                "got: {text:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn reaping_takes_the_claims_that_name_nothing_and_leaves_the_rest() {
+        // Left alone these accumulate one per session ever run, and each is a
+        // ticket in the recycled-pid draw `is_our_process` cannot see through.
+        // Reaping is safe by definition: the file names no live process of ours.
+        let dir = scratch("reap");
+        let is_live = |pid: u32| pid != u32::MAX;
+        let live = claim(&dir, "42c3c964", 4242);
+        let dead = claim(&dir, "deadbeef", u32::MAX);
+        let unparseable = dir.join(config::pid_file_name("garbage"));
+        std::fs::write(&unparseable, "not a pid\n").expect("fixture pid file");
+
+        reap_dead_claims_among(
+            vec![live.clone(), dead.clone(), unparseable.clone()],
+            is_live,
+        );
+
+        assert!(live.exists(), "a live updater keeps its claim");
+        assert!(!dead.exists(), "a crashed one's claim goes");
+        assert!(!unparseable.exists(), "so does a file naming nothing");
     }
 }

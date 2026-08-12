@@ -42,6 +42,8 @@ mod proc;
 #[path = "proc_windows.rs"]
 mod proc;
 mod render;
+#[cfg(test)]
+mod testutil;
 
 use std::process;
 

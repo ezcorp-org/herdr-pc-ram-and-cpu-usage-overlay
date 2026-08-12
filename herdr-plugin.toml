@@ -14,7 +14,7 @@
 
 id = "ez-corp.space-usage"
 name = "PC RAM & CPU Usage Overlay"
-version = "1.11.0"
+version = "1.11.1"
 # Oldest herdr with every API this plugin calls: `session.snapshot`, the `tokens`
 # metadata API on `pane.report_metadata` / `workspace.report_metadata`, and
 # `pane.process_info` — all 0.7.5. Diffing the two bundled API schemas
@@ -51,12 +51,20 @@ platforms = ["linux", "macos", "windows"]
 # a herdr that is already running sits inert until the next restart — most of
 # what "I installed it and nothing happened" used to mean.
 #
-# That covers a FIRST install. A reinstall needs one more thing: the previous
-# version's daemon is still running, and `--restore` leaves any live daemon
-# alone, so the replaced binary would keep serving the old build until the next
-# herdr restart. The daemon therefore watches its own executable and hands over
-# to a replacement when it is rebuilt or reinstalled underneath it (see
-# `run_daemon`), since nothing outside it is in a position to notice.
+# That covers a FIRST install. A reinstall used to need one more thing: the
+# previous version's daemon is still running, `--restore` leaves any live daemon
+# alone, and it held the ONE claim there was — so the new build did not take
+# effect at all until the next herdr restart. Per-session claims settle that:
+# the new build claims its own session's pid file and starts serving straight
+# away (see `config::pid_file`).
+#
+# The daemon also watches its own executable and hands over when it is REBUILT
+# underneath it, which is the dev-link workflow. Measured against herdr 0.8.0,
+# that does not extend to `herdr plugin install`: it moves the whole checkout
+# aside and deletes it, so the running daemon's executable is unlinked rather
+# than rewritten, and it cannot stat itself to notice (see `run_daemon`). After
+# a reinstall the old process therefore lingers, redundant, until its herdr
+# server goes away.
 #
 # `workspace.focused` is the earliest event a real user reliably produces, and
 # `--restore` is idempotent and exits in microseconds once the daemon is live

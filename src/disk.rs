@@ -368,7 +368,18 @@ mod tests {
         let root = if cfg!(windows) { "C:" } else { "/" };
         let readings = read(&[root.to_string(), root.to_string()]);
         assert_eq!(readings.len(), 2);
-        assert_eq!(readings[0], readings[1]);
+        // The NAME is what the order is about, and the only field of a live
+        // reading that holds still. Comparing whole readings made this test
+        // flaky: they are two `statvfs` calls a moment apart, and anything
+        // writing to the disk in between — which on a build machine is
+        // everything — moves `free_mb` a few kilobytes and fails an exact float
+        // comparison. Seen once in roughly a hundred local runs; CI writes far
+        // more than this box does.
+        assert_eq!(readings[0].name, readings[1].name);
+        assert_eq!(readings[0].name, root);
+        // Same filesystem, so its size cannot have changed between the two
+        // calls — unlike how much of it is free.
+        assert_eq!(readings[0].total_mb, readings[1].total_mb);
     }
 
     #[test]

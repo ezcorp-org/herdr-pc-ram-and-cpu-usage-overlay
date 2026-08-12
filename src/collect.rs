@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::herdr::Herdr;
-use crate::model::{PaneInfo, Space};
+use crate::model::{PaneInfo, SessionSnapshot, Space, WorkspaceInfo};
 use crate::proc;
 
 /// Pseudo-agent label used to mark our agents-panel entries (agents-panel mode)
@@ -24,15 +24,15 @@ pub const PSEUDO_AGENT: &str = "usage";
 /// Split out of [`collect_spaces`] so the classification rules are unit-testable
 /// without a live herdr.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct PaneRoles {
+pub struct PaneRoles {
     /// cwd of the first pane that reports one — the branch lookup path.
-    cwd: Option<String>,
+    pub cwd: Option<String>,
     /// panes with a real agent.
-    agent_panes: Vec<String>,
+    pub agent_panes: Vec<String>,
     /// plain shell panes.
-    spare_panes: Vec<String>,
+    pub spare_panes: Vec<String>,
     /// panes already carrying our "usage" pseudo-agent.
-    pseudo_panes: Vec<String>,
+    pub pseudo_panes: Vec<String>,
 }
 
 /// Classify one workspace's panes, in the order herdr reported them.
@@ -101,6 +101,53 @@ fn panes_by_workspace(panes: &[PaneInfo]) -> HashMap<&str, Vec<&PaneInfo>> {
     by_workspace
 }
 
+/// Every pane and workspace this plugin could have pushed a status onto, from
+/// ONE snapshot call: `(workspace id, its panes by role)`.
+///
+/// What a sweep needs, and deliberately not [`collect_spaces`], which answers a
+/// bigger question at a much higher price — a `pane.process_info` round trip per
+/// pane and a `git` fork per workspace, for numbers a sweep throws away. That
+/// price is paid in the one place it hurts most: `--disable` reaches into
+/// sessions nothing has shown to be healthy, and against one that has stopped
+/// answering, every extra round trip is another full socket timeout the user
+/// waits through — or, on Windows, where a pipe opened as a `File` has no
+/// timeout to reach, another wait with no end.
+pub fn sweep_targets(client: &mut Herdr) -> crate::Result<Vec<(String, PaneRoles)>> {
+    let snapshot = client.session_snapshot()?;
+    Ok(workspaces_with_roles(&snapshot)
+        .into_iter()
+        .map(|(ws, _, roles)| (ws.workspace_id.clone(), roles))
+        .collect())
+}
+
+/// Every workspace in `snapshot`, with its panes and how those panes classify,
+/// in the order herdr reported them.
+///
+/// The one walk both readers share. They want different things from it —
+/// [`sweep_targets`] the pane ids alone, [`collect_spaces`] a sample per pane on
+/// top — but they must agree on *which* workspaces exist and which pane belongs
+/// to which role, because a pane the sweep does not know about is a status
+/// nothing takes back, and in agents-panel mode that row carries no TTL to
+/// clear it. Two walks that could drift is the way to get that wrong quietly,
+/// so there is one.
+fn workspaces_with_roles(
+    snapshot: &SessionSnapshot,
+) -> Vec<(&WorkspaceInfo, Vec<&PaneInfo>, PaneRoles)> {
+    let by_workspace = panes_by_workspace(&snapshot.panes);
+    snapshot
+        .workspaces
+        .iter()
+        .map(|ws| {
+            let panes = by_workspace
+                .get(ws.workspace_id.as_str())
+                .cloned()
+                .unwrap_or_default();
+            let roles = classify_panes(&panes);
+            (ws, panes, roles)
+        })
+        .collect()
+}
+
 /// Enumerate spaces and the root shell PID of each of their panes, classifying
 /// panes into agent / spare / pseudo buckets.
 ///
@@ -111,18 +158,13 @@ fn panes_by_workspace(panes: &[PaneInfo]) -> HashMap<&str, Vec<&PaneInfo>> {
 /// mid-scan errors there and simply contributes no root.
 pub fn collect_spaces(client: &mut Herdr) -> crate::Result<Vec<Space>> {
     let snapshot = client.session_snapshot()?;
-    let by_workspace = panes_by_workspace(&snapshot.panes);
+    let workspaces = workspaces_with_roles(&snapshot);
 
-    let mut spaces = Vec::with_capacity(snapshot.workspaces.len());
-    for ws in &snapshot.workspaces {
-        let panes: &[&PaneInfo] = by_workspace
-            .get(ws.workspace_id.as_str())
-            .map_or(&[], Vec::as_slice);
-        let roles = classify_panes(panes);
-
+    let mut spaces = Vec::with_capacity(workspaces.len());
+    for (ws, panes, roles) in workspaces {
         // Best-effort shell PIDs; a pane that just closed errors and is skipped.
-        let mut roots = Vec::with_capacity(panes.len());
-        for pane in panes {
+        let mut roots: Vec<u32> = Vec::with_capacity(panes.len());
+        for pane in &panes {
             if let Ok(info) = client.process_info(&pane.pane_id) {
                 if let Some(pid) = info.shell_pid.filter(|&p| p != 0) {
                     roots.push(pid);
@@ -337,7 +379,7 @@ pub fn snapshot(client: &mut Herdr, window_ms: u64) -> crate::Result<Vec<Space>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{PaneInfo, Space};
+    use crate::model::{PaneInfo, Space, WorkspaceInfo};
 
     /// Build a [`PaneInfo`] as `session.snapshot` reports one.
     fn pane(pane_id: &str, workspace_id: &str, cwd: Option<&str>, agent: Option<&str>) -> PaneInfo {
@@ -350,6 +392,15 @@ mod tests {
         }
     }
 
+    /// Terse [`WorkspaceInfo`] builder for the walk test.
+    fn workspace(workspace_id: &str, label: &str) -> WorkspaceInfo {
+        WorkspaceInfo {
+            workspace_id: workspace_id.to_string(),
+            label: label.to_string(),
+            focused: false,
+        }
+    }
+
     /// A [`PaneInfo`] carrying metadata tokens with the given keys.
     fn pane_with_tokens(pane_id: &str, keys: &[&str]) -> PaneInfo {
         let mut p = pane(pane_id, "w1", None, None);
@@ -359,6 +410,51 @@ mod tests {
                 .collect(),
         );
         p
+    }
+
+    // ---- the walk both readers share -----------------------------------------
+
+    #[test]
+    fn every_workspace_comes_back_with_its_own_panes_and_their_roles() {
+        // `collect_spaces` samples each space and `sweep_targets` clears it, and
+        // the two must agree on which workspaces exist and which pane plays
+        // which part — a pane the sweep never hears about is a status nothing
+        // takes back, and in agents-panel mode that row has no TTL to fall back
+        // on. They agree by construction, sharing this walk; what is left to
+        // pin is the walk itself. Neither caller can be tested directly, both
+        // needing a live herdr on the other end of a socket.
+        let snapshot = SessionSnapshot {
+            workspaces: vec![
+                workspace("w1", "first"),
+                workspace("w2", "second"),
+                workspace("w3", "empty"),
+            ],
+            panes: vec![
+                pane("w2:p1", "w2", None, None),
+                pane("w1:p1", "w1", Some("/repo"), Some("claude")),
+                pane("w1:p2", "w1", None, None),
+                pane("w1:p3", "w1", None, Some(PSEUDO_AGENT)),
+            ],
+        };
+
+        let walked = workspaces_with_roles(&snapshot);
+        let ids: Vec<&str> = walked.iter().map(|(ws, ..)| &*ws.workspace_id).collect();
+        assert_eq!(ids, ["w1", "w2", "w3"], "every workspace, in herdr's order");
+
+        let (_, panes, roles) = &walked[0];
+        let held: Vec<&str> = panes.iter().map(|p| &*p.pane_id).collect();
+        assert_eq!(held, ["w1:p1", "w1:p2", "w1:p3"], "its own panes only");
+        assert_eq!(roles.agent_panes, ["w1:p1"]);
+        assert_eq!(roles.spare_panes, ["w1:p2"]);
+        assert_eq!(roles.pseudo_panes, ["w1:p3"]);
+        assert_eq!(roles.cwd.as_deref(), Some("/repo"));
+
+        // A workspace with no panes still comes back: it may carry a workspace
+        // token of ours, and a sweep that skipped it would strand one.
+        let (ws, panes, roles) = &walked[2];
+        assert_eq!(ws.workspace_id, "w3");
+        assert!(panes.is_empty());
+        assert!(roles.agent_panes.is_empty() && roles.spare_panes.is_empty());
     }
 
     // ---- pane bucketing + classification ------------------------------------

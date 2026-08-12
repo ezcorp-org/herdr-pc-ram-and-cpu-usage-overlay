@@ -68,8 +68,36 @@ fn open_stream(path: &Path) -> io::Result<Stream> {
 /// No read/write timeouts: a pipe opened as `File` has no such knobs. That is
 /// the one thing unix gets for free here, so the daemon carries a watchdog
 /// instead — see [`crate::daemon::run_daemon`].
+///
+/// Retries on `ERROR_PIPE_BUSY`, which is a "not this instant" and not a "not
+/// here". herdr's listener keeps exactly ONE free pipe instance and creates the
+/// next only once `accept` has returned, so any connection that lands in that
+/// window is refused outright — herdr's own client rides it out with
+/// `WaitNamedPipeW(FOREVER)`, and a plain `File::open` does not. Treating it as
+/// a dead session is what makes it matter here: `--disable` sweeps sessions that
+/// are busy serving their own UI, and giving up on one leaves its pseudo-agent
+/// rows behind, which carry no TTL to clear them.
 #[cfg(windows)]
 fn open_stream(path: &Path) -> io::Result<Stream> {
+    /// Windows' `ERROR_PIPE_BUSY`: every instance is spoken for, try again.
+    const PIPE_BUSY: i32 = 231;
+    /// Total wait is `TRIES * BUSY_PAUSE`, comfortably inside the sweep's own
+    /// deadline and imperceptible on the connections that never see a retry.
+    const TRIES: u32 = 20;
+    const BUSY_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+
+    for _ in 0..TRIES {
+        match open_pipe_once(path) {
+            Err(err) if err.raw_os_error() == Some(PIPE_BUSY) => std::thread::sleep(BUSY_PAUSE),
+            settled => return settled,
+        }
+    }
+    open_pipe_once(path)
+}
+
+/// One attempt at the pipe — see [`open_stream`] for why there may be several.
+#[cfg(windows)]
+fn open_pipe_once(path: &Path) -> io::Result<Stream> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
 
@@ -129,6 +157,15 @@ pub struct Herdr {
 /// Open a connection to the herdr socket.
 pub fn connect() -> crate::Result<Herdr> {
     Herdr::open(socket_path()?)
+}
+
+/// Connect to a named socket rather than this process's own.
+///
+/// One caller: `--disable`, clearing the statuses of a session whose updater it
+/// just stopped. Every other path wants [`connect`] — talking to a session other
+/// than your own is the exception, and one that has to name the socket it means.
+pub fn connect_to(path: PathBuf) -> crate::Result<Herdr> {
+    Herdr::open(path)
 }
 
 impl Herdr {
@@ -387,6 +424,47 @@ pub fn socket_path() -> crate::Result<PathBuf> {
     ))
 }
 
+/// The resolved socket path, as the string [`session_key_of`] is taken over.
+///
+/// The one input that names this session, handed on as a path rather than as a
+/// key so that the chain — socket to key to file name — stays reachable from a
+/// single test instead of each half being pinned against the other half's own
+/// arithmetic. Its only caller is [`crate::config::pid_file`].
+pub fn socket_path_string() -> String {
+    socket_path().unwrap_or_default().to_string_lossy().into()
+}
+
+/// A short, filename-safe name for the herdr session reached over `socket_path`.
+///
+/// Each herdr session runs its own server on its own socket — the default
+/// session on `<config_home>/herdr/herdr.sock`, `herdr --session <name>` on
+/// `<config_home>/herdr/sessions/<name>/herdr.sock` — and every plugin process a
+/// session spawns inherits that path in `HERDR_SOCKET_PATH`. herdr's plugin state
+/// dir, by contrast, is one per user and per plugin: `HERDR_PLUGIN_STATE_DIR` is
+/// the same string in every session. So the socket path is the only thing that
+/// names the session from inside a plugin, and anything that must be one *per
+/// session* has to carry this in its file name — see [`crate::config::pid_file`].
+///
+/// A hash rather than the path itself because a file name may not hold a path:
+/// it has separators in it, is longer than some filesystems allow a name to be,
+/// and spells differently on Windows.
+///
+/// Hand-rolled FNV-1a rather than `DefaultHasher`, whose output std does not
+/// promise to keep stable between Rust releases. The key has to mean the same
+/// thing to two processes that may have been built by different compilers — a
+/// daemon and the `--restore` that checks up on it — and a key that quietly
+/// changed under a rebuild would let a second updater start alongside the first.
+pub(crate) fn session_key_of(socket_path: &str) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in socket_path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
+}
+
 /// The herdr CLI binary (`HERDR_BIN_PATH`, else `herdr`) for the fallback path.
 ///
 /// Deliberately retained but not yet wired: every method currently goes over the
@@ -551,6 +629,47 @@ mod tests {
             socket_path_from(None, config_home),
             PathBuf::from("/home/u/.config/herdr/herdr.sock"),
         );
+    }
+
+    // ---- naming the session -------------------------------------------------
+
+    #[test]
+    fn each_session_socket_gets_its_own_key() {
+        // What the fix turns on: the default session and a named one must not
+        // share a key, or they go back to sharing one updater — and one updater
+        // can only push over the one socket it connected to.
+        let default = session_key_of("/home/u/.config/herdr/herdr.sock");
+        let named = session_key_of("/home/u/.config/herdr/sessions/second/herdr.sock");
+        assert_ne!(default, named);
+        // Same socket, same key: this is what lets `--restore` find the daemon
+        // it started last time instead of starting another one beside it.
+        assert_eq!(default, session_key_of("/home/u/.config/herdr/herdr.sock"));
+    }
+
+    #[test]
+    fn the_session_key_is_a_fixed_width_name_a_filesystem_accepts() {
+        // It becomes part of a file name, so anything a path can hold and a name
+        // cannot — a separator above all — would put the pid file somewhere
+        // nobody looks for it.
+        let key = session_key_of(r"C:\Users\u\AppData\Roaming\herdr\herdr.sock");
+        assert_eq!(key.len(), 16, "got: {key}");
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()), "got: {key}");
+    }
+
+    #[test]
+    fn the_session_key_is_the_same_one_every_build_computes() {
+        // Pinned to a literal on purpose. Two processes have to agree on this —
+        // a daemon and the `--restore` checking up on it — and they may have
+        // been built by different compilers, so a hash that drifted with the
+        // toolchain would quietly let a second updater start alongside the
+        // first. FNV-1a over the path bytes, exactly this.
+        assert_eq!(
+            session_key_of("/home/u/.config/herdr/herdr.sock"),
+            "42c3c9646ad866b0",
+        );
+        // The empty path is the socket we could not resolve — still a key, and
+        // still its own, rather than a panic or a name shared with a real one.
+        assert_eq!(session_key_of(""), "cbf29ce484222325");
     }
 
     #[cfg(windows)]
