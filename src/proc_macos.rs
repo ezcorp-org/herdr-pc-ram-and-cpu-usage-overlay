@@ -116,7 +116,7 @@ fn list_pids() -> Vec<u32> {
 /// `proc_pidinfo` returns the number of bytes it wrote, or <= 0 on failure —
 /// EPERM for a process we may not inspect, ESRCH once it exits. A short write
 /// leaves the tail of the struct zeroed, which would read back as a perfectly
-/// plausible "0 ns of CPU, 0 bytes resident" sample, so anything less than a
+/// plausible "0 ticks of CPU, 0 bytes resident" sample, so anything less than a
 /// full-size write is treated as failure rather than as data.
 ///
 /// # Safety
@@ -136,7 +136,7 @@ unsafe fn pid_info<T>(pid: u32, flavor: libc::c_int) -> Option<T> {
     (written == size).then_some(info)
 }
 
-/// Cumulative user+system CPU nanoseconds and RSS bytes for `pid`.
+/// Cumulative user+system CPU ticks (see [`clk_tck`]) and RSS bytes for `pid`.
 fn task_info(pid: u32) -> Option<libc::proc_taskinfo> {
     // SAFETY: `proc_taskinfo` is the POD struct PROC_PIDTASKINFO fills.
     unsafe { pid_info::<libc::proc_taskinfo>(pid, libc::PROC_PIDTASKINFO) }
@@ -148,10 +148,10 @@ fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
     unsafe { pid_info::<libc::proc_bsdinfo>(pid, libc::PROC_PIDTBSDINFO) }
 }
 
-/// Snapshot the process table once, returning `pid -> {ppid, cpu ns}` for every
-/// live process. Processes whose times are unreadable keep their pid/ppid edge
-/// (the subtree walk needs it) with zero CPU; processes that vanish mid-scan,
-/// or whose parent link we cannot read at all, are skipped.
+/// Snapshot the process table once, returning `pid -> {ppid, cpu ticks}` for
+/// every live process. Processes whose times are unreadable keep their pid/ppid
+/// edge (the subtree walk needs it) with zero CPU; processes that vanish
+/// mid-scan, or whose parent link we cannot read at all, are skipped.
 pub fn scan_proc() -> HashMap<u32, ProcEntry> {
     let mut procs = HashMap::new();
     for pid in list_pids() {
@@ -438,10 +438,7 @@ mod tests {
         let parent = unsafe { libc::getppid() } as u32;
         assert_eq!(me.ppid, parent, "own parent pid mismatch");
         // Our own task is always readable, so its CPU counter is real.
-        assert!(
-            me.jiffies > 0,
-            "own cumulative CPU nanoseconds read as zero"
-        );
+        assert!(me.jiffies > 0, "own cumulative CPU ticks read as zero");
     }
 
     #[cfg(target_os = "macos")]
