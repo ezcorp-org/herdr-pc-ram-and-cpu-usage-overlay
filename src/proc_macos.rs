@@ -10,27 +10,38 @@
 //! sample as zero CPU/RSS, which is correct for panes we own: a herdr pane's
 //! subtree runs as the current user.
 //!
-//! **CPU units.** `proc_taskinfo` reports nanoseconds, not clock ticks, so
-//! [`ProcEntry::jiffies`] holds nanoseconds and [`clk_tck`] returns 10^9. That
-//! is the whole trick that lets the three backends share one formula: the maths
-//! in `collect::measure` is `Δjiffies / clk_tck() / elapsed_s / nproc()`, so any
-//! backend may pick its own unit as long as `clk_tck()` names it. Linux uses
-//! `_SC_CLK_TCK` jiffies (100), Windows 100 ns FILETIME ticks (10^7).
+//! **CPU units.** `proc_taskinfo` reports Mach absolute-time ticks. Their scale
+//! comes from `mach_timebase_info` and is not necessarily nanoseconds (Apple
+//! Silicon commonly uses 24 MHz ticks). [`ProcEntry::jiffies`] holds those raw
+//! ticks and [`clk_tck`] returns their frequency. That lets the three backends
+//! share one formula: the maths in `collect::measure` is
+//! `Δjiffies / clk_tck() / elapsed_s / nproc()`. Linux uses `_SC_CLK_TCK`
+//! jiffies (100), Windows 100 ns FILETIME ticks (10^7).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 /// Per-process sample: parent PID and cumulative CPU time in [`clk_tck`] units
-/// (here nanoseconds — see the module docs; the Linux twin uses jiffies).
+/// (here Mach absolute-time ticks; the Linux twin uses jiffies).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProcEntry {
     pub ppid: u32,
     pub jiffies: u64,
 }
 
-/// CPU-time units per second: `proc_taskinfo` totals are in nanoseconds.
+/// CPU-time units per second for the Mach ticks returned by `proc_taskinfo`.
+#[allow(deprecated)] // libc exposes this stable Mach API but recommends a larger crate.
 pub fn clk_tck() -> u64 {
-    1_000_000_000
+    static CLK_TCK: OnceLock<u64> = OnceLock::new();
+    *CLK_TCK.get_or_init(|| {
+        let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+        // SAFETY: `info` is a valid caller-owned output struct.
+        let rc = unsafe { libc::mach_timebase_info(&mut info) };
+        if rc != 0 || info.numer == 0 || info.denom == 0 {
+            return 1_000_000_000;
+        }
+        1_000_000_000_u64.saturating_mul(u64::from(info.denom)) / u64::from(info.numer)
+    })
 }
 
 /// Read a positive `sysconf(name)` value, falling back when it is unavailable.
@@ -363,11 +374,15 @@ mod tests {
     }
 
     #[test]
-    fn cpu_unit_is_nanoseconds() {
+    #[allow(deprecated)]
+    fn cpu_tick_frequency_matches_mach_timebase() {
         // The contract that lets this backend share `collect::measure` with the
         // other two: whatever unit `jiffies` is in, `clk_tck()` names it.
-        // `proc_taskinfo` is nanoseconds, so one second must be 10^9 units.
-        assert_eq!(clk_tck(), 1_000_000_000);
+        let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+        // SAFETY: `info` is a valid caller-owned output struct.
+        assert_eq!(unsafe { libc::mach_timebase_info(&mut info) }, 0);
+        let expected = 1_000_000_000_u64 * u64::from(info.denom) / u64::from(info.numer);
+        assert_eq!(clk_tck(), expected);
     }
 
     #[test]
