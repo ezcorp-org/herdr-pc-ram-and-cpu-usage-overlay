@@ -3,9 +3,10 @@
 # Shows CPU and RAM usage per space (workspace), grouped under each space's
 # git branch name. The sidebar row is the main surface — herdr draws it from a
 # `$usage` token row this plugin adds to herdr's config on first run, since no
-# plugin API can contribute one. Two more surfaces come along with it:
+# plugin API can contribute one. Three more surfaces come along with it:
 #   - a live terminal pane  ("Space usage" overlay)
 #   - a one-shot action     ("Space usage report")
+#   - the system monitor    ("Open system monitor" -> btop / htop / top)
 #
 # Install:     herdr plugin install ezcorp-org/herdr-pc-ram-and-cpu-usage-overlay
 # Local dev:   herdr plugin link /path/to/herdr-pc-ram-and-cpu-usage-overlay   (references the dir in place)
@@ -14,7 +15,7 @@
 
 id = "ez-corp.space-usage"
 name = "PC RAM & CPU Usage Overlay"
-version = "1.11.2"
+version = "1.12.0"
 # Oldest herdr with every API this plugin calls: `session.snapshot`, the `tokens`
 # metadata API on `pane.report_metadata` / `workspace.report_metadata`, and
 # `pane.process_info` — all 0.7.5. Diffing the two bundled API schemas
@@ -83,12 +84,52 @@ title = "Space usage"
 placement = "overlay"
 command = ["./target/release/space-usage", "--interval", "2"]
 
+# The system monitor, full-screen. The readout says how MUCH of the machine is
+# in use; this says WHAT is using it, which is the next question every time.
+#
+# `--monitor` resolves the command (`system_monitor` from the plugin config, else
+# the first of btop / htop / top on PATH) and then `exec`s it, so the process
+# herdr started IS the monitor: resize, Ctrl-C and btop's own `q` reach it
+# directly, and the overlay closes when it quits.
+[[panes]]
+id = "monitor"
+title = "System monitor"
+placement = "overlay"
+command = ["./target/release/space-usage", "--monitor"]
+
 # One-shot snapshot printed to stdout / plugin log.
 [[actions]]
 id = "report"
 title = "Space usage report"
 contexts = ["workspace"]
 command = ["./target/release/space-usage", "--once"]
+
+# What a mouse can actually reach. herdr lists ACTIONS in its menus and in the
+# palette; a [[panes]] entry on its own is reachable only from the CLI, so the
+# pane above needs this row to be clickable at all. herdr offers no hook for a
+# click on the usage readout itself — not the tab bar, not the sidebar, not a
+# token row — so this and a keybinding are the two ways in. The README has the
+# `[[keys.command]]` snippet for the second.
+#
+# The plugin id is repeated here because `pane open` names the plugin by id and
+# TOML cannot reference the `id` key above. Change one, change both.
+[[actions]]
+id = "monitor"
+title = "Open system monitor"
+contexts = ["workspace", "tab", "pane", "global"]
+command = [
+  "herdr",
+  "plugin",
+  "pane",
+  "open",
+  "--plugin",
+  "ez-corp.space-usage",
+  "--entrypoint",
+  "monitor",
+  "--placement",
+  "overlay",
+  "--focus",
+]
 
 # Draws the cpu/ram/battery row in all four icon tiers so the user can pick one
 # by eye. Whether a Nerd Font is installed, and whether the terminal draws emoji

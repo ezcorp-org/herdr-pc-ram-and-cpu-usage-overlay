@@ -134,6 +134,19 @@ pub struct Config {
     /// reason as [`Config::battery_label`]: herdr has no disk of its own to
     /// label, so `disk_label` is not a key it knows.
     pub disk_label: Option<String>,
+    /// The monitor the "Open system monitor" action runs, whitespace-split into
+    /// argv — so `"htop -t"` is a command with a flag, not a program with a
+    /// space in its name.
+    ///
+    /// `None` (the default) auto-detects; see [`crate::monitor::CANDIDATES`].
+    /// That is the setting to leave alone — the point of the detection is that a
+    /// fresh install opens whatever this machine already has.
+    ///
+    /// EMPTY reads as unset, unlike the labels in this same file. A label can
+    /// deliberately name nothing, leaving a bare figure; a command cannot
+    /// deliberately be nothing, so a blank here is a half-finished edit and
+    /// honouring it literally would break the action with no clue why.
+    pub system_monitor: Option<String>,
 }
 
 impl Default for Config {
@@ -151,6 +164,7 @@ impl Default for Config {
             disk: true,
             disks: default_disks(),
             disk_label: None,
+            system_monitor: None,
         }
     }
 }
@@ -570,9 +584,10 @@ pub(crate) fn herdr_config_path() -> PathBuf {
 /// when they equal the literal `false`, any other value is truthy), `disks` (a
 /// comma-separated drive list), `icons` (a tier name kept verbatim for
 /// [`crate::icons::resolve`]), `ram_display` (`percent` | `gb` | `absolute`,
-/// case-insensitive), and the four label overrides — `cpu_label`, `ram_label`,
-/// `battery_label`, `disk_label` — where an empty value means "name nothing"
-/// rather than unset. Unknown keys are ignored.
+/// case-insensitive), `system_monitor` (a command, empty reading as unset), and
+/// the four label overrides — `cpu_label`, `ram_label`, `battery_label`,
+/// `disk_label` — where an empty value means "name nothing" rather than unset.
+/// Unknown keys are ignored.
 fn parse_config(text: &str) -> Config {
     let mut cfg = Config::default();
     for line in text.split('\n') {
@@ -634,6 +649,10 @@ fn parse_config(text: &str) -> Config {
                     cfg.disks = drives;
                 }
             }
+            // Blank reads as unset, the herdr-side rule rather than the label
+            // rule — see [`Config::system_monitor`]. Stored raw, because the
+            // split into argv belongs to the one place that runs it.
+            "system_monitor" => cfg.system_monitor = non_empty(value),
             // Stored raw: naming the tiers in two places would let the parser
             // and `icons::resolve` disagree about what `Nerd-Font` means.
             "icons" => cfg.icons = value.to_string(),

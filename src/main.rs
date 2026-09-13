@@ -10,6 +10,7 @@
 //!   --interval N      live watch, refreshing every N seconds (used by the pane)
 //!   --json            emit machine-readable JSON and exit
 //!   --icons           preview every icon tier in this terminal and exit
+//!   --monitor         hand this pane to btop / htop / top (used by the pane)
 //!   --enable          start the sidebar status updater daemon
 //!   --disable         stop the daemon and clear statuses
 //!   --toggle          enable/disable depending on daemon state
@@ -29,6 +30,7 @@ mod herdr;
 mod herdr_config;
 mod icons;
 mod model;
+mod monitor;
 // One `proc` module per platform, selected here so every consumer just says
 // `proc::`. macOS is carved out of the unix arm because it has no `/proc`;
 // the other BSDs stay on the sysfs reader, which is what they had before and
@@ -141,6 +143,13 @@ fn run() -> Result<()> {
             &config::load_herdr_labels().with_overrides(&config),
         );
         return Ok(());
+    }
+
+    // Also ahead of `connect`: the readings come from the monitor's own eyes, not
+    // from herdr, so "what is using my machine" is still answerable when the
+    // server is the thing that has gone wrong.
+    if has_flag(&args, "--monitor") {
+        return monitor::run(config.system_monitor.as_deref());
     }
 
     // Read modes share one socket connection.
