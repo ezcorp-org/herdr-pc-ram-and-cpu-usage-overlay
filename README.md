@@ -34,6 +34,9 @@ With a Nerd Font installed it detects that and uses icons instead —
 - All-space totals in your terminal's window title:
   `spaces · cpu 39% · ram 8% · bat 74%+ · disk 78% 387G`
 - A live dashboard pane and one-shot report/JSON actions
+- **Opens a system monitor** — `btop`, `htop` or `top`, whichever this machine
+  has — from the action menu, the palette or a key, because the next question
+  after *how much* is *what*. See [System monitor](#system-monitor)
 - A small static Rust binary (~2–5 MB resident) that talks to herdr over its
   unix socket (a named pipe on Windows) — no per-sample subprocess spawns, no
   Node runtime
@@ -136,6 +139,7 @@ Other entrypoints:
 ```sh
 herdr plugin pane open --plugin ez-corp.space-usage --entrypoint dashboard  # live dashboard
 herdr plugin action invoke report --plugin ez-corp.space-usage             # one-shot snapshot
+herdr plugin action invoke monitor --plugin ez-corp.space-usage            # btop / htop / top
 herdr plugin action invoke icons --plugin ez-corp.space-usage              # preview icon tiers
 ./target/release/space-usage --json                                        # machine-readable
 ```
@@ -212,6 +216,7 @@ disk = true                 # likewise — free space, one cell per drive
 disks = "/"                 # which drives; "/, /home" for two, "C:, D:" on Windows
 icons = "auto"              # auto | text | unicode | nerdfont | emoji
 ram_display = "percent"     # or "gb" / "absolute" — see RAM as a figure
+# system_monitor = "btop"   # unset auto-detects btop -> htop -> top
 ```
 
 - **sidebar** (default): renders usage inside each spaces card, under the branch
@@ -402,6 +407,53 @@ no disk of its own to label, so a `disk_label` in its `[ui]` earns an
 disk_label = "free"         # -> free 78% 387G
 disk_label = ""             # -> 78% 387G
 ```
+
+## System monitor
+
+The readout says **how much** of the machine is in use. The next question is
+always **what is using it**, so the plugin opens a monitor:
+
+```sh
+herdr plugin action invoke monitor --plugin ez-corp.space-usage
+```
+
+That is the **Open system monitor** row in herdr's action menu and in the
+palette, so a mouse reaches it. For a key, put this in herdr's `config.toml` —
+`type = "shell"` gets one argv-safe token per word and no shell, which this
+command stays inside:
+
+```toml
+[[keys.command]]
+key = "prefix+m"
+type = "shell"
+command = "herdr plugin pane open --plugin ez-corp.space-usage --entrypoint monitor --placement overlay --focus"
+```
+
+It opens as a zoomed overlay and closes when you quit the monitor — `q` in btop
+and htop, `q` in top. The plugin `exec`s the monitor rather than wrapping it, so
+nothing of ours sits between it and the terminal: resize, `Ctrl-C` and its own
+keys all behave as they would in any pane.
+
+**What it runs.** The first of `btop`, `htop`, `top` on `PATH` — preference
+order, ending on the one every unix already has, so this needs no setup. Name a
+different one in the plugin's `config.toml`:
+
+```toml
+system_monitor = "htop -t"      # split into argv, so flags work
+system_monitor = "btop"
+```
+
+A named command is run as given, even if it is not installed: the error then
+says what you typed rather than quietly starting something else. With nothing
+named and nothing found, the message lists what it looked for and names this key
+— on Windows the list is `btop`, `htop` only, since `top` is not a program there
+and Task Manager is not something to run in a pane.
+
+**The readout itself is not clickable, and cannot be.** herdr exposes no click
+hook for its own chrome — not the tab bar, not the sidebar, not a token row — so
+no plugin can attach one. A local herdr patch used to do it from inside the
+binary; herdr 0.9.0 deleted the file that patch lived in. An action and a key are
+what a plugin can offer, and they reach the same overlay.
 
 ## Icons and labels
 
