@@ -20,8 +20,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{
-    GetActiveProcessorCount, GetProcessTimes, OpenProcess, TerminateProcess, ALL_PROCESSOR_GROUPS,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    GetActiveProcessorCount, GetProcessTimes, GetSystemTimes, OpenProcess, TerminateProcess,
+    ALL_PROCESSOR_GROUPS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
 /// Per-process sample: parent PID and cumulative CPU time in [`clk_tck`] units
@@ -240,6 +240,77 @@ pub fn ram_pct(mb: f64) -> String {
     pct_string(mb, mem_total_mb())
 }
 
+/// System-wide CPU time counters, cumulative since boot — the Windows twin of
+/// the Linux `/proc/stat` aggregate line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SystemTimes {
+    pub idle: u64,
+    pub total: u64,
+}
+
+/// Read machine-wide CPU time counters via `GetSystemTimes`.
+///
+/// `lpKernelTime` INCLUDES idle on Windows, so the busy time is
+/// `kernel + user - idle` and the total is `kernel + user` — subtracting idle
+/// twice is the classic mistake that reports near-zero CPU forever.
+pub fn system_times() -> Option<SystemTimes> {
+    let mut idle = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut kernel = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut user = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    // SAFETY: all three out-params are valid caller-owned FILETIMEs.
+    let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+    if ok == 0 {
+        return None;
+    }
+    let (idle, kernel, user) = (
+        filetime_ticks(&idle),
+        filetime_ticks(&kernel),
+        filetime_ticks(&user),
+    );
+    Some(SystemTimes {
+        idle,
+        total: kernel + user,
+    })
+}
+
+/// Machine-wide CPU% over the window between two samples, or `None` when
+/// either read failed or the counters did not advance. Mirrors the Linux twin.
+pub fn machine_cpu_percent(before: &SystemTimes, after: &SystemTimes) -> Option<f64> {
+    let total = after.total.checked_sub(before.total)?;
+    let idle = after.idle.checked_sub(before.idle)?;
+    let busy = total.checked_sub(idle)?;
+    if total == 0 {
+        return None;
+    }
+    Some(100.0 * busy as f64 / total as f64)
+}
+
+/// RAM in use machine-wide (MB), from `GlobalMemoryStatusEx` — the same figure
+/// the Task Manager "in use" line shows (`total - available`).
+///
+/// `None` when the call fails, which on a live Windows box it does not.
+pub fn machine_ram_mb() -> Option<f64> {
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: `status` is a properly sized MEMORYSTATUSEX.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return None;
+    }
+    Some(
+        (status.ullTotalPhys.saturating_sub(status.ullAvailPhys)) as f64
+            / (1024.0 * 1024.0),
+    )
+}
+
 /// Sum of resident memory (MB) across `pids` — working set size per
 /// `K32GetProcessMemoryInfo`, the closest Windows analogue of Linux RSS.
 /// Vanished or unopenable pids contribute nothing.
@@ -332,6 +403,29 @@ mod tests {
         assert_eq!(pct_string(250.0, 10000.0), "3%");
         assert_eq!(pct_string(16384.0, 16384.0), "100%");
         assert_eq!(pct_string(512.0, 0.0), "");
+    }
+
+    #[test]
+    fn machine_cpu_percent_is_busy_over_total_between_samples() {
+        let before = SystemTimes { idle: 90, total: 280 };
+        let after = SystemTimes { idle: 140, total: 380 };
+        assert_eq!(machine_cpu_percent(&before, &after), Some(50.0));
+        assert_eq!(machine_cpu_percent(&before, &before), None);
+        assert_eq!(machine_cpu_percent(&after, &before), None);
+    }
+
+    #[test]
+    fn machine_probes_answer_on_a_live_box() {
+        let before = system_times().expect("GetSystemTimes readable");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let after = system_times().expect("GetSystemTimes readable");
+        // A real machine's counters always advance; the percent itself may be
+        // anything (idle box at 0, busy one at 100) but not out of range.
+        let pct = machine_cpu_percent(&before, &after).expect("counters advanced");
+        assert!((0.0..=100.0).contains(&pct), "cpu {pct}% out of range");
+
+        let ram = machine_ram_mb().expect("GlobalMemoryStatusEx readable");
+        assert!(ram > 0.0, "a live box always has some RAM in use");
     }
 
     #[test]

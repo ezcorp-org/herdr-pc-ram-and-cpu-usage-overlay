@@ -134,6 +134,11 @@ pub struct Config {
     /// reason as [`Config::battery_label`]: herdr has no disk of its own to
     /// label, so `disk_label` is not a key it knows.
     pub disk_label: Option<String>,
+    /// Make the window title's cpu/ram figures whole-machine readings (the
+    /// figure a system monitor shows, every process counted) instead of the
+    /// sum over herdr's own spaces. Off by default: the per-space sidebar rows
+    /// stay per-space either way — this only widens the title.
+    pub machine_totals: bool,
     /// The monitor the "Open system monitor" action runs, whitespace-split into
     /// argv — so `"htop -t"` is a command with a flag, not a program with a
     /// space in its name.
@@ -164,6 +169,7 @@ impl Default for Config {
             disk: true,
             disks: default_disks(),
             disk_label: None,
+            machine_totals: false,
             system_monitor: None,
         }
     }
@@ -587,7 +593,8 @@ pub(crate) fn herdr_config_path() -> PathBuf {
 /// case-insensitive), `system_monitor` (a command, empty reading as unset), and
 /// the four label overrides — `cpu_label`, `ram_label`, `battery_label`,
 /// `disk_label` — where an empty value means "name nothing" rather than unset.
-/// Unknown keys are ignored.
+/// Also `machine_totals` (`true` makes the window title's cpu/ram whole-machine
+/// readings rather than the sum over herdr's spaces). Unknown keys are ignored.
 fn parse_config(text: &str) -> Config {
     let mut cfg = Config::default();
     for line in text.split('\n') {

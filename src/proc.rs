@@ -135,6 +135,79 @@ pub fn mem_total_mb() -> f64 {
     })
 }
 
+/// System-wide CPU time counters, cumulative since boot: the idle ticks and
+/// the total across all states. Two samples a window apart give the
+/// machine-wide CPU% the same way two `/proc` scans give a process subtree's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SystemTimes {
+    pub idle: u64,
+    pub total: u64,
+}
+
+/// Read the aggregate `cpu` line of `/proc/stat` — every CPU's jiffies summed,
+/// the machine figure a system monitor shows.
+///
+/// Fields (after the `cpu` label): user nice system idle iowait irq softirq
+/// steal. `total` counts user through steal (guest jiffies are already counted
+/// inside user/system, so summing them again would double-count); `idle` is
+/// idle + iowait, because iowait is time the CPU had nothing to run either.
+/// `None` when the line is absent or unparseable.
+pub fn system_times() -> Option<SystemTimes> {
+    let text = std::fs::read_to_string("/proc/stat").ok()?;
+    parse_system_times(&text)
+}
+
+/// [`system_times`] with the text injected, so the parse is testable off-host.
+fn parse_system_times(text: &str) -> Option<SystemTimes> {
+    let line = text.lines().next()?;
+    let fields = line.split_whitespace().skip(1); // drop the `cpu` label
+    let v: Vec<u64> = fields
+        .take(7) // user nice system idle iowait irq softirq
+        .filter_map(|f| f.parse().ok())
+        .collect();
+    if v.len() < 7 {
+        return None;
+    }
+    Some(SystemTimes {
+        idle: v[3] + v[4],
+        total: v.iter().sum(),
+    })
+}
+
+/// Machine-wide CPU% over the window between two samples, or `None` when
+/// either read failed or the counters did not advance (a paused VM, a clock
+/// that made no progress).
+pub fn machine_cpu_percent(before: &SystemTimes, after: &SystemTimes) -> Option<f64> {
+    let total = after.total.checked_sub(before.total)?;
+    let idle = after.idle.checked_sub(before.idle)?;
+    let busy = total.checked_sub(idle)?;
+    if total == 0 {
+        return None;
+    }
+    Some(100.0 * busy as f64 / total as f64)
+}
+
+/// RAM in use machine-wide (MB): `MemTotal` minus `MemAvailable`.
+///
+/// `MemAvailable`, not `MemFree` — the kernel reclaims caches before it
+/// force-frees, and `MemFree` alone reports a machine under heavy cache as
+/// nearly out of memory when a system monitor calls it fine. `None` when
+/// either line is unreadable (the caller then has nothing honest to show).
+pub fn machine_ram_mb() -> Option<f64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb = |prefix: &str| -> Option<f64> {
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                return rest.split_whitespace().next()?.parse().ok();
+            }
+        }
+        None
+    };
+    let total = kb("MemTotal:")?;
+    let available = kb("MemAvailable:")?;
+    Some((total - available).max(0.0) / 1024.0)
+}
+
 /// Render `mb` as a whole-percent-of-`total_mb` string, or `""` when unknown.
 fn pct_string(mb: f64, total_mb: f64) -> String {
     if total_mb > 0.0 {
@@ -294,6 +367,41 @@ mod tests {
         let meminfo = "MemTotal:       16384 kB\nMemFree:         1024 kB\n";
         assert_eq!(parse_mem_total_mb(meminfo), Some(16.0)); // 16384 / 1024
         assert_eq!(parse_mem_total_mb("MemFree: 10 kB\n"), None);
+    }
+
+    #[test]
+    fn parse_system_times_sums_the_cpu_line() {
+        let stat = "cpu  10 20 30 40 50 60 70\n"
+            + "cpu0 1 1 1 1 1 1 1\n";
+        let t = parse_system_times(stat).expect("aggregate cpu line");
+        // idle = idle + iowait = 40 + 50
+        assert_eq!(t.idle, 90);
+        // total = user..softirq = 10+20+30+40+50+60+70
+        assert_eq!(t.total, 280);
+    }
+
+    #[test]
+    fn machine_cpu_percent_is_busy_over_total_between_samples() {
+        let before = SystemTimes { idle: 90, total: 280 };
+        let after = SystemTimes { idle: 140, total: 380 };
+        // delta: total 100, idle 50 -> busy 50%
+        assert_eq!(machine_cpu_percent(&before, &after), Some(50.0));
+        // counters did not advance (paused guest) -> no honest figure
+        assert_eq!(machine_cpu_percent(&before, &before), None);
+        // a clock running backwards is refused, not a panic
+        assert_eq!(machine_cpu_percent(&after, &before), None);
+    }
+
+    #[test]
+    fn machine_ram_mb_subtracts_available_from_total() {
+        // Live-machine probe (Linux only): both lines exist on a running host,
+        // and used must be a plausible fraction of the total.
+        let total = mem_total_mb();
+        if total <= 0.0 {
+            return; // no /proc here (CI on another platform)
+        }
+        let used = machine_ram_mb().expect("meminfo readable");
+        assert!(used >= 0.0 && used <= total, "used {used} of {total}");
     }
 
     // ---- live-machine probes (mirrored by the proc_windows.rs twin) ---------

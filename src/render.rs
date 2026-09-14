@@ -566,7 +566,7 @@ pub fn render_json(spaces: &[Space], battery: Option<Battery>, disks: &[Disk]) -
 
 /// `--once`: print a single rendered snapshot and return.
 pub fn run_once(client: &mut Herdr, labels: &Labels, config: &Config) -> crate::Result<()> {
-    let spaces = collect::snapshot(client, SNAPSHOT_WINDOW_MS)?;
+    let (spaces, _) = collect::snapshot(client, SNAPSHOT_WINDOW_MS)?;
     println!(
         "{}",
         render(
@@ -582,7 +582,7 @@ pub fn run_once(client: &mut Herdr, labels: &Labels, config: &Config) -> crate::
 
 /// `--json`: print one JSON snapshot and return.
 pub fn run_json(client: &mut Herdr, config: &Config) -> crate::Result<()> {
-    let spaces = collect::snapshot(client, SNAPSHOT_WINDOW_MS)?;
+    let (spaces, _) = collect::snapshot(client, SNAPSHOT_WINDOW_MS)?;
     println!(
         "{}",
         render_json(&spaces, config.battery_reading(), &config.disk_readings()),
@@ -621,7 +621,7 @@ pub fn run_interval(
         // must sleep the cadence itself to avoid busy-spinning (mirrors the
         // daemon's error-branch sleep).
         let (body, failed) = match collect::snapshot(client, window_ms) {
-            Ok(spaces) => (render(&spaces, labels, icons, battery, &disks), false),
+            Ok((spaces, _)) => (render(&spaces, labels, icons, battery, &disks), false),
             Err(err) => (
                 format!("{} {err}", Style::detect().red("  herdr unavailable:")),
                 true,

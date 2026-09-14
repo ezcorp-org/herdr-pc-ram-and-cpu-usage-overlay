@@ -301,6 +301,116 @@ pub fn ram_pct(mb: f64) -> String {
     pct_string(mb, mem_total_mb())
 }
 
+/// System-wide CPU time counters, cumulative since boot — the macOS twin of
+/// the Linux `/proc/stat` aggregate line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SystemTimes {
+    pub idle: u64,
+    pub total: u64,
+}
+
+/// Read machine-wide CPU time counters via `host_processor_info`.
+///
+/// Per-CPU tick quadruplets arrive as one flat array the caller must
+/// `vm_deallocate`; busy is user + system + nice (nice is user time at a lower
+/// priority, and dropping it would under-report a throttled machine).
+pub fn system_times() -> Option<SystemTimes> {
+    let mut cpu_count: libc::mach_msg_type_number_t = 0;
+    let mut ticks: libc::processor_info_array_t = std::ptr::null_mut();
+    let mut entry_count: libc::mach_msg_type_number_t = 0;
+    // SAFETY: all three out-params are valid caller-owned slots; the tick array
+    // they receive is owned by us until the `vm_deallocate` below.
+    let rc = unsafe {
+        libc::host_processor_info(
+            libc::mach_host_self(),
+            libc::PROCESSOR_CPU_LOAD_INFO,
+            &mut cpu_count,
+            &mut ticks,
+            &mut entry_count,
+        )
+    };
+    if rc != libc::KERN_SUCCESS || ticks.is_null() {
+        return None;
+    }
+    const CELLS_PER_CPU: usize = 4; // user, system, idle, nice
+    let mut idle = 0u64;
+    let mut busy = 0u64;
+    for cpu in 0..(cpu_count as usize) {
+        let base = cpu * CELLS_PER_CPU;
+        // SAFETY: `entry_count == cpu_count * CELLS_PER_CPU` is the documented
+        // shape of the array `host_processor_info` handed out.
+        let load = |cell: usize| unsafe { *ticks.add(base + cell) } as u64;
+        busy += load(0) + load(1) + load(3); // user + system + nice
+        idle += load(2);
+    }
+    // SAFETY: returning the array the same call above allocated, whole.
+    unsafe {
+        libc::vm_deallocate(
+            libc::mach_task_self(),
+            ticks as libc::vm_address_t,
+            entry_count as libc::vm_size_t,
+        )
+    };
+    Some(SystemTimes {
+        idle,
+        total: busy + idle,
+    })
+}
+
+/// Machine-wide CPU% over the window between two samples, or `None` when
+/// either read failed or the counters did not advance. Mirrors the twins.
+pub fn machine_cpu_percent(before: &SystemTimes, after: &SystemTimes) -> Option<f64> {
+    let total = after.total.checked_sub(before.total)?;
+    let idle = after.idle.checked_sub(before.idle)?;
+    let busy = total.checked_sub(idle)?;
+    if total == 0 {
+        return None;
+    }
+    Some(100.0 * busy as f64 / total as f64)
+}
+
+/// RAM in use machine-wide (MB): physical total minus what is free-ish.
+///
+/// `host_statistics` counts pages; "in use" here is total minus
+/// free + inactive + purgeable — pages the kernel could hand back right now,
+/// which is the figure Activity Monitor's Memory Pressure treats as available.
+/// An approximation by nature (wired + compressed + app memory make up the
+/// rest); `None` when the kernel answers nothing.
+pub fn machine_ram_mb() -> Option<f64> {
+    let mut stats: libc::vm_statistics_data_t = unsafe { std::mem::zeroed() };
+    let mut count = (std::mem::size_of::<libc::vm_statistics_data_t>()
+        / std::mem::size_of::<libc::integer_t>()) as libc::mach_msg_type_number_t;
+    // SAFETY: `stats`/`count` are a correctly sized caller-owned out-param pair.
+    let rc = unsafe {
+        libc::host_statistics(
+            libc::mach_host_self(),
+            libc::HOST_VM_INFO,
+            (&mut stats as *mut libc::vm_statistics_data_t).cast(),
+            &mut count,
+        )
+    };
+    if rc != libc::KERN_SUCCESS {
+        return None;
+    }
+    let page = sysconf_page_size() as u64;
+    let reclaimable =
+        (stats.free_count + stats.inactive_count + stats.purgeable_count) as u64 * page;
+    let total = hw_memsize()?;
+    Some(bytes_to_mb(total.saturating_sub(reclaimable)))
+}
+
+/// Bytes per memory page via `sysconf`, falling back to 4096 (same rule as the
+/// Linux twin's `page_size`).
+fn sysconf_page_size() -> u64 {
+    // SAFETY: `sysconf` is a pure query of a static system value.
+    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if v > 0 {
+        v as u64
+    } else {
+        4096
+    }
+}
+
 /// Sum of RSS (MB) across `pids` — `pti_resident_size`, the Mach task's
 /// resident footprint and the closest analogue of Linux RSS. Vanished or
 /// unreadable pids contribute nothing.
@@ -391,6 +501,26 @@ mod tests {
         assert_eq!(bytes_to_mb(1024 * 1024), 1.0);
         assert_eq!(bytes_to_mb(16 * 1024 * 1024 * 1024), 16384.0); // 16 GiB
         assert_eq!(bytes_to_mb(512 * 1024), 0.5);
+    }
+
+    #[test]
+    fn machine_cpu_percent_is_busy_over_total_between_samples() {
+        let before = SystemTimes { idle: 90, total: 280 };
+        let after = SystemTimes { idle: 140, total: 380 };
+        assert_eq!(machine_cpu_percent(&before, &after), Some(50.0));
+        assert_eq!(machine_cpu_percent(&before, &before), None);
+        assert_eq!(machine_cpu_percent(&after, &before), None);
+    }
+
+    #[test]
+    fn machine_probes_answer_on_a_live_box() {
+        let before = system_times().expect("host_processor_info readable");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let after = system_times().expect("host_processor_info readable");
+        let pct = machine_cpu_percent(&before, &after).expect("counters advanced");
+        assert!((0.0..=100.0).contains(&pct), "cpu {pct}% out of range");
+        let ram = machine_ram_mb().expect("host_statistics readable");
+        assert!(ram > 0.0, "a live box always has some RAM in use");
     }
 
     #[test]

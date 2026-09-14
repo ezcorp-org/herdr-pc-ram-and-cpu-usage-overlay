@@ -38,7 +38,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::battery::Battery;
-use crate::collect::{self, PSEUDO_AGENT};
+use crate::collect::{self, MachineTotals, PSEUDO_AGENT};
 use crate::config::{self, Config, Labels, Mode, Wanted};
 use crate::disk::Disk;
 use crate::herdr::{self, Herdr};
@@ -434,7 +434,7 @@ pub fn run_daemon() -> crate::Result<()> {
         }
 
         match collect::snapshot(&mut client, window_ms) {
-            Ok(spaces) => {
+            Ok((spaces, machine)) => {
                 if stopping.load(Ordering::SeqCst) {
                     park(); // shutdown ran during the sample window — do not re-report
                 }
@@ -447,7 +447,7 @@ pub fn run_daemon() -> crate::Result<()> {
                 // drive nobody renders is a sysfs walk (or a `pmset` fork, or a
                 // `statvfs` per drive) for nothing.
                 if config.window_title_totals {
-                    set_title_totals(&mut client, &spaces, config, style);
+                    set_title_totals(&mut client, &spaces, machine, config, style);
                 }
                 failures = 0;
             }
@@ -807,10 +807,21 @@ pub fn clear_all(client: &mut Herdr, tracked: &Tracked) {
 ///
 /// Takes the readings off the cycle's `config` rather than as arguments: this is
 /// the one surface the daemon draws them on, so nothing else has to carry the
-/// values past a row that will not use them.
-pub fn set_title_totals(client: &mut Herdr, spaces: &[Space], config: &Config, style: RowStyle) {
+/// values past a row that will not use them. `machine` carries the whole-host
+/// readings, taken on the same sampling window as the spaces — used when
+/// `machine_totals` asks the title to speak for the machine rather than for
+/// herdr's own processes.
+pub fn set_title_totals(
+    client: &mut Herdr,
+    spaces: &[Space],
+    machine: MachineTotals,
+    config: &Config,
+    style: RowStyle,
+) {
     let title = title_totals(
         spaces,
+        machine,
+        config,
         style,
         config.battery_reading(),
         &config.disk_readings(),
@@ -822,20 +833,32 @@ pub fn set_title_totals(client: &mut Herdr, spaces: &[Space], config: &Config, s
 /// over every space, then the machine-wide cells — one battery, one per selected
 /// drive.
 ///
+/// With `machine_totals` the first two cells are the WHOLE-HOST cpu and ram
+/// instead of the sum over herdr's spaces — the same figures a system monitor
+/// shows. The battery and drives were already machine-wide, so they are
+/// unaffected.
+///
 /// Pure, and split from [`set_title_totals`] so the formatting is testable
 /// without a live herdr connection.
 fn title_totals(
     spaces: &[Space],
+    machine: MachineTotals,
+    config: &Config,
     style: RowStyle,
     battery: Option<Battery>,
     disks: &[Disk],
 ) -> String {
-    let mut cpu = 0.0;
-    let mut ram_mb = 0.0;
-    for sp in spaces {
-        cpu += sp.cpu;
-        ram_mb += sp.ram_mb;
-    }
+    let (cpu, ram_mb) = if config.machine_totals {
+        (machine.cpu, machine.ram_mb)
+    } else {
+        let mut cpu = 0.0;
+        let mut ram_mb = 0.0;
+        for sp in spaces {
+            cpu += sp.cpu;
+            ram_mb += sp.ram_mb;
+        }
+        (cpu, ram_mb)
+    };
     format!(
         "spaces · {}",
         render::totals_row(cpu, ram_mb, style, battery, disks),
@@ -1531,7 +1554,16 @@ mod tests {
         // that is filling from one that is draining.
         let labels = Labels::default();
         let style = RowStyle::new(&labels, IconSet::Unicode, RamDisplay::Percent);
-        let line = |state| title_totals(&[space(26.0, 0.0)], style, Some(bat(74.0, state)), &[]);
+        let line = |state| {
+            title_totals(
+                &[space(26.0, 0.0)],
+                MachineTotals::default(),
+                &Config::default(),
+                style,
+                Some(bat(74.0, state)),
+                &[],
+            )
+        };
         assert!(line(State::Charging).ends_with("bat ▓74%+"));
         assert!(line(State::Discharging).ends_with("bat ▓74%"));
         assert!(line(State::Full).ends_with("bat ▓74%="));
@@ -1543,8 +1575,22 @@ mod tests {
         let labels = Labels::default();
         let spaces = [space(10.0, 0.0), space(16.4, 0.0)];
         let style = text_style(&labels);
-        let with = title_totals(&spaces, style, Some(bat(74.0, State::Full)), &[]);
-        let without = title_totals(&spaces, style, None, &[]);
+        let with = title_totals(
+            &spaces,
+            MachineTotals::default(),
+            &Config::default(),
+            style,
+            Some(bat(74.0, State::Full)),
+            &[],
+        );
+        let without = title_totals(
+            &spaces,
+            MachineTotals::default(),
+            &Config::default(),
+            style,
+            None,
+            &[],
+        );
 
         // 10.0 + 16.4 = 26.4, rounded once over the total rather than per space.
         assert!(with.starts_with("spaces · cpu 26% · ram "), "got: {with}");
@@ -1561,7 +1607,16 @@ mod tests {
         let labels = Labels::default();
         let spaces = [space(10.0, 0.0), space(16.4, 0.0)];
         let style = text_style(&labels);
-        let title = |disks: &[Disk]| title_totals(&spaces, style, None, disks);
+        let title = |disks: &[Disk]| {
+            title_totals(
+                &spaces,
+                MachineTotals::default(),
+                &Config::default(),
+                style,
+                None,
+                disks,
+            )
+        };
 
         let one = title(&[drive("/", 240.0, 512.0)]);
         assert!(one.ends_with(" · disk 53% 240G"), "got: {one}");
@@ -1584,6 +1639,8 @@ mod tests {
         let labels = Labels::default();
         let title = title_totals(
             &[space(26.0, 0.0)],
+            MachineTotals::default(),
+            &Config::default(),
             text_style(&labels),
             Some(bat(74.0, State::Discharging)),
             &[drive("/", 240.0, 512.0)],
@@ -1592,6 +1649,42 @@ mod tests {
             title.ends_with(" · bat 74% · disk 53% 240G"),
             "got: {title}"
         );
+    }
+
+    #[test]
+    fn machine_totals_swaps_the_space_sum_for_the_whole_host() {
+        // `machine_totals`: the title speaks for the MACHINE — every process,
+        // idle included — not for herdr's own panes. The spaces are still
+        // passed in; with the flag on they are simply not what is drawn.
+        let labels = Labels::default();
+        let spaces = [space(10.0, 0.0), space(16.4, 0.0)];
+        let machine = MachineTotals {
+            cpu: 83.0,
+            ram_mb: 13_600.0,
+        };
+        let mut config = Config::default();
+        config.machine_totals = true;
+        let title = title_totals(
+            &spaces,
+            machine,
+            &config,
+            text_style(&labels),
+            None,
+            &[],
+        );
+        assert!(title.starts_with("spaces · cpu 83% · ram "), "got: {title}");
+        assert!(!title.contains("26%"), "space sum leaked: {title}");
+
+        // And the default keeps the sum, so existing installs see no change.
+        let plain = title_totals(
+            &spaces,
+            machine,
+            &Config::default(),
+            text_style(&labels),
+            None,
+            &[],
+        );
+        assert!(plain.starts_with("spaces · cpu 26% · ram "), "got: {plain}");
     }
 
     // ---- restart recovery ---------------------------------------------------

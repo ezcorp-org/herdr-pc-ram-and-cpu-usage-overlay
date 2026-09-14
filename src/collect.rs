@@ -275,6 +275,18 @@ pub fn group_worktree_families(client: &mut Herdr, spaces: &mut [Space]) {
     }
 }
 
+/// The machine-wide readings taken during [`measure`]'s sampling window: the
+/// whole-host CPU% (the figure a system monitor shows, idle included) and the
+/// RAM in use across every process, not just herdr's.
+///
+/// Zeroes mean "no honest reading" — the platform probe failed — and callers
+/// show nothing rather than a confident zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MachineTotals {
+    pub cpu: f64,
+    pub ram_mb: f64,
+}
+
 /// Sample CPU over `window_ms`, then fill `cpu` / `ram_mb` / `proc_count` on each
 /// space by summing over each root's `/proc` subtree.
 ///
@@ -282,11 +294,15 @@ pub fn group_worktree_families(client: &mut Herdr, spaces: &mut [Space]) {
 /// of every root's subtree (built from the *after* children map). CPU% is
 /// `Σ max(0, Δjiffies) / CLK_TCK / elapsed_s / NPROC * 100` — a share of the
 /// whole machine (0..100). RSS and process count come from that same PID set.
-pub fn measure(spaces: &mut [Space], window_ms: u64) {
+/// The same window brackets the system-wide CPU counters, so the machine's own
+/// reading costs nothing extra to take.
+pub fn measure(spaces: &mut [Space], window_ms: u64) -> MachineTotals {
     let before = proc::scan_proc();
+    let sys_before = proc::system_times();
     let start = Instant::now();
     std::thread::sleep(Duration::from_millis(window_ms));
     let after = proc::scan_proc();
+    let sys_after = proc::system_times();
     let elapsed = start.elapsed().as_secs_f64();
     let kids = proc::children_map(&after);
 
@@ -315,6 +331,14 @@ pub fn measure(spaces: &mut [Space], window_ms: u64) {
         };
         sp.ram_mb = proc::rss_mb(&pids);
         sp.proc_count = pids.len();
+    }
+
+    MachineTotals {
+        cpu: sys_before
+            .zip(sys_after)
+            .and_then(|(before, after)| proc::machine_cpu_percent(&before, &after))
+            .unwrap_or(0.0),
+        ram_mb: proc::machine_ram_mb().unwrap_or(0.0),
     }
 }
 
@@ -369,11 +393,15 @@ pub fn aggregate_families(mut spaces: Vec<Space>) -> Vec<Space> {
 }
 
 /// Full pipeline: collect → group worktrees → measure (`window_ms`) → aggregate.
-pub fn snapshot(client: &mut Herdr, window_ms: u64) -> crate::Result<Vec<Space>> {
+///
+/// Returns the machine-wide readings next to the spaces: callers that draw the
+/// whole host (the window title, with `machine_totals`) want them, and callers
+/// that do not just drop them.
+pub fn snapshot(client: &mut Herdr, window_ms: u64) -> crate::Result<(Vec<Space>, MachineTotals)> {
     let mut spaces = collect_spaces(client)?;
     group_worktree_families(client, &mut spaces);
-    measure(&mut spaces, window_ms);
-    Ok(aggregate_families(spaces))
+    let machine = measure(&mut spaces, window_ms);
+    Ok((aggregate_families(spaces), machine))
 }
 
 #[cfg(test)]
