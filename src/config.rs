@@ -134,6 +134,14 @@ pub struct Config {
     /// reason as [`Config::battery_label`]: herdr has no disk of its own to
     /// label, so `disk_label` is not a key it knows.
     pub disk_label: Option<String>,
+    /// Whether the disk cells carry the free-space figure at all. On by
+    /// default; `disk_size = false` keeps the percentage only, for a title
+    /// measured in columns.
+    pub disk_size: bool,
+    /// The word the window title opens with — `"spaces"`, joined to the cells
+    /// with the same separator the rows use. An empty value names nothing,
+    /// like an empty label.
+    pub title_prefix: String,
     /// The monitor the "Open system monitor" action runs, whitespace-split into
     /// argv — so `"htop -t"` is a command with a flag, not a program with a
     /// space in its name.
@@ -164,6 +172,8 @@ impl Default for Config {
             disk: true,
             disks: default_disks(),
             disk_label: None,
+            disk_size: true,
+            title_prefix: "spaces".to_string(),
             system_monitor: None,
         }
     }
@@ -587,6 +597,8 @@ pub(crate) fn herdr_config_path() -> PathBuf {
 /// case-insensitive), `system_monitor` (a command, empty reading as unset), and
 /// the four label overrides — `cpu_label`, `ram_label`, `battery_label`,
 /// `disk_label` — where an empty value means "name nothing" rather than unset.
+/// Also `disk_size` (`false` drops the free-space figure from disk cells) and
+/// `title_prefix` (the window title's opening word; empty names nothing).
 /// Unknown keys are ignored.
 fn parse_config(text: &str) -> Config {
     let mut cfg = Config::default();
@@ -637,7 +649,11 @@ fn parse_config(text: &str) -> Config {
             "cpu_label" => cfg.cpu_label = Some(value.to_string()),
             "ram_label" => cfg.ram_label = Some(value.to_string()),
             "battery" => cfg.battery = value != "false",
-            "disk_label" => cfg.disk_label = non_empty(value),
+            "disk_label" => cfg.disk_label = Some(value.to_string()),
+            "disk_size" => cfg.disk_size = value != "false",
+            // Empty is a deliberate "prefix nothing", matching the label rule:
+            // the title can start straight at the first cell.
+            "title_prefix" => cfg.title_prefix = value.to_string(),
             "disk" => cfg.disk = value != "false",
             // A blank list reads as unset — the same rule an empty label
             // follows. `disks = ""` is the obvious first edit when you are

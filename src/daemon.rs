@@ -814,11 +814,14 @@ pub fn set_title_totals(client: &mut Herdr, spaces: &[Space], config: &Config, s
         style,
         config.battery_reading(),
         &config.disk_readings(),
+        &config.title_prefix,
     );
     let _ = client.window_title_set(&title);
 }
 
-/// The window title text: `"spaces · "` plus the per-space row's cells summed
+/// The window title text: the configured prefix (`"spaces"`, joined to the
+/// cells with the same separator the rows use; empty names nothing) plus the
+/// per-space row's cells summed
 /// over every space, then the machine-wide cells — one battery, one per selected
 /// drive.
 ///
@@ -829,6 +832,7 @@ fn title_totals(
     style: RowStyle,
     battery: Option<Battery>,
     disks: &[Disk],
+    prefix: &str,
 ) -> String {
     let mut cpu = 0.0;
     let mut ram_mb = 0.0;
@@ -836,10 +840,12 @@ fn title_totals(
         cpu += sp.cpu;
         ram_mb += sp.ram_mb;
     }
-    format!(
-        "spaces · {}",
-        render::totals_row(cpu, ram_mb, style, battery, disks),
-    )
+    let cells = render::totals_row(cpu, ram_mb, style, battery, disks);
+    if prefix.is_empty() {
+        cells
+    } else {
+        format!("{prefix} · {cells}")
+    }
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -1531,7 +1537,15 @@ mod tests {
         // that is filling from one that is draining.
         let labels = Labels::default();
         let style = RowStyle::new(&labels, IconSet::Unicode, RamDisplay::Percent);
-        let line = |state| title_totals(&[space(26.0, 0.0)], style, Some(bat(74.0, state)), &[]);
+        let line = |state| {
+            title_totals(
+                &[space(26.0, 0.0)],
+                style,
+                Some(bat(74.0, state)),
+                &[],
+                "spaces",
+            )
+        };
         assert!(line(State::Charging).ends_with("bat ▓74%+"));
         assert!(line(State::Discharging).ends_with("bat ▓74%"));
         assert!(line(State::Full).ends_with("bat ▓74%="));
@@ -1543,8 +1557,8 @@ mod tests {
         let labels = Labels::default();
         let spaces = [space(10.0, 0.0), space(16.4, 0.0)];
         let style = text_style(&labels);
-        let with = title_totals(&spaces, style, Some(bat(74.0, State::Full)), &[]);
-        let without = title_totals(&spaces, style, None, &[]);
+        let with = title_totals(&spaces, style, Some(bat(74.0, State::Full)), &[], "spaces");
+        let without = title_totals(&spaces, style, None, &[], "spaces");
 
         // 10.0 + 16.4 = 26.4, rounded once over the total rather than per space.
         assert!(with.starts_with("spaces · cpu 26% · ram "), "got: {with}");
@@ -1561,7 +1575,7 @@ mod tests {
         let labels = Labels::default();
         let spaces = [space(10.0, 0.0), space(16.4, 0.0)];
         let style = text_style(&labels);
-        let title = |disks: &[Disk]| title_totals(&spaces, style, None, disks);
+        let title = |disks: &[Disk]| title_totals(&spaces, style, None, disks, "spaces");
 
         let one = title(&[drive("/", 240.0, 512.0)]);
         assert!(one.ends_with(" · disk 53% 240G"), "got: {one}");
@@ -1587,11 +1601,24 @@ mod tests {
             text_style(&labels),
             Some(bat(74.0, State::Discharging)),
             &[drive("/", 240.0, 512.0)],
+            "spaces",
         );
         assert!(
             title.ends_with(" · bat 74% · disk 53% 240G"),
             "got: {title}"
         );
+    }
+
+    #[test]
+    fn a_custom_title_prefix_replaces_spaces_and_an_empty_one_names_nothing() {
+        // The opening word is config, not grammar: a user who titles their
+        // window after the machine renames it, and one who wants the cells
+        // alone drops it with no gap and no leading separator.
+        let labels = Labels::default();
+        let style = text_style(&labels);
+        let title = |prefix: &str| title_totals(&[space(26.0, 0.0)], style, None, &[], prefix);
+        assert!(title("nucbox").starts_with("nucbox · cpu "), "got: {}", title("nucbox"));
+        assert!(title("").starts_with("cpu "), "got: {}", title(""));
     }
 
     // ---- restart recovery ---------------------------------------------------

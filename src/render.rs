@@ -147,6 +147,7 @@ pub struct RowStyle<'a> {
     labels: &'a Labels,
     icons: IconSet,
     ram_display: RamDisplay,
+    disk_size: bool,
 }
 
 impl<'a> RowStyle<'a> {
@@ -160,13 +161,28 @@ impl<'a> RowStyle<'a> {
             labels,
             icons,
             ram_display,
+            disk_size: true,
         }
+    }
+
+    /// Turn the free-space figure off in every disk cell this style draws.
+    ///
+    /// Chained by [`RowStyle::from_config`] from `disk_size = false`; kept as a
+    /// builder so the test constructors stay on the default (the size on).
+    pub fn without_disk_size(mut self) -> Self {
+        self.disk_size = false;
+        self
     }
 
     /// The style this plugin's own config asks for, with the tier already
     /// resolved by the caller.
     pub fn from_config(labels: &'a Labels, icons: IconSet, config: &Config) -> Self {
-        Self::new(labels, icons, config.ram_display)
+        let style = Self::new(labels, icons, config.ram_display);
+        if config.disk_size {
+            style
+        } else {
+            style.without_disk_size()
+        }
     }
 }
 
@@ -230,18 +246,25 @@ fn battery_cell(icons: IconSet, labels: &Labels, reading: Option<Battery>) -> Op
 /// The size is formatted here rather than in [`crate::icons`] because how a size
 /// is spelled is this module's job and the tier's job is the glyph in front of
 /// it. Public so the `--icons` preview draws the same cell every other surface
-/// does.
+/// does. `show_size` comes from `disk_size` in the plugin's config: off, the
+/// cell keeps the percentage only.
 pub fn disk_cell(
     icons: IconSet,
     label: Option<&str>,
     mount: Option<&str>,
     reading: &Disk,
+    show_size: bool,
 ) -> String {
     icons.disk(
         label,
         mount,
         reading.used_percent(),
-        &compact_size(reading.free_mb),
+        if show_size {
+            compact_size(reading.free_mb)
+        } else {
+            String::new()
+        }
+        .as_str(),
     )
 }
 
@@ -261,6 +284,7 @@ fn disk_cells(style: RowStyle, disks: &[Disk]) -> Vec<String> {
                 style.labels.disk(),
                 named.then_some(reading.name.as_str()),
                 reading,
+                style.disk_size,
             )
         })
         .collect()
@@ -986,11 +1010,34 @@ mod tests {
         // The percentage is USED, like the cpu and ram cells beside it, so the
         // row reads one way. The size is what is LEFT — the figure you act on,
         // and unmistakable for a percentage because it carries a unit.
-        let cell = |icons| disk_cell(icons, None, None, &drive("/", 240.0, 512.0));
-        assert_eq!(cell(IconSet::Text), "disk 53% 240G");
-        assert_eq!(cell(IconSet::Unicode), "disk ▒53% 240G");
-        assert_eq!(cell(IconSet::NerdFont), "\u{f0a0} 53% 240G");
-        assert_eq!(cell(IconSet::Emoji), "💾53% 240G");
+        let cell = |icons, show| disk_cell(icons, None, None, &drive("/", 240.0, 512.0), show);
+        assert_eq!(cell(IconSet::Text, true), "disk 53% 240G");
+        assert_eq!(cell(IconSet::Unicode, true), "disk ▒53% 240G");
+        assert_eq!(cell(IconSet::NerdFont, true), "\u{f0a0} 53% 240G");
+        assert_eq!(cell(IconSet::Emoji, true), "💾53% 240G");
+    }
+
+    #[test]
+    fn a_disk_cell_can_drop_the_free_size_and_keep_the_percent() {
+        // `disk_size = false`: the title is measured in columns, and the
+        // percentage is the reading the row's other cells are all in. What
+        // goes is the figure, not the gap where it was — no trailing space,
+        // and no stray one in front of the next separator.
+        let cell = |icons| disk_cell(icons, None, None, &drive("/", 240.0, 512.0), false);
+        assert_eq!(cell(IconSet::Text), "disk 53%");
+        assert_eq!(cell(IconSet::Unicode), "disk ▒53%");
+        assert_eq!(cell(IconSet::Emoji), "💾53%");
+        assert_eq!(
+            disk_cell(
+                IconSet::Text,
+                Some(""),
+                None,
+                &drive("/", 240.0, 512.0),
+                false
+            ),
+            "53%",
+            "no stray space with a bare label either",
+        );
     }
 
     #[test]
@@ -999,7 +1046,7 @@ mod tests {
         // and a high percentage, exactly as a pegged cpu would read — which is
         // why the cell shows used rather than free.
         assert_eq!(
-            disk_cell(IconSet::Unicode, None, None, &drive("/", 12.0, 512.0)),
+            disk_cell(IconSet::Unicode, None, None, &drive("/", 12.0, 512.0), true),
             "disk █98% 12G",
         );
     }

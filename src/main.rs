@@ -210,7 +210,13 @@ fn print_icon_preview(config: &config::Config, labels: &config::Labels) {
                 SAMPLE_MEM_TOTAL_MB,
             ),
             Some(set.battery(labels.battery(), SAMPLE_BATTERY)),
-            vec![render::disk_cell(set, labels.disk(), None, &disk)],
+            vec![render::disk_cell(
+                set,
+                labels.disk(),
+                None,
+                &disk,
+                config.disk_size,
+            )],
         );
         let marker = if set == current { "   <- current" } else { "" };
         println!("    {name:<10}{row}{marker}");

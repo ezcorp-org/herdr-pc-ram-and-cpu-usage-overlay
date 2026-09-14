@@ -235,7 +235,13 @@ impl IconSet {
         used_percent: f64,
         free_size: &str,
     ) -> String {
-        let body = format!("{}% {free_size}", round_percent(used_percent));
+        // An empty size is a deliberate "percentage only" (`disk_size = false`),
+        // so the body loses the trailing gap rather than carrying a stray space.
+        let body = if free_size.is_empty() {
+            format!("{}%", round_percent(used_percent))
+        } else {
+            format!("{}% {free_size}", round_percent(used_percent))
+        };
         labelled(
             label,
             || self.naming(Metric::Disk, Some(used_percent), mount),
