@@ -11,6 +11,8 @@
 //!   --json            emit machine-readable JSON and exit
 //!   --icons           preview every icon tier in this terminal and exit
 //!   --monitor         hand this pane to btop / htop / top (used by the pane)
+//!   --install-desktop [home] install the native Herdr desktop mod
+//!   --desktop-json JSON     internal: sample local desktop process roots
 //!   --enable          start the sidebar status updater daemon
 //!   --disable         stop the daemon and clear statuses
 //!   --toggle          enable/disable depending on daemon state
@@ -25,6 +27,7 @@ mod battery;
 mod collect;
 mod config;
 mod daemon;
+mod desktop;
 mod disk;
 mod herdr;
 mod herdr_config;
@@ -115,6 +118,21 @@ fn main() {
 
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if has_flag(&args, "--install-desktop") {
+        let path = desktop::install_arg(&args)?;
+        let installed = desktop::install(&path)?;
+        println!("Installed desktop mod: {}", installed.display());
+        println!("Open in the desktop app: herdr-app do mod.open '{{\"name\":\"space-usage\"}}'");
+        return Ok(());
+    }
+    if has_flag(&args, "--desktop-json") {
+        let index = args.iter().position(|arg| arg == "--desktop-json").unwrap();
+        let input = args
+            .get(index + 1)
+            .ok_or("--desktop-json needs a JSON array of spaces")?;
+        return desktop::run_json(input);
+    }
 
     // Daemon / control modes manage their own socket connection internally.
     if has_flag(&args, "--daemon") {

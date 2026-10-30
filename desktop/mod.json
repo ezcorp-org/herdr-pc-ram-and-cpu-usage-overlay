@@ -1,0 +1,6 @@
+{
+  "title": "Space usage",
+  "place": "bottom",
+  "size": 180,
+  "overlay": { "width": 760, "height": 260 }
+}

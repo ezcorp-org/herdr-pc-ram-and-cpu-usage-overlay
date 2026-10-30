@@ -44,6 +44,54 @@ With a Nerd Font installed it detects that and uses icons instead —
 
 ## Install
 
+### Herdr desktop app
+
+The desktop app uses native mods. Install this project's desktop mod with:
+
+```sh
+cargo build --release
+./target/release/space-usage --install-desktop
+```
+
+On Windows, use `target\release\space-usage.exe --install-desktop`.
+The installer copies the mod and sampler to
+`~/.config/herdr-app/mods/space-usage`. To use another app home, set
+`HERDR_APP_HOME` or pass its path after `--install-desktop`.
+
+With the desktop app running, open the **Space usage** overlay:
+
+```sh
+herdr-app do mod.open '{"name":"space-usage"}'
+```
+
+For a panel that stays at the bottom, use a personal layout. Herdr's built-in
+layouts do not accept automatic mod placement. To copy and select the main
+layout, run this once, then restart the desktop app:
+
+```sh
+herdr-app do layout.clone '{"name":"main","as":"with-space-usage"}'
+```
+
+Herdr docks the mod when it first sees it in a personal layout. An existing
+personal layout gets the panel automatically. The overlay works in every layout.
+
+The mod shows CPU and RAM per local space. Select a row to open that
+space. Battery and disk appear once, with the totals. Remote spaces show
+**Remote · not sampled**: their process IDs cannot be measured on this machine.
+Desktop spaces stay separate; terminal-plugin worktree grouping does not apply.
+
+Edit `mods/space-usage/config.toml` in the app home to change the interval,
+labels, RAM format, battery, disk, or icons. The defaults use text labels and a
+five-second interval. Changes apply on the next sample. Run the installer again
+after a build to update the mod; your config stays in place. The copied sampler
+keeps working if you move this checkout or clear `target/`.
+
+The desktop mod uses the existing Rust sampler and formatters. It does not need
+the terminal app, its plugin registry, or a terminal-app socket. The desktop
+app's own guide is at `~/.config/herdr-app/AGENTS.md`.
+
+### Herdr terminal app
+
 ```sh
 herdr plugin install ezcorp-org/herdr-pc-ram-and-cpu-usage-overlay
 ```

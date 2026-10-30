@@ -448,7 +448,7 @@ fn render_styled(
 /// order (serde preserves it) and is the payload's public contract, so do not
 /// reorder or rename.
 #[derive(Serialize)]
-struct JsonSpace {
+pub(crate) struct JsonSpace {
     workspace_id: String,
     label: String,
     branch: String,
@@ -530,6 +530,16 @@ fn json_num_1dp(x: f64) -> Number {
 /// onto every row — see [`JsonSpace::battery_percent`] for why they ride along
 /// per space.
 pub fn render_json(spaces: &[Space], battery: Option<Battery>, disks: &[Disk]) -> String {
+    serde_json::to_string_pretty(&json_spaces(spaces, battery, disks))
+        .unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Shared numeric payload for the terminal report and desktop mod.
+pub(crate) fn json_spaces(
+    spaces: &[Space],
+    battery: Option<Battery>,
+    disks: &[Disk],
+) -> Vec<JsonSpace> {
     let mem_total = proc::mem_total_mb();
     let json_disks: Vec<JsonDisk> = disks
         .iter()
@@ -541,7 +551,7 @@ pub fn render_json(spaces: &[Space], battery: Option<Battery>, disks: &[Disk]) -
             total_mb: json_num_1dp(d.total_mb),
         })
         .collect();
-    let payload: Vec<JsonSpace> = spaces
+    spaces
         .iter()
         .map(|s| JsonSpace {
             workspace_id: s.id.clone(),
@@ -558,8 +568,7 @@ pub fn render_json(spaces: &[Space], battery: Option<Battery>, disks: &[Disk]) -
             battery_state: battery.map(|b| battery_state_key(b.state).to_string()),
             disks: json_disks.clone(),
         })
-        .collect();
-    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_string())
+        .collect()
 }
 
 // ---- run modes --------------------------------------------------------------

@@ -48,5 +48,12 @@ jobs:
       - name: Test
         run: cargo test --all
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Test desktop mod
+        run: node --test desktop/model.test.mjs
+
       - name: Build release
         run: cargo build --release
