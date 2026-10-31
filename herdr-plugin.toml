@@ -15,7 +15,7 @@
 
 id = "ez-corp.space-usage"
 name = "PC RAM & CPU Usage Overlay"
-version = "1.12.0"
+version = "1.13.0"
 # Oldest herdr with every API this plugin calls: `session.snapshot`, the `tokens`
 # metadata API on `pane.report_metadata` / `workspace.report_metadata`, and
 # `pane.process_info` — all 0.7.5. Diffing the two bundled API schemas

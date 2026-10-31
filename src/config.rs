@@ -364,7 +364,12 @@ pub(crate) const MAX_INTERVAL_SECONDS: u64 = 28_800;
 
 /// Load the plugin's own `config.toml`, returning defaults if it is absent.
 pub fn load_config() -> Config {
-    match std::fs::read_to_string(config_dir().join("config.toml")) {
+    load_config_at(&config_dir().join("config.toml"))
+}
+
+/// Load one config file for either the terminal plugin or desktop mod.
+pub(crate) fn load_config_at(path: &std::path::Path) -> Config {
+    match std::fs::read_to_string(path) {
         Ok(text) => parse_config(&text),
         Err(_) => Config::default(), // no config file — defaults
     }
