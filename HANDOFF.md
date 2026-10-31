@@ -53,7 +53,7 @@ and process sampler remain unchanged.
 ## Verification
 
 - 282 Mac and 277 Linux Rust unit tests, the installation/sampling test,
-  and 15 JavaScript tests passed.
+  and 16 JavaScript tests passed.
 - Formatting, Clippy with warnings denied, both native release builds,
   Windows cross-target compilation, and native mod checks passed.
 - Controlled 64 MB workloads ran on both devices. CPU readings agreed with

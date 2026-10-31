@@ -1,12 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { runInNewContext } from "node:vm";
+import { runInNewContext, Script } from "node:vm";
 import { sampleTargets, parseReading } from "./model.js";
 
-const source = readFileSync(new URL("./main.js", import.meta.url), "utf8")
-  .replace(/^import .*;\n/gm, "")
-  .replace("export default class", "class") + "\nSpaceUsage;";
+const rawSource = readFileSync(new URL("./main.js", import.meta.url), "utf8");
+
+function viewSource(source) {
+  return source.replace(/^import .*;\r?\n/gm, "")
+    .replace("export default class", "class") + "\nSpaceUsage;";
+}
+
+const source = viewSource(rawSource);
+
+test("the view harness accepts Windows line endings", () => {
+  const windowsSource = rawSource.replace(/\r?\n/g, "\r\n");
+  assert.doesNotThrow(() => new Script(viewSource(windowsSource)));
+});
 
 function reading(text) {
   return { spaces: [], totals: "Herdr processes only", interval_seconds: 5,
