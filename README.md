@@ -1,9 +1,9 @@
 # herdr-pc-ram-and-cpu-usage-overlay
 <img width="393" height="243" alt="Screenshot 2026-07-11 at 2 41 03 PM" src="https://github.com/user-attachments/assets/720aace3-4aa2-4474-a8ae-3197b84f4f79" />
 
-A [herdr](https://herdr.dev) plugin that shows **live CPU and RAM usage per
-space (workspace)** — so when you're running a herd of agents, you can see at
-a glance which space is eating your machine.
+A [Herdr](https://herdr.dev) desktop mod and terminal plugin that show
+**live CPU and RAM usage per space (workspace)**. See which space uses your
+resources, or check the selected device's total usage in the desktop status bar.
 
 ```
 ● web-app
@@ -14,11 +14,14 @@ a glance which space is eating your machine.
     idle · usage · cpu 26% · ram 8%   ← agents panel (mode = "agents-panel")
 ```
 
-**It works the moment you install it.** No action to invoke, no config to paste
-— see [Zero-setup](#zero-setup) for exactly what that involves, including the one
+**Desktop app:** follow the [desktop setup](#herdr-desktop-app) for a persistent
+status bar and a full space list.
+
+**Terminal plugin:** it works the moment you install it. No action to invoke,
+no config to paste — see [Zero-setup](#zero-setup) for exactly what that involves, including the one
 line it adds to herdr's own `config.toml` and how to take it back out.
 
-With a Nerd Font installed it detects that and uses icons instead —
+The terminal plugin can detect a Nerd Font and use icons instead —
 ` 26% ·  8%`. See [Icons](#icons-and-labels).
 
 - Per-space CPU% and RAM%, both a share of the **whole machine** (0–100%, so a
@@ -29,15 +32,15 @@ With a Nerd Font installed it detects that and uses icons instead —
   none**, so desktops and servers see no empty cell
 - **Disk usage** in the top bar — `disk 78% 387G`: how full the drive is, then
   how much room is left. Pick which drives appear with `disks = "/, /home"`
-- **Worktree-aware**: workspaces opened as worktree children are folded into
-  their parent space's total
+- **Worktree-aware in the terminal app**: workspaces opened as worktree children
+  are folded into their parent space's total
 - All-space totals in your terminal's window title:
   `spaces · cpu 39% · ram 8% · bat 74%+ · disk 78% 387G`
 - A live dashboard pane and one-shot report/JSON actions
 - **Opens a system monitor** — `btop`, `htop` or `top`, whichever this machine
   has — from the action menu, the palette or a key, because the next question
   after *how much* is *what*. See [System monitor](#system-monitor)
-- A small static Rust binary (~2–5 MB resident) that talks to herdr over its
+- The terminal plugin uses a small Rust binary that talks to herdr over its
   unix socket (a named pipe on Windows) — no per-sample subprocess spawns, no
   Node runtime
 - Runs on **Linux, macOS, and Windows** (herdr Windows beta)
@@ -46,49 +49,185 @@ With a Nerd Font installed it detects that and uses icons instead —
 
 ### Herdr desktop app
 
-The desktop app uses native mods. Install this project's desktop mod with:
+The native desktop mod provides a full space list and an optional bottom-right
+status bar. The status bar follows the selected space's device and shows its
+whole-device CPU, RAM, battery, and disk usage.
+
+You need Herdr desktop with `herdr-app` on PATH, Git, Rust 1.88 or later, and
+the native build tools for your Rust target. Node is needed only to run the
+JavaScript development tests. This setup was checked with Herdr desktop 0.1.9.
+
+#### Build and open
+
+For a new checkout:
 
 ```sh
-cargo build --release
+git clone https://github.com/ezcorp-org/herdr-pc-ram-and-cpu-usage-overlay.git
+cd herdr-pc-ram-and-cpu-usage-overlay
+cargo build --release --locked
+```
+
+If you already have the checkout, use it and keep any local changes.
+Run the installer on the computer that runs the desktop app.
+
+On macOS or Linux:
+
+```sh
 ./target/release/space-usage --install-desktop
+herdr-app check "$HOME/.config/herdr-app/mods/space-usage"
 ```
 
-On Windows, use `target\release\space-usage.exe --install-desktop`.
-The installer copies the mod and sampler to
-`~/.config/herdr-app/mods/space-usage`. To use another app home, set
-`HERDR_APP_HOME` or pass its path after `--install-desktop`.
+On Windows, in PowerShell:
 
-With the desktop app running, open the **Space usage** overlay:
+```powershell
+./target/release/space-usage.exe --install-desktop
+herdr-app check "$HOME/.config/herdr-app/mods/space-usage"
+```
+
+The installer copies `main.js`, `model.js`, `mod.json`, `config.toml`, and the
+sampler binary into `~/.config/herdr-app/mods/space-usage`. On Windows the binary
+is `space-usage.exe`. The copied sampler works independently of this checkout.
+The installer preserves an existing `config.toml` and does not edit layouts.
+
+For a custom app home, set `HERDR_APP_HOME` for both installation and Herdr CLI
+commands. You can also pass the app home after `--install-desktop`.
+
+With Herdr running, open the full list:
 
 ```sh
-herdr-app do mod.open '{"name":"space-usage"}'
+herdr-app do mod.open --name space-usage
 ```
 
-For a panel that stays at the bottom, use a personal layout. Herdr's built-in
-layouts do not accept automatic mod placement. To copy and select the main
-layout, run this once, then restart the desktop app:
+Select a row to open that space. Press **Esc** to close the list.
+The overlay works in every layout.
+
+#### Bottom-right status bar
+
+Use a personal layout to keep the readings visible. Clone the standard layout:
 
 ```sh
-herdr-app do layout.clone '{"name":"main","as":"with-space-usage"}'
+herdr-app do layout.clone --name main --as with-space-usage
 ```
 
-Herdr docks the mod when it first sees it in a personal layout. An existing
-personal layout gets the panel automatically. The overlay works in every layout.
+This selects the clone. Choose a fresh name if it already exists. If you
+already use a personal layout, edit that layout instead of cloning again.
+Herdr owns its shipped layouts, so structural edits belong in a personal copy.
 
-The mod shows CPU and RAM per local space. Select a row to open that
-space. Battery and disk appear once, with the totals. Remote spaces show
-**Remote · not sampled**: their process IDs cannot be measured on this machine.
-Desktop spaces stay separate; terminal-plugin worktree grouping does not apply.
+In `~/.config/herdr-app/layouts/with-space-usage.json`, replace the existing
+`status` block with this row:
 
-Edit `mods/space-usage/config.toml` in the app home to change the interval,
-labels, RAM format, battery, disk, or icons. The defaults use text labels and a
-five-second interval. Changes apply on the next sample. Run the installer again
-after a build to update the mod; your config stays in place. The copied sampler
-keeps working if you move this checkout or clear `target/`.
+```json
+{
+  "id": "status-bar", "type": "row", "size": { "px": 28 }, "resizable": false,
+  "children": [
+    {
+      "id": "status", "type": "block", "size": { "weight": 1 },
+      "content": { "mod": "workspace-status" }
+    },
+    {
+      "id": "space-usage-status", "type": "block", "size": { "px": 400 },
+      "content": { "mod": "space-usage", "props": { "compact": true } }
+    }
+  ]
+}
+```
 
-The desktop mod uses the existing Rust sampler and formatters. It does not need
-the terminal app, its plugin registry, or a terminal-app socket. The desktop
-app's own guide is at `~/.config/herdr-app/AGENTS.md`.
+Save the file to apply the change. While this layout is selected, the readings
+stay at the bottom right when you switch spaces or close the full list.
+Click the readings to open the list again. The selected layout persists across
+app starts; no restart is needed to apply the layout edit.
+
+To return to the standard layout:
+
+```sh
+herdr-app do layout.switch --name main
+```
+
+#### Remote devices
+
+On each connected device, build from the same revision using [Build and open](#build-and-open),
+then run that binary with `--install-desktop`. The remote needs the sampler
+and a Herdr connection. Run the window commands and native mod check on the
+desktop computer. Put the remote sampler on the executable search path that
+Herdr uses there. On a Linux or Mac remote with the default app home:
+
+```sh
+mkdir -p "$HOME/.local/bin"
+ln -s "$HOME/.config/herdr-app/mods/space-usage/space-usage" "$HOME/.local/bin/space-usage"
+```
+
+Ensure `~/.local/bin` is on the remote PATH. If the link already exists, reuse
+it. If a different program occupies that path, use another directory on PATH
+rather than replacing the program. For a custom app home, point the link to
+that home's installed sampler. On a Windows remote, add the installed sampler's
+folder to PATH so `space-usage` resolves to `space-usage.exe`.
+
+From the desktop computer, list devices and check the remote sampler. Replace
+`DEVICE` with a name from the list:
+
+```sh
+hc machine ls
+hc exec --on DEVICE space-usage --desktop-json '[]'
+```
+
+The check must return JSON with a `system` object containing CPU and RAM
+readings. Then select a space on that device in Herdr. Its device name and
+readings appear in the status bar. Battery is omitted on devices without one.
+
+Remote sampling runs through Herdr's existing connection. Process IDs are
+measured only on their owning device. Each device needs the current sampler
+and keeps its own config beside that sampler. An unavailable or outdated
+sampler shows **Usage unavailable**, without substituting local readings.
+
+#### Desktop settings
+
+Edit `mods/space-usage/config.toml` under each device's app home. Defaults are
+text labels and a five-second refresh interval. To enable icons:
+
+```toml
+icons = "nerdfont"
+interval_seconds = 5
+```
+
+The desktop app's UI font must support Nerd Font icons. Use `icons = "emoji"`
+for emoji or `icons = "text"` for words. See [Icons and labels](#icons-and-labels)
+for all choices. Icons appear in CPU, RAM, battery, and disk order. In text
+mode, `bat` means battery charge; `+` means charging and `=` means a steady
+charge while connected to power.
+
+Other settings include `ram_display = "gb"` for absolute RAM use,
+`battery = false`, `disk = false`, and custom labels. Changes apply on the
+next sample. Set the icon preference on remote samplers too: their text is
+rendered with the desktop computer's UI font.
+
+#### What the readings mean
+
+The status bar and overlay header show whole-device use, including programs
+outside Herdr. CPU is the busy share of all logical CPUs, from 0 to 100%.
+RAM comes from the OS: active, wired, compressed, and speculative pages on
+macOS; total minus available RAM on Linux. This differs from tools that also
+count inactive caches. Battery and disk belong to the selected device.
+
+Each space row shows that space's process-tree CPU and resident RAM. Small
+percentages round to zero; use `ram_display = "gb"` to see small RAM readings
+as a size. Desktop worktree spaces remain separate; terminal-plugin worktree
+grouping does not apply.
+
+#### Updates and troubleshooting
+
+To upgrade, build from the updated checkout and repeat the installation command
+on each device. Existing config is preserved. Personal layouts stay in place.
+
+Use `herdr-app status` to check for mod or layout errors. Repeat the native mod
+check from [Build and open](#build-and-open) after code changes. If a remote
+shows **Usage unavailable**, run the remote sampler check above and check its
+connection, PATH, and sampler version. Click the footer to see the error in
+the full list.
+
+To disable the status bar, switch to the standard layout. To remove the mod,
+close its overlay, remove its blocks from personal layouts, and delete its
+`mods/space-usage` folder. Remove any remote sampler link you created for it.
+The desktop mod does not change the terminal app's plugin config.
 
 ### Herdr terminal app
 
@@ -96,7 +235,7 @@ app's own guide is at `~/.config/herdr-app/AGENTS.md`.
 herdr plugin install ezcorp-org/herdr-pc-ram-and-cpu-usage-overlay
 ```
 
-Requirements: Linux, macOS, or Windows, and the **Rust toolchain** (`cargo`) on
+Requirements: Linux, macOS, or Windows, and **Rust 1.88 or later** (`cargo`) on
 the box hosting the herdr server — herdr compiles the plugin at install time via
 `cargo build --release`. Plugins run on the machine hosting the herdr server, so
 remote setups need these on the server box only. `node` is no longer required.
@@ -117,6 +256,9 @@ is not sufficient); the MSVC target needs the Visual C++ build tools plus the
 Windows SDK, as usual.
 
 ## Zero-setup
+
+This section applies to the terminal plugin. The desktop app uses the
+[native mod setup](#herdr-desktop-app).
 
 Installing is the whole setup. Within a few seconds of the install — or the next
 time you switch spaces — every space card is showing its CPU and RAM.
@@ -723,7 +865,7 @@ claims a pane at all.
 ## Development
 
 ```sh
-git clone <this repo>
+git clone https://github.com/ezcorp-org/herdr-pc-ram-and-cpu-usage-overlay.git
 cd herdr-pc-ram-and-cpu-usage-overlay
 cargo build --release
 herdr plugin link .

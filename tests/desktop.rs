@@ -79,6 +79,12 @@ fn install_upgrade_and_sample_without_a_terminal_app_server() {
         String::from_utf8_lossy(&output.stderr)
     );
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let system = &result["system"];
+    assert!(system["total_ram_mb"].as_f64().unwrap_or(0.0) > 0.0);
+    assert!(system["ram_mb"].as_f64().unwrap_or(0.0) > 0.0);
+    assert!(system["ram_mb"].as_f64().unwrap() <= system["total_ram_mb"].as_f64().unwrap());
+    assert!((0.0..=100.0).contains(&system["cpu_percent"].as_f64().unwrap()));
+    assert!(system["text"].as_str().unwrap().contains("LOAD"));
     assert_eq!(result["interval_seconds"], 7);
     let live = &result["spaces"][0];
     assert_eq!(live["workspace_id"], "live");
@@ -88,6 +94,17 @@ fn install_upgrade_and_sample_without_a_terminal_app_server() {
     assert!(live["text"].as_str().unwrap().contains("LOAD"));
     assert_eq!(result["spaces"][1]["ram_mb"], 0.0);
     assert!(result["totals"].as_str().unwrap().contains("LOAD"));
+
+    // Whole-device readings must work even when no Herdr space has a process.
+    let empty = Command::new(&executable)
+        .args(["--desktop-json", "[]"])
+        .output()
+        .unwrap();
+    assert!(empty.status.success());
+    let empty: serde_json::Value = serde_json::from_slice(&empty.stdout).unwrap();
+    assert!(empty["spaces"].as_array().unwrap().is_empty());
+    assert!(empty["system"]["ram_mb"].as_f64().unwrap() > 0.0);
+    assert_eq!(empty["system"]["total_ram_mb"], system["total_ram_mb"]);
 
     let invalid = Command::new(executable)
         .args(["--desktop-json", "not-json"])

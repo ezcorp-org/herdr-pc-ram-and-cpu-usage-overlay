@@ -55,7 +55,20 @@ pub fn run_json(input: &str) -> crate::Result<()> {
     // A desktop mod has no terminal-side [ui] labels or font settings.
     let labels = config::Labels::default().with_overrides(&config);
     let style = render::RowStyle::from_config(&labels, config.icon_set(), &config);
+    // Read whole-device CPU over the same window as the per-space sample.
+    // Do not refresh processes here: collect::measure already owns that work.
+    let mut system = sysinfo::System::new();
+    system.refresh_cpu_usage();
     collect::measure(&mut spaces, 500);
+    system.refresh_cpu_usage();
+    system.refresh_memory();
+    let cpu = f64::from(system.global_cpu_usage());
+    let ram_mb = system.used_memory() as f64 / (1024.0 * 1024.0);
+    let total_ram_mb = system.total_memory() as f64 / (1024.0 * 1024.0);
+    if system.cpus().is_empty() || !cpu.is_finite() || total_ram_mb <= 0.0 || ram_mb > total_ram_mb
+    {
+        return Err("whole-device CPU or memory counters are unavailable".into());
+    }
     let battery = config.battery_reading();
     let disks = config.disk_readings();
     // Keep the existing numeric JSON contract and add the shared display text.
@@ -70,9 +83,17 @@ pub fn run_json(input: &str) -> crate::Result<()> {
         battery,
         &disks,
     );
+    let system_reading = json!({
+        "cpu_percent": cpu.clamp(0.0, 100.0),
+        "ram_mb": ram_mb,
+        "total_ram_mb": total_ram_mb,
+        "ram_percent": 100.0 * ram_mb / total_ram_mb,
+        "text": render::totals_row(cpu, ram_mb, style, battery, &disks),
+    });
     println!(
         "{}",
-        json!({ "spaces": readings, "totals": totals, "interval_seconds": config.interval_seconds })
+        json!({ "spaces": readings, "totals": totals, "system": system_reading,
+            "interval_seconds": config.interval_seconds })
     );
     Ok(())
 }

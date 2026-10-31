@@ -10,17 +10,8 @@ env:
 jobs:
   # All three are hard gates.
   #
-  # Windows compiles and is live-verified against the herdr 0.8.0-preview beta
-  # (Win32 process sampling + named-pipe transport), so a Windows regression
-  # must fail the build like any other.
-  #
-  # macOS compiles today because the socket client is a UnixStream and
-  # signal-hook is a POSIX dependency, so Darwin needs nothing special to build.
-  # It is still functionally degraded until a Darwin process backend lands: the
-  # module tree routes every unix target at the `/proc` reader, which does not
-  # exist on macOS, so CPU/RAM read zero there. The tests that run are the
-  # platform-neutral ones, and they are worth gating on — they catch Darwin
-  # build breakage the moment it appears.
+  # Run the native process backend, whole-device sampler, and desktop model
+  # checks on every supported platform.
   build:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -53,7 +44,7 @@ jobs:
           node-version: 22
 
       - name: Test desktop mod
-        run: node --test desktop/model.test.mjs
+        run: node --test
 
       - name: Build release
         run: cargo build --release
