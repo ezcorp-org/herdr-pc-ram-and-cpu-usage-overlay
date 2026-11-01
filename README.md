@@ -1,5 +1,8 @@
 # herdr-pc-ram-and-cpu-usage-overlay
 <img width="393" height="243" alt="Screenshot 2026-07-11 at 2 41 03 PM" src="https://github.com/user-attachments/assets/720aace3-4aa2-4474-a8ae-3197b84f4f79" />
+<img width="1583" height="993" alt="herdr-status-bar-blurred" src="https://github.com/user-attachments/assets/86941196-22b3-4a81-bb62-35ffe1a62f81" />
+<img width="1582" height="994" alt="herdr-usage-panel-blurred" src="https://github.com/user-attachments/assets/4acc8abc-77ab-49e0-8018-843200fda4f8" />
+
 
 A [Herdr](https://herdr.dev) desktop mod and terminal plugin that show
 **live CPU and RAM usage per space (workspace)**. See which space uses your
