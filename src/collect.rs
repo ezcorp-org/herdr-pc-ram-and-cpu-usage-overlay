@@ -299,23 +299,63 @@ pub fn measure(spaces: &mut [Space], window_ms: u64) {
             pids.extend(proc::subtree(root, &kids));
         }
 
-        let mut delta_jiffies: u64 = 0;
-        for &pid in &pids {
-            if let (Some(a), Some(b)) = (after.get(&pid), before.get(&pid)) {
-                // `saturating_sub` clamps at zero, guarding counter resets and
-                // pid reuse inside the window.
-                delta_jiffies += a.jiffies.saturating_sub(b.jiffies);
-            }
-        }
+        let delta_jiffies = delta_jiffies(&pids, &before, &after);
 
         sp.cpu = if elapsed > 0.0 {
-            100.0 * (delta_jiffies as f64 / clk_tck) / elapsed / nproc
+            // Capped: the died-in-window correction is exact only when the
+            // reaping ancestor is in the space, so allow for small overshoot.
+            (100.0 * (delta_jiffies as f64 / clk_tck) / elapsed / nproc).min(100.0)
         } else {
             0.0
         };
         sp.ram_mb = proc::rss_mb(&pids);
         sp.proc_count = pids.len();
     }
+}
+
+/// CPU jiffies a space's processes used between two `/proc` scans.
+///
+/// `pids` is the space's process set from the *after* scan; each entry's
+/// `jiffies` includes reaped children (cutime/cstime on Linux). Three cases:
+/// - alive in both scans: its growth (`saturating_sub` guards pid reuse);
+/// - born inside the window (absent before): all of it, it all ran in the window;
+/// - died inside the window, under an ancestor that is still in the space: its
+///   whole lifetime just landed in that ancestor's cutime, so subtract the part
+///   it had already used before the window (or long-lived children that exit
+///   would be counted from their start). The ancestor is found by walking the
+///   *before* parent chain through other vanished pids.
+pub(crate) fn delta_jiffies(
+    pids: &HashSet<u32>,
+    before: &HashMap<u32, proc::ProcEntry>,
+    after: &HashMap<u32, proc::ProcEntry>,
+) -> u64 {
+    let mut total: i128 = 0;
+    for &pid in pids {
+        let Some(a) = after.get(&pid) else { continue };
+        total += match before.get(&pid) {
+            Some(b) => a.jiffies.saturating_sub(b.jiffies) as i128,
+            None => a.jiffies as i128,
+        };
+    }
+    for (&pid, b) in before {
+        if after.contains_key(&pid) {
+            continue;
+        }
+        // Walk up through processes that also vanished, to a survivor.
+        let mut parent = b.ppid;
+        let mut hops = 0;
+        while !after.contains_key(&parent) && hops < 64 {
+            match before.get(&parent) {
+                Some(p) if parent > 1 => parent = p.ppid,
+                _ => break,
+            }
+            hops += 1;
+        }
+        if pids.contains(&parent) {
+            total -= b.jiffies as i128;
+        }
+    }
+    total.max(0) as u64
 }
 
 /// Fold measured worktree children into their parent (summing cpu/ram/procs/
@@ -378,6 +418,63 @@ pub fn snapshot(client: &mut Herdr, window_ms: u64) -> crate::Result<Vec<Space>>
 
 #[cfg(test)]
 mod tests {
+
+    // ---- delta_jiffies: short-lived / reaped processes -----------------------
+
+    fn pe(ppid: u32, jiffies: u64) -> proc::ProcEntry {
+        proc::ProcEntry { ppid, jiffies }
+    }
+
+    #[test]
+    fn delta_counts_growth_of_survivors() {
+        let before = HashMap::from([(10, pe(1, 100))]);
+        let after = HashMap::from([(10, pe(1, 160))]);
+        assert_eq!(delta_jiffies(&HashSet::from([10]), &before, &after), 60);
+    }
+
+    #[test]
+    fn delta_counts_processes_born_in_the_window_in_full() {
+        // 11 started after the first scan: all 40 of its jiffies are in-window.
+        let before = HashMap::from([(10, pe(1, 100))]);
+        let after = HashMap::from([(10, pe(1, 100)), (11, pe(10, 40))]);
+        assert_eq!(delta_jiffies(&HashSet::from([10, 11]), &before, &after), 40);
+    }
+
+    #[test]
+    fn delta_counts_a_child_that_lived_and_died_inside_the_window() {
+        // cargo (10) spawned rustc, which used 500 jiffies and was reaped
+        // between the scans: it appears in neither scan, only in 10's cutime.
+        let before = HashMap::from([(10, pe(1, 100))]);
+        let after = HashMap::from([(10, pe(1, 600))]);
+        assert_eq!(delta_jiffies(&HashSet::from([10]), &before, &after), 500);
+    }
+
+    #[test]
+    fn delta_subtracts_pre_window_cpu_of_a_child_that_died_in_the_window() {
+        // 11 had used 300 before the window, 50 more inside it, then exited and
+        // was reaped by 10, whose cutime jumps by the whole 350. Only 50 is new.
+        let before = HashMap::from([(10, pe(1, 100)), (11, pe(10, 300))]);
+        let after = HashMap::from([(10, pe(1, 450))]);
+        assert_eq!(delta_jiffies(&HashSet::from([10]), &before, &after), 50);
+    }
+
+    #[test]
+    fn delta_walks_through_vanished_parents_to_the_reaping_survivor() {
+        // 12 (child of 11, child of 10) and 11 both exit in the window: 12's
+        // 200 + 11's own 100 fold into 10. Pre-window: 11 had 100 own, 12 had 200.
+        // In-window work: 11 +5, 12 +10 => 10's total grows by 315.
+        let before = HashMap::from([(10, pe(1, 0)), (11, pe(10, 100)), (12, pe(11, 200))]);
+        let after = HashMap::from([(10, pe(1, 315))]);
+        assert_eq!(delta_jiffies(&HashSet::from([10]), &before, &after), 15);
+    }
+
+    #[test]
+    fn delta_ignores_deaths_outside_the_space() {
+        // 21 died under 20, which is not in this space: no correction applies.
+        let before = HashMap::from([(10, pe(1, 100)), (20, pe(1, 0)), (21, pe(20, 999))]);
+        let after = HashMap::from([(10, pe(1, 130)), (20, pe(1, 1000))]);
+        assert_eq!(delta_jiffies(&HashSet::from([10]), &before, &after), 30);
+    }
     use super::*;
     use crate::model::{PaneInfo, Space, WorkspaceInfo};
 

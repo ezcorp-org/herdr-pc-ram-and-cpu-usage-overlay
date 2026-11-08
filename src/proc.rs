@@ -8,7 +8,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-/// Per-process sample: parent PID and cumulative CPU jiffies (utime + stime).
+/// Per-process sample: parent PID and cumulative CPU jiffies: its own
+/// (utime + stime) plus that of children it has already reaped (cutime + cstime).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProcEntry {
     pub ppid: u32,
@@ -72,7 +73,13 @@ pub fn scan_proc() -> HashMap<u32, ProcEntry> {
 /// `comm` (field 2) may contain spaces and parentheses, so everything after the
 /// **last** `)` is taken as the space-delimited tail starting at field 3
 /// (state). In that tail: index 1 = ppid (field 4), index 11 = utime (field 14),
-/// index 12 = stime (field 15).
+/// index 12 = stime (field 15), index 13 = cutime (field 16), index 14 = cstime
+/// (field 17).
+///
+/// cutime/cstime matter: a build runs on short-lived children (rustc, cc, ld,
+/// test binaries) that start and exit between two samples, so their own
+/// utime/stime is never seen. When one exits, the kernel folds its CPU into the
+/// parent's cutime/cstime — counting those is the only way that work shows up.
 pub fn parse_stat(stat: &str) -> Option<ProcEntry> {
     // `+ 2` skips the `)` and the single space that follows it, landing on the
     // state field. Both are ASCII, so this stays on a char boundary.
@@ -81,9 +88,12 @@ pub fn parse_stat(stat: &str) -> Option<ProcEntry> {
     let ppid = fields.get(1)?.parse().ok()?;
     let utime: u64 = fields.get(11)?.parse().ok()?;
     let stime: u64 = fields.get(12)?.parse().ok()?;
+    // Absent on exotic kernels: treat as 0 rather than dropping the process.
+    let cutime: u64 = fields.get(13).and_then(|f| f.parse().ok()).unwrap_or(0);
+    let cstime: u64 = fields.get(14).and_then(|f| f.parse().ok()).unwrap_or(0);
     Some(ProcEntry {
         ppid,
-        jiffies: utime + stime,
+        jiffies: utime + stime + cutime + cstime,
     })
 }
 
@@ -242,6 +252,14 @@ mod tests {
         let entry = parse_stat(stat).expect("parseable stat line");
         assert_eq!(entry.ppid, 7);
         assert_eq!(entry.jiffies, 15); // 11 + 4
+    }
+
+    #[test]
+    fn parse_stat_counts_reaped_children_cpu() {
+        // utime 11, stime 4, cutime 300, cstime 25 (fields 14-17).
+        let stat = "9 (cargo) S 7 9 9 0 -1 4194304 100 0 0 0 11 4 300 25 20 0 1 0 5";
+        let entry = parse_stat(stat).expect("parseable stat line");
+        assert_eq!(entry.jiffies, 340); // 11 + 4 + 300 + 25
     }
 
     #[test]
