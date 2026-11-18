@@ -27,6 +27,9 @@ use windows_sys::Win32::System::Threading::{
 /// Per-process sample: parent PID and cumulative CPU time in [`clk_tck`] units
 /// (here FILETIME 100 ns ticks; the Linux twin uses jiffies — the shared math in
 /// `collect::measure` divides by [`clk_tck`] so both come out as seconds).
+/// Whether a reaped child's CPU is folded into its parent's `jiffies`.
+pub const FOLDS_REAPED_CHILDREN: bool = false;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProcEntry {
     pub ppid: u32,

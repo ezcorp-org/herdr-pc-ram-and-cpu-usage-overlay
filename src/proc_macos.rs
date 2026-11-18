@@ -23,6 +23,9 @@ use std::sync::OnceLock;
 
 /// Per-process sample: parent PID and cumulative CPU time in [`clk_tck`] units
 /// (here Mach absolute-time ticks; the Linux twin uses jiffies).
+/// Whether a reaped child's CPU is folded into its parent's `jiffies`.
+pub const FOLDS_REAPED_CHILDREN: bool = false;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProcEntry {
     pub ppid: u32,
