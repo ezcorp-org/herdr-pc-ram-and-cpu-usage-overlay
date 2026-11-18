@@ -10,6 +10,9 @@ use std::sync::OnceLock;
 
 /// Per-process sample: parent PID and cumulative CPU jiffies: its own
 /// (utime + stime) plus that of children it has already reaped (cutime + cstime).
+/// Whether a reaped child's CPU is folded into its parent's `jiffies`.
+pub const FOLDS_REAPED_CHILDREN: bool = true;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProcEntry {
     pub ppid: u32,

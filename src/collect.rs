@@ -329,6 +329,18 @@ pub(crate) fn delta_jiffies(
     before: &HashMap<u32, proc::ProcEntry>,
     after: &HashMap<u32, proc::ProcEntry>,
 ) -> u64 {
+    delta_jiffies_with(proc::FOLDS_REAPED_CHILDREN, pids, before, after)
+}
+
+/// [`delta_jiffies`] with the platform trait explicit. Only Linux folds a
+/// reaped child's CPU into its parent's counter; on macOS and Windows a dead
+/// process's CPU is in no survivor's counter, so nothing may be subtracted.
+fn delta_jiffies_with(
+    folds_reaped_children: bool,
+    pids: &HashSet<u32>,
+    before: &HashMap<u32, proc::ProcEntry>,
+    after: &HashMap<u32, proc::ProcEntry>,
+) -> u64 {
     let mut total: i128 = 0;
     for &pid in pids {
         let Some(a) = after.get(&pid) else { continue };
@@ -338,7 +350,7 @@ pub(crate) fn delta_jiffies(
         };
     }
     for (&pid, b) in before {
-        if after.contains_key(&pid) {
+        if !folds_reaped_children || after.contains_key(&pid) {
             continue;
         }
         // Walk up through processes that also vanished, to a survivor.
@@ -466,6 +478,17 @@ mod tests {
         let before = HashMap::from([(10, pe(1, 0)), (11, pe(10, 100)), (12, pe(11, 200))]);
         let after = HashMap::from([(10, pe(1, 315))]);
         assert_eq!(delta_jiffies(&HashSet::from([10]), &before, &after), 15);
+    }
+
+    #[test]
+    fn delta_subtracts_nothing_where_reaped_children_are_not_folded() {
+        // macOS/Windows: 10's counter never gains 11's CPU, so 11's death
+        // under 10 must not reduce the total.
+        let before = HashMap::from([(10, pe(1, 100)), (11, pe(10, 300))]);
+        let after = HashMap::from([(10, pe(1, 150))]);
+        let pids = HashSet::from([10]);
+        assert_eq!(delta_jiffies_with(false, &pids, &before, &after), 50);
+        assert_eq!(delta_jiffies_with(true, &pids, &before, &after), 0);
     }
 
     #[test]
