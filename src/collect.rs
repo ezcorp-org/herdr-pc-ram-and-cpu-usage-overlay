@@ -467,7 +467,10 @@ mod tests {
         // was reaped by 10, whose cutime jumps by the whole 350. Only 50 is new.
         let before = HashMap::from([(10, pe(1, 100)), (11, pe(10, 300))]);
         let after = HashMap::from([(10, pe(1, 450))]);
-        assert_eq!(delta_jiffies(&HashSet::from([10]), &before, &after), 50);
+        assert_eq!(
+            delta_jiffies_with(true, &HashSet::from([10]), &before, &after),
+            50
+        );
     }
 
     #[test]
@@ -477,7 +480,10 @@ mod tests {
         // In-window work: 11 +5, 12 +10 => 10's total grows by 315.
         let before = HashMap::from([(10, pe(1, 0)), (11, pe(10, 100)), (12, pe(11, 200))]);
         let after = HashMap::from([(10, pe(1, 315))]);
-        assert_eq!(delta_jiffies(&HashSet::from([10]), &before, &after), 15);
+        assert_eq!(
+            delta_jiffies_with(true, &HashSet::from([10]), &before, &after),
+            15
+        );
     }
 
     #[test]
