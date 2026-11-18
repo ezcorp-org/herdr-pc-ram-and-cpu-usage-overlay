@@ -171,7 +171,8 @@ fn with_usage_row(text: &str, mode: Mode) -> Option<String> {
 ///
 /// Reversible in content, not always byte for byte. Splitting a one-line
 /// `rows = [[..], [..]]` leaves the closing `]` on its own line and a trailing
-/// comma on the row above once our block is gone — both valid TOML, and the same
+/// comma on the row above once our block is gone (a comma we add after a last row
+/// that had none stays too) — both valid TOML, and the same
 /// rows in the same order. Reflowing the user's formatting back is not worth the
 /// risk of a rewrite that guesses wrong; every other shape does round trip
 /// exactly.
@@ -317,7 +318,8 @@ fn splice_into_array(lines: &mut Vec<String>, line: usize, col: usize) {
 
     if head.trim().is_empty() {
         // The `]` already sits on its own line: leave it alone and put the block
-        // above it.
+        // above it. The last row up there may lack its trailing comma.
+        terminate_previous_row(lines, line);
         lines.splice(line..line, block);
         return;
     }
@@ -331,6 +333,22 @@ fn splice_into_array(lines: &mut Vec<String>, line: usize, col: usize) {
     block.insert(0, separated);
     block.push(format!("{indent}{tail}"));
     lines.splice(line..=line, block);
+}
+
+/// Put a `,` after the last code on the lines above `before`, unless it already
+/// ends in `,` or opens the array with `[`. Blank and comment-only lines are
+/// skipped; a trailing comment stays after the new comma.
+fn terminate_previous_row(lines: &mut [String], before: usize) {
+    let Some(prev) = (0..before)
+        .rev()
+        .find(|&i| !strip_comment(&lines[i]).trim().is_empty())
+    else {
+        return;
+    };
+    let code_len = strip_comment(&lines[prev]).trim_end().len();
+    if !lines[prev][..code_len].ends_with([',', '[']) {
+        lines[prev].insert(code_len, ',');
+    }
 }
 
 /// A whole `[table]` with herdr's default rows plus ours, appended to `text`.
@@ -468,6 +486,30 @@ rows = [
         // The bracket is still alone on its line, indented as it was.
         assert!(out.contains("\n]\n"), "{out}");
         assert_eq!(out.matches('[').count(), text.matches('[').count() + 1);
+    }
+
+    #[test]
+    fn a_last_row_without_a_trailing_comma_gets_one_before_ours() {
+        // Issue #13: herdr-radar writes its rows with no comma after the last
+        // one. Our row went in after it with no separator, and herdr dropped
+        // the whole config. A real TOML parser is the judge, not a string match.
+        let text = "\
+[ui.sidebar.spaces]
+rows = [
+  [\"state_icon\", \"workspace\"],
+  [
+    { token = \"$space_logo_other\", fg = \"#e9e9f0\", bold = false }
+  ]
+]
+";
+        toml::from_str::<toml::Table>(text).expect("input is valid TOML");
+        let out = with_usage_row(text, Mode::Sidebar).unwrap();
+        let parsed: toml::Table =
+            toml::from_str(&out).unwrap_or_else(|err| panic!("output must parse: {err}\n{out}"));
+        let rows = parsed["ui"]["sidebar"]["spaces"]["rows"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rows.len(), 3, "{out}");
     }
 
     #[test]
